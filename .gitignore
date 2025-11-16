@@ -1,0 +1,12 @@
+.env
+.idea/
+__pycache__/
+*.pyc
+data/
+.venv/
+venv/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.joblib
+*.diff
