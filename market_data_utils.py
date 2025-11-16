@@ -1455,9 +1455,6 @@ class MarketDataUtils:
                 else:
                     row_data[field] = safe_cusum_value(b.get(field), field)
 
-            # ДЕБАГ: Логируем типы перед сохранением
-            self.logger.debug(f"cusum_state: value={row_data['cusum_state']}, type={type(row_data['cusum_state'])}")
-
             rows.append(row_data)
 
         sql = text(f"""

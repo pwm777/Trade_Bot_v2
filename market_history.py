@@ -326,12 +326,6 @@ class IndicatorWarmupManager:
             full_dataset = candles
 
         try:
-            # Сохраняем только НОВЫЕ свечи (контекст уже в БД)
-            if needs_context and context_candles:
-                await self.market_data_utils.upsert_candles_1m(symbol, new_unique)
-            else:
-                await self.market_data_utils.upsert_candles_1m(symbol, candles)
-
             # ✅ Передаем флаг gap-прогрева
             is_gap = needs_context
 
