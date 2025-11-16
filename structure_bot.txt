@@ -25,6 +25,8 @@
 
 
 
+
+
 Общая архитектура системы
 BotLifecycleManager (run_bot.py) - главный координатор
     ├── ImprovedQualityTrendSystem (стратегия) - ImprovedQualityTrendSystem.py
