@@ -275,9 +275,7 @@ class ModelTrainer:
 
     def prepare_training_data(self, run_id: str) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
         """
-        Подготовка данных с окном истории (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
-
-        Использует векторизацию numpy вместо циклов по строкам
+        Подготовка данных с окном истории (ИСПРАВЛЕННАЯ ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
         """
         df = self.data_loader.load_training_dataset(run_id)
 
@@ -285,17 +283,18 @@ class ModelTrainer:
 
         # Фильтруем класс 3 СРАЗУ
         df_filtered = df[df['reversal_label'] != 3].copy()
-        logger.info(f"   Отфильтровано {len(df) - len(df_filtered)} примеров с классом 3")
+        skipped = len(df) - len(df_filtered)
+
+        if skipped > 0:
+            logger.info(f"⚠️  Пропущено {skipped} примеров с классом 3")
 
         # Конвертируем в numpy array для скорости
-        feature_matrix = df_filtered[self.base_feature_names].values  # shape: (n, 22)
+        feature_matrix = df_filtered[self.base_feature_names].values
         labels = df_filtered['reversal_label'].values
         weights = df_filtered['sample_weight'].values
 
         n_samples = len(df_filtered)
         n_features = len(self.base_feature_names)
-
-        # Количество валидных примеров (с достаточной историей)
         n_valid = n_samples - (self.lookback - 1)
 
         if n_valid <= 0:
@@ -304,25 +303,25 @@ class ModelTrainer:
         logger.info(f"   Создание {n_valid} окон из {n_samples} образцов...")
 
         # Предаллокация массива результатов
-        # Shape: (n_valid, lookback * n_features)
         X_windowed = np.zeros((n_valid, self.lookback * n_features), dtype=np.float32)
 
-        # Векторизованное создание окон
+        # Векторизованное создание окон с ПРАВИЛЬНЫМ порядком
         for i in range(n_valid):
             start_idx = i
             end_idx = i + self.lookback
 
-            # Берём окно [start_idx:end_idx] и "разворачиваем" в 1D
+            # Берём окно [start_idx:end_idx]
             window = feature_matrix[start_idx:end_idx, :]  # shape: (lookback, n_features)
 
-            # Переставляем оси: сначала текущий бар (t0), потом лаги
-            # t0 должен быть последним баром окна
-            window_reversed = window[::-1]  # Разворачиваем: [t-29, t-28, ..., t0]
+            # ПРАВИЛЬНЫЙ ПОРЯДОК: [t0, t-1, t-2, ..., t-(lookback-1)]
+            # где t0 = end_idx-1 (последний бар окна)
+            # t-1 = end_idx-2, и т.д.
+            window_ordered = window[::-1]  # Разворачиваем чтобы t0 был первым
 
             # Flatten в правильном порядке: t0_feat1, t0_feat2, ..., t-1_feat1, ...
-            X_windowed[i] = window_reversed.ravel()
+            X_windowed[i] = window_ordered.ravel()
 
-        # Метки и веса соответствуют ПОСЛЕДНЕМУ бару каждого окна
+        # Метки и веса соответствуют ПОСЛЕДНЕМУ бару каждого окна (t0)
         y_windowed = labels[self.lookback - 1:]
         w_windowed = weights[self.lookback - 1:]
 
@@ -334,36 +333,36 @@ class ModelTrainer:
         # Проверка пропусков
         missing = X_df.isnull().sum()
         if missing.any():
-            logger.warning(f"⚠️  Обнаружены пропуски:\n{missing[missing > 0].head(10)}")
-            logger.warning(f"   Заполняем нулями...")
+            logger.warning(f"⚠️  Обнаружены пропуски, заполняем нулями...")
             X_df = X_df.fillna(0)
 
         logger.info(f"✅ Подготовлены данные: {len(X_df)} примеров, {len(self.feature_names)} признаков")
         logger.info(f"   Распределение классов: {y_series.value_counts().to_dict()}")
-        logger.info(f"   Размер окна: {self.lookback} баров")
-        logger.info(f"   Базовых признаков: {len(self.base_feature_names)}")
 
         return X_df, y_series, w_series
 
     def tune_tau_for_spd_range(
             self,
             y_val: np.ndarray,
-            proba: np.ndarray,  # shape (n,3) — [HOLD, BUY, SELL]
+            proba: np.ndarray,
             bars_per_day: int,
-            spd_min: float = 30.0,
-            spd_max: float = 50.0,
+            spd_min: float = 8.0,  # Более реалистичный диапазон
+            spd_max: float = 25.0,
             precision_min: float = 0.60,
             delta: float = 0.08,
             cooldown_bars: int = 2,
     ):
-        """
-        Подбирает tau (порог max(p_buy,p_sell)) так, чтобы SPD был в [spd_min, spd_max].
-        Возвращает (tau, stats_dict). Если не найдено — берёт tau с SPD ближайшим к центру диапазона.
-        """
-        # предрасчёты
         p_buy, p_sell = proba[:, 1], proba[:, 2]
         maxp = np.maximum(p_buy, p_sell)
-        taus = np.quantile(maxp, np.linspace(0.30, 0.95, 48))
+
+        # Более широкий и детальный диапазон tau
+        taus = np.quantile(maxp, np.linspace(0.05, 0.95, 100))
+
+        # ДИАГНОСТИКА: логируем распределение maxp
+        logging.info(f"📊 Max probability stats: "
+                     f"mean={maxp.mean():.3f}, "
+                     f"50%={np.percentile(maxp, 50):.3f}, "
+                     f"90%={np.percentile(maxp, 90):.3f}")
 
         best_in = None  # (cand, key)  — лучший внутри диапазона
         best_near = None  # (cand, keyn) — ближайший к центру диапазона
@@ -457,15 +456,11 @@ class ModelTrainer:
 
     @staticmethod
     def _eval_decision_metrics(y_true: np.ndarray,
-                               proba: np.ndarray,  # shape (n,3) [HOLD, BUY, SELL]
+                               proba: np.ndarray,
                                tau: float,
                                delta: float,
                                cooldown_bars: int,
                                bars_per_day: int) -> dict:
-        """
-        Унифицированный расчёт act/предсказаний/метрик, используемый и в тюнере, и в sensitivity.
-        ВАЖНО: метрики считаются ТОЛЬКО на индексе act=True (как в тюнере), labels=[1,2].
-        """
         p_buy = proba[:, 1]
         p_sell = proba[:, 2]
         maxp = np.maximum(p_buy, p_sell)
@@ -484,8 +479,12 @@ class ModelTrainer:
             sel[np.array(keep, dtype=int)] = True
             act = sel
 
-        # предсказания 0/1/2 по политике
-        pred = np.zeros(len(proba), dtype=int)  # HOLD=0
+        # ДИАГНОСТИКА: логируем количество активных samples
+        active_count = np.sum(act)
+        if active_count > 0:
+            logging.debug(f"Active samples: {active_count}, tau={tau:.3f}")
+
+        pred = np.zeros(len(proba), dtype=int)
         buy_ge_sell = p_buy >= p_sell
         pred[act & buy_ge_sell] = 1
         pred[act & (~buy_ge_sell)] = 2
@@ -493,11 +492,28 @@ class ModelTrainer:
         # SPD
         spd_val = act.sum() * bars_per_day / max(1, len(y_true))
 
-        # метрики на активном подмножестве (как в тюнере)
+        # метрики на активном подмножестве (ТОЛЬКО классы 1 и 2)
         if np.any(act):
-            pm, rm, fm, _ = precision_recall_fscore_support(
-                y_true[act], pred[act], labels=[1, 2], average='macro', zero_division=0
-            )
+            y_true_active = y_true[act]
+            pred_active = pred[act]
+
+            # ФИЛЬТРУЕМ: берем только классы 1 и 2 (BUY/SELL)
+            mask_buy_sell = (y_true_active == 1) | (y_true_active == 2)
+            y_true_bs = y_true_active[mask_buy_sell]
+            pred_bs = pred_active[mask_buy_sell]
+
+            if len(y_true_bs) > 0:
+                pm, rm, fm, _ = precision_recall_fscore_support(
+                    y_true_bs, pred_bs, labels=[1, 2], average='macro', zero_division=0
+                )
+
+                # ДИАГНОСТИКА: логируем реальные метрики
+                correct_bs = np.sum(y_true_bs == pred_bs)
+                accuracy_bs = correct_bs / len(y_true_bs) if len(y_true_bs) > 0 else 0
+                logging.debug(f"BUY/SELL metrics: {len(y_true_bs)} samples, accuracy={accuracy_bs:.3f}")
+            else:
+                pm = rm = fm = 0.0
+                logging.debug("No BUY/SELL samples in active set")
         else:
             pm = rm = fm = 0.0
 
@@ -506,10 +522,10 @@ class ModelTrainer:
             'precision_macro_buy_sell': float(pm),
             'recall_macro_buy_sell': float(rm),
             'f1_macro_buy_sell': float(fm),
-            # дублируем для удобства
             'tau': float(tau),
             'delta': float(delta),
             'cooldown_bars': int(cooldown_bars),
+            '_debug_active_count': int(active_count),  # Для отладки
         }
 
     @staticmethod
@@ -566,20 +582,22 @@ class ModelTrainer:
         # SCALER (ОПЦИОНАЛЬНО)
         # ═══════════════════════════════════════════════════════════
         scaler = None
+        X_train_processed = X_train
+        X_val_processed = X_val
+
         if use_scaler:
             logger.info("📊 Создание StandardScaler и нормализация данных...")
             scaler = StandardScaler()
-            scaler.fit(X_train)
-
-            X_train_scaled = scaler.transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-
-            train_data = lgb.Dataset(X_train_scaled, label=y_train, weight=w_train)
-            val_data = lgb.Dataset(X_val_scaled, label=y_val, reference=train_data)
+            X_train_processed = scaler.fit_transform(X_train)
+            X_val_processed = scaler.transform(X_val)
 
             logger.info(f"✅ Scaler обучен и применен на {len(X_train)} образцах")
         else:
             logger.info("⚠️  Scaler отключен - обучение на RAW признаках")
+
+        # Датасеты LightGBM
+        train_data = lgb.Dataset(X_train_processed, label=y_train, weight=w_train)
+        val_data = lgb.Dataset(X_val_processed, label=y_val, reference=train_data)
 
         # Параметры модели (оптимизированы для большого числа признаков)
         params = {
@@ -615,13 +633,13 @@ class ModelTrainer:
             num_boost_round=2200,
             callbacks=[
                 thermometer_progress_callback(logger, width=30, period=10),
-                lgb.early_stopping(stopping_rounds=150, first_metric_only=True),
+                lgb.early_stopping(stopping_rounds=50, first_metric_only=True),
             ],
         )
 
         # Предсказания
         if use_scaler and scaler is not None:
-            y_val_pred_proba = model.predict(X_val_scaled)
+            y_val_pred_proba = model.predict(X_val_processed)
         else:
             y_val_pred_proba = model.predict(X_val)
 
@@ -643,8 +661,8 @@ class ModelTrainer:
                     y_val=np.asarray(y_val),
                     proba=np.asarray(y_val_pred_proba),
                     bars_per_day=bars_per_day,
-                    spd_min=4.0,
-                    spd_max=10.0,
+                    spd_min=8.0,  # Более реалистичный минимум
+                    spd_max=20.0,  # Более широкий максимум
                     precision_min=pm,
                     delta=0.08,
                     cooldown_bars=2,
