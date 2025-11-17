@@ -72,7 +72,7 @@ BASE_FEATURE_NAMES = [
     'lower_shadow_ratio',
     'price_vs_vwap',
     'bb_position',
-    'cusum_1m_recent',
+    #'cusum_1m_recent',
     'cusum_1m_quality_score',
     'cusum_1m_trend_aligned',
     'cusum_1m_price_move',
@@ -612,7 +612,7 @@ class ModelTrainer:
             train_data,
             valid_sets=[val_data],
             valid_names=['valid_0'],
-            num_boost_round=2000,
+            num_boost_round=2200,
             callbacks=[
                 thermometer_progress_callback(logger, width=30, period=10),
                 lgb.early_stopping(stopping_rounds=150, first_metric_only=True),
