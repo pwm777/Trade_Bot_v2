@@ -38,7 +38,7 @@ from sklearn.metrics import precision_recall_curve, average_precision_score, pre
 # ──────────────────────────────────────────────────────────────
 # КОНФИГУРАЦИЯ
 # ──────────────────────────────────────────────────────────────
-LOOKBACK_WINDOW = 30  # Количество баров истории для каждого примера
+LOOKBACK_WINDOW = 11  # Количество баров истории для каждого примера
 TIMEFRAME_TO_BARS = {"1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24}
 
 # Настройка логирования
@@ -275,73 +275,75 @@ class ModelTrainer:
 
     def prepare_training_data(self, run_id: str) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
         """
-        Подготовка данных с окном истории
+        Подготовка данных с окном истории (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
 
-        Каждый пример теперь включает:
-        - Текущий бар (t0)
-        - Предыдущие lookback-1 баров (t-1, t-2, ..., t-29)
-
-        Returns:
-            X: DataFrame с признаками (n_samples, lookback * n_features)
-            y: Series с метками (n_samples,)
-            w: Series с весами (n_samples,)
+        Использует векторизацию numpy вместо циклов по строкам
         """
         df = self.data_loader.load_training_dataset(run_id)
 
         logger.info(f"🔄 Создание окон истории (lookback={self.lookback})...")
 
-        rows = []
-        skipped = 0
+        # Фильтруем класс 3 СРАЗУ
+        df_filtered = df[df['reversal_label'] != 3].copy()
+        logger.info(f"   Отфильтровано {len(df) - len(df_filtered)} примеров с классом 3")
 
-        # Начинаем с индекса lookback-1, чтобы было достаточно истории
-        for i in range(self.lookback - 1, len(df)):
-            # Проверка: пропускаем если есть класс 3 в текущем баре
-            if df.iloc[i]['reversal_label'] == 3:
-                skipped += 1
-                continue
+        # Конвертируем в numpy array для скорости
+        feature_matrix = df_filtered[self.base_feature_names].values  # shape: (n, 22)
+        labels = df_filtered['reversal_label'].values
+        weights = df_filtered['sample_weight'].values
 
-            row_features = {}
+        n_samples = len(df_filtered)
+        n_features = len(self.base_feature_names)
 
-            # Текущий бар (t0)
-            for feat in self.base_feature_names:
-                row_features[f"{feat}_t0"] = df.iloc[i][feat]
+        # Количество валидных примеров (с достаточной историей)
+        n_valid = n_samples - (self.lookback - 1)
 
-            # История (t-1, t-2, ..., t-(lookback-1))
-            for lag in range(1, self.lookback):
-                idx = i - lag
-                for feat in self.base_feature_names:
-                    row_features[f"{feat}_t-{lag}"] = df.iloc[idx][feat]
+        if n_valid <= 0:
+            raise ValueError(f"Недостаточно данных для lookback={self.lookback}")
 
-            # Метаданные (только для текущего бара)
-            row_features['label'] = df.iloc[i]['reversal_label']
-            row_features['weight'] = df.iloc[i]['sample_weight']
-            row_features['ts'] = df.iloc[i]['ts']
+        logger.info(f"   Создание {n_valid} окон из {n_samples} образцов...")
 
-            rows.append(row_features)
+        # Предаллокация массива результатов
+        # Shape: (n_valid, lookback * n_features)
+        X_windowed = np.zeros((n_valid, self.lookback * n_features), dtype=np.float32)
 
-        if skipped > 0:
-            logger.info(f"⚠️  Пропущено {skipped} примеров с классом 3")
+        # Векторизованное создание окон
+        for i in range(n_valid):
+            start_idx = i
+            end_idx = i + self.lookback
 
-        result = pd.DataFrame(rows)
+            # Берём окно [start_idx:end_idx] и "разворачиваем" в 1D
+            window = feature_matrix[start_idx:end_idx, :]  # shape: (lookback, n_features)
 
-        # Разделяем на X, y, w
-        X = result[self.feature_names]
-        y = result['label']
-        w = result['weight']
+            # Переставляем оси: сначала текущий бар (t0), потом лаги
+            # t0 должен быть последним баром окна
+            window_reversed = window[::-1]  # Разворачиваем: [t-29, t-28, ..., t0]
+
+            # Flatten в правильном порядке: t0_feat1, t0_feat2, ..., t-1_feat1, ...
+            X_windowed[i] = window_reversed.ravel()
+
+        # Метки и веса соответствуют ПОСЛЕДНЕМУ бару каждого окна
+        y_windowed = labels[self.lookback - 1:]
+        w_windowed = weights[self.lookback - 1:]
+
+        # Конвертируем в DataFrame
+        X_df = pd.DataFrame(X_windowed, columns=self.feature_names)
+        y_series = pd.Series(y_windowed, name='label')
+        w_series = pd.Series(w_windowed, name='weight')
 
         # Проверка пропусков
-        missing = X.isnull().sum()
+        missing = X_df.isnull().sum()
         if missing.any():
             logger.warning(f"⚠️  Обнаружены пропуски:\n{missing[missing > 0].head(10)}")
             logger.warning(f"   Заполняем нулями...")
-            X = X.fillna(0)
+            X_df = X_df.fillna(0)
 
-        logger.info(f"✅ Подготовлены данные: {len(X)} примеров, {len(self.feature_names)} признаков")
-        logger.info(f"   Распределение классов: {y.value_counts().to_dict()}")
+        logger.info(f"✅ Подготовлены данные: {len(X_df)} примеров, {len(self.feature_names)} признаков")
+        logger.info(f"   Распределение классов: {y_series.value_counts().to_dict()}")
         logger.info(f"   Размер окна: {self.lookback} баров")
         logger.info(f"   Базовых признаков: {len(self.base_feature_names)}")
 
-        return X, y, w
+        return X_df, y_series, w_series
 
     def tune_tau_for_spd_range(
             self,
@@ -610,7 +612,7 @@ class ModelTrainer:
             train_data,
             valid_sets=[val_data],
             valid_names=['valid_0'],
-            num_boost_round=1500,
+            num_boost_round=2000,
             callbacks=[
                 thermometer_progress_callback(logger, width=30, period=10),
                 lgb.early_stopping(stopping_rounds=150, first_metric_only=True),
@@ -1029,8 +1031,36 @@ class ModelTrainer:
             pd.DataFrame({'feature': feat_names, 'gain': gain}).sort_values('gain', ascending=False).to_csv(
                 f"{prefix_path}_feat_importance.csv", index=False
             )
-        except Exception:
-            pass
+
+            # ДОБАВЛЕНО: Таблица для 22 базовых признаков (агрегированная важность)
+            base_feat_importance = {}
+            for feature, importance in zip(feat_names, gain):
+                # Извлекаем базовое название признака (убираем _t0, _t-1 и т.д.)
+                if '_t-' in feature:
+                    base_feat = feature.split('_t-')[0]  # cmo_14_t-1 -> cmo_14
+                elif '_t0' in feature:
+                    base_feat = feature.replace('_t0', '')  # cmo_14_t0 -> cmo_14
+                else:
+                    base_feat = feature  # на случай, если есть признаки без временных меток
+
+                base_feat_importance[base_feat] = base_feat_importance.get(base_feat, 0) + importance
+
+            # Создаем DataFrame с агрегированной важностью
+            df_base_imp = pd.DataFrame({
+                'base_feature': list(base_feat_importance.keys()),
+                'total_gain': list(base_feat_importance.values())
+            }).sort_values('total_gain', ascending=False)
+
+            # Сохраняем CSV таблицу с 22 признаками
+            df_base_imp.to_csv(f"{prefix_path}_feat_importance_22_base.csv", index=False)
+
+            # Логируем все 22 базовых признака
+            logger.info("🎯 ВАЖНОСТЬ 22 БАЗОВЫХ ПРИЗНАКОВ (агрегировано по всем лагам):")
+            for i, row in df_base_imp.iterrows():
+                logger.info(f"   {i + 1:2d}. {row['base_feature']}: {row['total_gain']:.0f}")
+
+        except Exception as e:
+            logger.warning(f"Не удалось создать анализ важности признаков: {e}")
 
         # === 2) Гистограммы ===
         y_pred = proba.argmax(axis=1)
