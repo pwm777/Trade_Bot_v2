@@ -13,10 +13,10 @@ from typing import (
     TypedDict, Literal, Protocol, Dict, Any, List, Optional, runtime_checkable, Callable, cast, Union
 )
 import pandas as pd
-from enum import Enum
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from decimal import Decimal
+from enum import Enum, IntEnum
 import uuid
 import time
 import logging
@@ -1064,26 +1064,10 @@ def normalize_direction(direction: Any) -> Literal[1, -1, 0]:
 def direction_to_side(direction: Union[int, Direction]) -> DirectionStr:
     """
     Конвертация Direction/int → строка для биржевых API.
-
-    Args:
-        direction: Direction enum или числовое значение (1, -1, 0)
-
-    Returns:
-        Строка "BUY", "SELL" или "FLAT"
-
-    Examples:
-        >>> direction_to_side(Direction.BUY)
-        "BUY"
-        >>> direction_to_side(1)
-        "BUY"
-        >>> direction_to_side(-1)
-        "SELL"
-
-    Raises:
-        KeyError: Если передано некорректное числовое значение
     """
     if isinstance(direction, Direction):
-        return cast(DirectionStr, direction.side)
+        # ✅ ИСПРАВЛЕНО: явное приведение
+        return cast(DirectionStr, direction.name)  # Используем .name вместо .side
 
     mapping: Dict[int, DirectionStr] = {1: "BUY", -1: "SELL", 0: "FLAT"}
     return mapping[direction]
