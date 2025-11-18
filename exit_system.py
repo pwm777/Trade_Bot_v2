@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import logging
 from iqts_standards import (DetectorSignal, DirectionLiteral,
-            validate_market_data, Timeframe)
+            validate_market_data, Timeframe, normalize_direction)
 from iqts_detectors import (RoleBasedOnlineTrendDetector, MLGlobalTrendDetector)
 
 class ExitDecision(TypedDict, total=False):
@@ -263,7 +263,7 @@ class ExitSignalDetector:
         # ═══════════════════════════════════════════════════════════════
 
         # Веса для расчета общей уверенности (используется только для LOW)
-        weights = {'global': 0.6, 'trend': 0.3, 'entry': 0.1}
+        weights = {'global': 0.6, 'trend': 0.4}
 
         total_confidence_weighted = (
                 weights['global'] * global_rev['confidence'] +
@@ -357,13 +357,13 @@ class AdaptiveExitManager:
     def _calculate_pnl_pct(self,
                            entry_price: float,
                            current_price: float,
-                           direction: str) -> float:
+                           direction: DirectionLiteral) -> float:
         """Расчет PnL в процентах"""
-        if direction == 'BUY':
+        if direction == 1:  # ✅ BUY (числовое значение)
             return (current_price - entry_price) / entry_price
-        elif direction == 'SELL':
+        elif direction == -1:  # ✅ SELL (числовое значение)
             return (entry_price - current_price) / entry_price
-        else:
+        else:  # direction == 0 (FLAT/HOLD)
             return 0.0
 
     async def should_exit_position(self,
@@ -392,7 +392,7 @@ class AdaptiveExitManager:
                 details={"missing": missing}
             )
         opened_at = position['opened_at']
-        direction = cast(DirectionLiteral, signal.get('direction', 'FLAT'))
+        direction = normalize_direction(signal.get('direction'))
         entry_price = signal.get('entry_price', 0.0)
         stop_loss = signal.get('stop_loss', 0.0)
         take_profit = signal.get('take_profit', 0.0)
@@ -475,7 +475,7 @@ class AdaptiveExitManager:
         })
 
     def _check_hard_exits(self,
-                          direction: DirectionLiteral,
+                          direction: DirectionLiteral,  # ✅ Уже правильный тип
                           current_price: float,
                           stop_loss: float,
                           take_profit: float,
@@ -484,15 +484,15 @@ class AdaptiveExitManager:
         """Проверка жестких условий выхода"""
 
         # 1. Стоп-лосс
-        if direction == 'BUY' and current_price <= stop_loss:
+        if direction == 1 and current_price <= stop_loss:  # ✅ BUY
             return {'should_exit': True, 'reason': 'stop_loss_hit', 'type': 'hard'}
-        elif direction == 'SELL' and current_price >= stop_loss:
+        elif direction == -1 and current_price >= stop_loss:  # ✅ SELL
             return {'should_exit': True, 'reason': 'stop_loss_hit', 'type': 'hard'}
 
         # 2. Тейк-профит
-        if direction == 'BUY' and current_price >= take_profit:
+        if direction == 1 and current_price >= take_profit:  # ✅ BUY
             return {'should_exit': True, 'reason': 'take_profit_hit', 'type': 'hard'}
-        elif direction == 'SELL' and current_price <= take_profit:
+        elif direction == -1 and current_price <= take_profit:  # ✅ SELL
             return {'should_exit': True, 'reason': 'take_profit_hit', 'type': 'hard'}
 
         # 3. Адаптивное максимальное время
@@ -538,9 +538,9 @@ class AdaptiveExitManager:
             position['exit_tracking'] = tracking
 
         # Обновляем пик цены
-        if direction == 'BUY':
+        if direction == 1:  # ✅ BUY
             tracking['peak_price'] = max(tracking['peak_price'], current_price)
-        else:
+        else:  # direction == -1  # ✅ SELL
             tracking['peak_price'] = min(tracking['peak_price'], current_price)
 
         # 1. Break-even стоп (при небольшой прибыли)
@@ -583,13 +583,8 @@ class AdaptiveExitManager:
     def update_position_stops(self,
                               position: Dict,
                               current_price: float) -> Dict:
-        """
-        обновление уровней стоп-лосса для позиции
-        возвращает обновленные уровни (для отправки брокеру)
-        """
-
         signal = position['signal']
-        direction = cast(DirectionLiteral, signal.get('direction', 'FLAT'))
+        direction = normalize_direction(signal.get('direction', 0))
         entry_price = signal.get('entry_price', 0.0)
         original_stop_loss = signal.get('stop_loss', 0.0)
 
@@ -602,19 +597,19 @@ class AdaptiveExitManager:
 
         # Break-even стоп (безубыток + буфер)
         if pnl_pct >= self.breakeven_activation and tracking.get('breakeven_moved', False):
-            if direction == 'BUY':
+            if direction == 1:  # ✅ BUY
                 new_stop_loss = entry_price * 1.002  # +0.2% буфер
-            else:
+            else:  # direction == -1  # ✅ SELL
                 new_stop_loss = entry_price * 0.998  # -0.2% буфер
 
         # Трейлинг стоп (двигается за ценой)
         if tracking.get('trailing_active', False):
             peak_price = tracking.get('peak_price', current_price)
 
-            if direction == 'BUY':
+            if direction == 1:  # ✅ BUY
                 trailing_stop = peak_price * (1 - self.trailing_stop_distance)
                 new_stop_loss = max(new_stop_loss, trailing_stop)  # Никогда не опускаем
-            else:
+            else:  # direction == -1  # ✅ SELL
                 trailing_stop = peak_price * (1 + self.trailing_stop_distance)
                 new_stop_loss = min(new_stop_loss, trailing_stop)  # Никогда не поднимаем
 
