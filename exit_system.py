@@ -47,11 +47,11 @@ class ExitSignalDetector:
         )
 
         # Пороги для каскадного анализа
+        # Строки 50-55
         self.cascading_thresholds = {
-            'all_levels_sum': 0.7,  # Суммарная confidence всех трех уровней
-            'global_hint': 0.3,  # Минимальный намек от глобального
-            'lower_tf_min': 0.2,  # Минимум для хотя бы одного младшего
-            'lower_tf_weighted': 0.25,  # Минимум взвешенной силы младших
+            'both_levels_sum': 0.65,  # ✅ Снижено с 0.7 (для 2 уровней)
+            'global_hint': 0.3,  # ✅ Без изменений
+            'trend_min': 0.25,  # ✅ Минимум для 1m
         }
 
         # Классические пороги (запасной вариант)
@@ -171,7 +171,6 @@ class ExitSignalDetector:
         global_rev = signals['global_reversal']
         trend_rev = signals['trend_reversal']
         trend_weak = signals['trend_weakening']
-        # ❌ УДАЛИТЬ: entry_rev = signals['entry_reversal']
 
         # УСЛОВИЕ 1: Оба уровня показывают проблему
         all_levels_detect = (
