@@ -35,6 +35,7 @@ risk_manager.py
 
 from __future__ import annotations
 from typing import TypedDict, Dict, Any, Optional, Literal, Protocol, Union, Tuple
+from iqts_standards import DetectorSignal
 from enum import IntEnum
 from dataclasses import dataclass, field
 import numpy as np
@@ -169,13 +170,25 @@ class RiskManagerInterface(Protocol):
 
     def calculate_position_size(
             self,
-            signal: Dict[str, Any],
+            signal: DetectorSignal,  # ✅ ИСПРАВЛЕНО: DetectorSignal вместо Dict[str, Any]
             current_price: float,
             atr: float,
             account_balance: float
     ) -> float:
-        """Расчёт размера позиции"""
-        ...
+        """
+        Расчёт размера позиции на основе ATR и доли портфеля.
+
+        Args:
+            signal: DetectorSignal с полем 'ok'
+            current_price: Текущая цена
+            atr: Average True Range
+            account_balance: Баланс счёта
+
+        Returns:
+            Размер позиции (в единицах актива), 0.0 если некорректные данные
+        """
+        if not signal.get("ok", False) or atr <= 0 or current_price <= 0 or account_balance <= 0:
+            return 0.0
 
     def calculate_dynamic_stops(
             self,
@@ -402,7 +415,7 @@ class EnhancedRiskManager:
 
     def calculate_risk_context(
             self,
-            signal: Dict[str, Any],
+            signal: DetectorSignal,
             current_price: float,
             atr: float,
             account_balance: float,
@@ -688,7 +701,7 @@ class EnhancedRiskManager:
 
     def _validate_inputs(
             self,
-            signal: Dict[str, Any],
+            signal: DetectorSignal,
             current_price: float,
             atr: float,
             account_balance: float

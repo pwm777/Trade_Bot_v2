@@ -131,13 +131,23 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
         self._daily_stats_lock = Lock()
 
     def _initialize_risk_manager(self, risk_config: Dict):
-        return EnhancedRiskManager(
+        """
+        Инициализация риск-менеджера с новым API (v2.0).
+        Args:
+            risk_config: Конфигурация риска из config.py
+        Returns:
+            EnhancedRiskManager с настроенными лимитами
+        """
+        # создаём RiskLimits объект
+        limits = RiskLimits(
             max_portfolio_risk=risk_config.get('max_position_risk', 0.02),
             max_daily_loss=risk_config.get('max_daily_loss', 0.05),
-            atr_periods=risk_config.get('atr_periods', 14),
+            max_position_value_pct=0.30,  # Default из RiskLimits
             stop_loss_atr_multiplier=risk_config.get('stop_atr_multiplier', 2.0),
-            take_profit_atr_multiplier=risk_config.get('tp_atr_multiplier', 3.0)
+            take_profit_atr_multiplier=risk_config.get('tp_atr_multiplier', 3.0),
+            atr_periods=risk_config.get('atr_periods', 14)
         )
+        return EnhancedRiskManager(limits=limits)
 
     def _initialize_performance_tracker(self) -> Dict:
         return {
