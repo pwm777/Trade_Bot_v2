@@ -11,6 +11,7 @@
 from __future__ import annotations
 from typing import (
     TypedDict, Literal, Protocol, Dict, Any, List, Optional, runtime_checkable, Callable, cast
+    Union
 )
 import pandas as pd
 from enum import Enum
@@ -26,7 +27,73 @@ from datetime import datetime, UTC
 # =============================================================================
 
 Timeframe = Literal["1m", "5m", "15m", "1h"]
-DirectionLiteral = Literal[1, -1, 0]  # 1->BUY, -1->SELL, 0->HOLD
+
+# ============================================================================
+# === DIRECTION TYPES (ЕДИНАЯ СИСТЕМА КООРДИНАТ) =============================
+# ============================================================================
+
+class Direction(IntEnum):
+    """
+    Направление позиции (числовые значения для совместимости с DirectionLiteral).
+
+    Значения:
+        BUY = 1   -> Покупка (Long)
+        SELL = -1 -> Продажа (Short)
+        FLAT = 0  -> Нет позиции (Hold)
+
+    Использование:
+        direction = Direction.BUY  # Значение: 1
+        if direction == Direction.BUY:
+            side = direction.side  # "BUY"
+        opposite = direction.opposite()  # Direction.SELL
+    """
+    BUY = 1
+    SELL = -1
+    FLAT = 0
+
+    @property
+    def side(self) -> str:
+        """Строковое представление для биржевых API"""
+        return self.name  # "BUY", "SELL", "FLAT"
+
+    def opposite(self) -> 'Direction':
+        """Возвращает противоположное направление"""
+        if self == Direction.BUY:
+            return Direction.SELL
+        elif self == Direction.SELL:
+            return Direction.BUY
+        return Direction.FLAT
+
+    def __str__(self) -> str:
+        return self.name
+
+
+# Числовой формат (backward compatibility для DetectorSignal)
+DirectionLiteral = Literal[1, -1, 0]
+"""
+DEPRECATED: Используйте Direction enum вместо этого.
+Числовой формат направления для обратной совместимости.
+
+Значения:
+    1  -> BUY/LONG  (эквивалентно Direction.BUY)
+    -1 -> SELL/SHORT (эквивалентно Direction.SELL)
+    0  -> FLAT/HOLD  (эквивалентно Direction.FLAT)
+"""
+
+# Строковый формат (для биржевых API)
+DirectionStr = Literal["BUY", "SELL", "FLAT"]
+"""
+Строковый формат направления для биржевых API и OrderReq.
+
+Значения:
+    "BUY"  -> Покупка (эквивалентно Direction.BUY или 1)
+    "SELL" -> Продажа (эквивалентно Direction.SELL или -1)
+    "FLAT" -> Нет позиции (эквивалентно Direction.FLAT или 0)
+"""
+
+# Обобщённый тип (для функций, принимающих любой формат)
+DirectionType = Union[Direction, DirectionLiteral, DirectionStr, int, str]
+
 MarketRegimeLiteral = Literal[
     "strong_uptrend", "weak_uptrend",
     "strong_downtrend", "weak_downtrend",
@@ -264,15 +331,37 @@ class RegimeInfo(TypedDict, total=False):
 
 
 class RiskContext(TypedDict, total=False):
+    """
+    Контекст риск-параметров для позиции.
+
+    ВАЖНО: Расширен в v2.0 для поддержки EnhancedRiskManager.
+    """
+    # Основные параметры позиции
+    position_size: float
+    initial_stop_loss: float
+    take_profit: float
+
+    # Метаданные расчёта
     atr: float
     stop_atr_multiplier: float
     tp_atr_multiplier: float
-    volatility_regime: float
-    regime: MarketRegimeLiteral
-    regime_confidence: float
-    stop_loss: Optional[float]
-    take_profit: Optional[float]
 
+    # Режим рынка
+    volatility_regime: float
+    regime: Optional[str]
+    regime_confidence: float
+
+    # Аудит и трассировка (v2.0)
+    computed_at_ms: int
+    risk_manager_version: str
+    validation_hash: Optional[str]
+
+    # Дополнительные параметры (v2.0)
+    max_hold_time_minutes: Optional[int]
+    trailing_config: Optional[Dict[str, float]]
+
+    # Backward compatibility (deprecated, алиас для initial_stop_loss)
+    stop_loss: Optional[float]
 
 # =============================================================================
 # === BOT LIFECYCLE TYPES =====================================================
@@ -344,7 +433,7 @@ class RiskManagerInterface(Protocol):
             self,
             *,
             entry_price: float,
-            direction: Literal[1, -1, 0],
+            direction: Union[Direction, DirectionLiteral],
             atr: float,
             regime_ctx: RiskContext
     ) -> tuple[float, float]: ...
@@ -968,6 +1057,134 @@ def normalize_direction(direction: Any) -> Literal[1, -1, 0]:
         return normalize_direction(name)
     return 0
 
+
+# ============================================================================
+# === DIRECTION CONVERSION FUNCTIONS (v2.0) ==================================
+# ============================================================================
+
+def direction_to_side(direction: Union[int, Direction]) -> DirectionStr:
+    """
+    Конвертация Direction/int → строка для биржевых API.
+
+    Args:
+        direction: Direction enum или числовое значение (1, -1, 0)
+
+    Returns:
+        Строка "BUY", "SELL" или "FLAT"
+
+    Examples:
+        >>> direction_to_side(Direction.BUY)
+        "BUY"
+        >>> direction_to_side(1)
+        "BUY"
+        >>> direction_to_side(-1)
+        "SELL"
+
+    Raises:
+        KeyError: Если передано некорректное числовое значение
+    """
+    if isinstance(direction, Direction):
+        return cast(DirectionStr, direction.side)
+
+    mapping: Dict[int, DirectionStr] = {1: "BUY", -1: "SELL", 0: "FLAT"}
+    return mapping[direction]
+
+
+def direction_to_int(direction: Union[Direction, DirectionStr, str]) -> DirectionLiteral:
+    """
+    Конвертация Direction/str → числовое значение.
+
+    Args:
+        direction: Direction enum или строка ("BUY", "SELL", "FLAT")
+
+    Returns:
+        Числовое значение (1, -1, 0)
+
+    Examples:
+        >>> direction_to_int(Direction.BUY)
+        1
+        >>> direction_to_int("BUY")
+        1
+        >>> direction_to_int("SELL")
+        -1
+
+    Raises:
+        KeyError: Если передана некорректная строка
+    """
+    if isinstance(direction, Direction):
+        return cast(DirectionLiteral, direction.value)
+
+    if isinstance(direction, str):
+        mapping: Dict[str, DirectionLiteral] = {
+            "BUY": 1, "LONG": 1, "BULL": 1,
+            "SELL": -1, "SHORT": -1, "BEAR": -1,
+            "FLAT": 0, "HOLD": 0, "WAIT": 0
+        }
+        return mapping[direction.upper()]
+
+    return cast(DirectionLiteral, direction)
+
+
+def side_to_direction(side: str) -> Direction:
+    """
+    Конвертация строка → Direction enum.
+
+    Args:
+        side: Строка "BUY", "SELL" или "FLAT" (регистронезависимо)
+
+    Returns:
+        Direction enum
+
+    Examples:
+        >>> side_to_direction("BUY")
+        Direction.BUY
+        >>> side_to_direction("sell")
+        Direction.SELL
+        >>> side_to_direction("LONG")
+        Direction.BUY
+
+    Raises:
+        KeyError: Если передана некорректная строка
+    """
+    mapping = {
+        "BUY": Direction.BUY,
+        "LONG": Direction.BUY,
+        "BULL": Direction.BUY,
+        "SELL": Direction.SELL,
+        "SHORT": Direction.SELL,
+        "BEAR": Direction.SELL,
+        "FLAT": Direction.FLAT,
+        "HOLD": Direction.FLAT,
+        "WAIT": Direction.FLAT,
+    }
+    return mapping[side.upper()]
+
+
+def normalize_direction_v2(value: Any) -> Direction:
+    """
+    Универсальная конвертация произвольного значения в Direction enum.
+
+    НОВАЯ ВЕРСИЯ (v2.0): Возвращает Direction enum вместо int.
+    Для старого поведения используйте normalize_direction().
+
+    Поддерживает:
+        - Direction enum (возвращает как есть)
+        - Строки: "BUY", "SELL", "FLAT", "LONG", "SHORT", "HOLD"
+        - Числа: > 0 → BUY, < 0 → SELL, 0 → FLAT
+        - None → FLAT
+
+    Args:
+        value: Значение для конвертации
+
+    Returns:
+        Direction enum
+
+    Examples:
+        >>> normalize_direction_v2("BUY")
+        Direction.BUY
+        >>> normalize_direction_v2(1)
+        Direction.BUY
+        >>> normalize_direction_v2(-1)
 def validate_market_data(data: Dict[Timeframe, pd.DataFrame]) -> bool:
     """Light-версия без тяжёлых pandas-операций"""
     if not isinstance(data, dict) or not data:
@@ -1152,6 +1369,12 @@ __all__ = [
     # Типы и литералы
     "Timeframe",
     "DirectionLiteral",
+
+    # Direction types (v2.0)
+    "Direction",
+    "DirectionStr",
+    "DirectionType",
+
     "MarketRegimeLiteral",
     "ReasonCode",
     "ExecutionMode",
@@ -1193,6 +1416,13 @@ __all__ = [
 
     # Утилиты
     "normalize_signal", "normalize_direction",
+
+    # Direction conversion (v2.0)
+    "direction_to_side",
+    "direction_to_int",
+    "side_to_direction",
+    "normalize_direction_v2",
+
      "validate_market_data",
     "validate_system_status", "normalize_trading_hours",
     "map_reason", "get_reason_category", "is_successful_reason",

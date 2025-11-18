@@ -23,7 +23,7 @@ from iqts_standards import (Timeframe,
 from multi_timeframe_confirmator import ThreeLevelHierarchicalConfirmator
 
 # Риск-менеджмент
-from improved_algorithm import EnhancedRiskManager
+from risk_manager import EnhancedRiskManager, Direction, RiskContext, RiskLimits
 
 # Определяем тип для рыночных режимов
 RegimeType = Literal["strong_uptrend", "weak_uptrend", "strong_downtrend", "weak_downtrend", "sideways", "uncertain"]
