@@ -6,7 +6,7 @@ PositionTracker — отслеживает активные и закрытые 
 Гибкая конфигурация — поддержка таймфреймов, управления рисками, ограничений.
 Бот получает данные, потом анализирует их, и генерирует сигналы, →
 исполняет сделки, → управляет позициями → логирует результаты."""
-
+from __future__ import annotations
 from collections import deque
 import asyncio
 import logging
@@ -19,6 +19,7 @@ from ImprovedQualityTrendSystem import ImprovedQualityTrendSystem
 from enhanced_monitoring import EnhancedMonitoringSystem, enhanced_telegram_alert, enhanced_email_alert
 from iqts_standards import ( TradeSignalIQTS,  TradeResult, REQUIRED_OHLCV_COLUMNS)
 from signal_validator import validate_signal
+from signal_validator import SignalValidator
 from exit_system import AdaptiveExitManager
 from risk_manager import EnhancedRiskManager
 
@@ -103,13 +104,15 @@ class EnhancedTradingBot:
     """
     def __init__(self, config: Dict, data_provider: DataProvider,
                  execution_engine: ExecutionEngine, trading_system: Optional[ImprovedQualityTrendSystem] = None,
-                 risk_manager: Optional[EnhancedRiskManager] = None ):
+                 risk_manager: Optional[EnhancedRiskManager] = None,
+                 validator: Optional["SignalValidator"] = None,
+                 ):
         self.config = config
         self.data_provider = data_provider
         self.execution_engine = execution_engine
         self.logger = self._setup_logging()
         self.risk_manager = risk_manager
-        self.validator = validator
+        self.validator = validator or SignalValidator(strict_mode=False)
         # ⭐ ИСПРАВЛЕНО: Используем переданную стратегию или создаем новую
         if trading_system is not None:
             self.trading_system = trading_system

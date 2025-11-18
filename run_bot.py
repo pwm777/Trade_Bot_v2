@@ -418,7 +418,8 @@ class BotLifecycleManager:
                 risk_manager=risk_manager,
                 trade_log=trade_log,
                 market_data_utils=market_data_utils,
-                logger=logger
+                logger=logger,
+                validator=validator,
             )
 
             return ComponentsContainer(
@@ -1125,7 +1126,8 @@ class BotLifecycleManager:
                                risk_manager: Optional[Any],
                                trade_log: Any,
                                market_data_utils: Any,
-                               logger: logging.Logger) -> MainBotInterface:
+                               logger: logging.Logger,
+                               validator: Any) -> MainBotInterface:
         """
         Создаём главный бот с переданной стратегией для цикла торговли.
         ✅ ОБНОВЛЕНО: Интеграция с PositionManager для правильного управления позициями.
@@ -1557,7 +1559,8 @@ class BotLifecycleManager:
             data_provider=data_provider,
             execution_engine=execution_engine,
             trading_system=cast(ImprovedQualityTrendSystem, strategy),
-            risk_manager=risk_manager
+            risk_manager=risk_manager,
+            validator=validator,
         )
         logger.info("✅ EnhancedTradingBot created with RiskManager DI")
         # END REPLACE

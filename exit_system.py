@@ -1,11 +1,12 @@
 # exit_system.py
-
+from __future__ import annotations
 from typing import Dict,  Tuple, TypedDict, Any, cast, Optional
 from datetime import datetime, timedelta
 import pandas as pd
 import logging
-from iqts_standards import (DetectorSignal, DirectionLiteral,
-            validate_market_data, Timeframe, normalize_direction)
+from iqts_standards import (DetectorSignal,
+            validate_market_data, Timeframe, normalize_direction,
+                            DirectionLiteral)
 from iqts_detectors import (RoleBasedOnlineTrendDetector, MLGlobalTrendDetector)
 from risk_manager import Direction
 
@@ -107,7 +108,7 @@ class ExitSignalDetector:
 
         return exit_decision
 
-    def _check_reversal(self, signal: DetectorSignal, position_direction: DirectionLiteral) -> Dict:
+    def _check_reversal(self, signal: DetectorSignal, position_direction: 'DirectionLiteral') -> Dict[str, Any]:
         """
         Проверка полного разворота тренда
         Если мы в BUY, а сигнал показывает SELL - это разворот
@@ -120,15 +121,14 @@ class ExitSignalDetector:
                 'signal_ok': False
             }
 
-        signal_direction = signal.get("direction", "FLAT")
+        signal_direction = signal.get("direction", 0)  # int: 1/-1/0
         signal_confidence = signal.get("confidence", 0.0)
 
+        # Нормализуем position_direction к int
+        pos_dir = normalize_direction(position_direction)  # 1/-1/0
+
         # Разворот = противоположное направление
-        is_reversal = False
-        if position_direction == "BUY" and signal_direction == "SELL":
-            is_reversal = True
-        elif position_direction == "SELL" and signal_direction == "BUY":
-            is_reversal = True
+        is_reversal = (pos_dir == 1 and signal_direction == -1) or (pos_dir == -1 and signal_direction == 1)
 
         return {
             'detected': is_reversal,
