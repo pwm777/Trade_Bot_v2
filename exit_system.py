@@ -29,12 +29,10 @@ class ExitSignalDetector:
 
     def __init__(self,
                  global_timeframe: Timeframe = "5m",
-                 trend_timeframe: Timeframe = "1m",
-                 entry_timeframe: Timeframe = "10s"):
+                 trend_timeframe: Timeframe = "1m"):
 
         self.global_timeframe: Timeframe = global_timeframe
         self.trend_timeframe: Timeframe = trend_timeframe
-        self.entry_timeframe: Timeframe = entry_timeframe
 
         # Детекторы для анализа разворота
         self.global_detector = MLGlobalTrendDetector(
@@ -46,11 +44,6 @@ class ExitSignalDetector:
         self.trend_detector = RoleBasedOnlineTrendDetector(
             role="trend",
             name=f"exit_trend_{trend_timeframe}"
-        )
-
-        self.entry_detector = RoleBasedOnlineTrendDetector(
-            role="entry",
-            name=f"exit_entry_{entry_timeframe}"
         )
 
         # Пороги для каскадного анализа
@@ -101,14 +94,12 @@ class ExitSignalDetector:
         # Анализируем все три уровня
         global_signal = await self.global_detector.analyze(data)
         trend_signal = await self.trend_detector.analyze(data)
-        entry_signal = await self.entry_detector.analyze(data)
 
         # Проверяем разворот и ослабление на каждом уровне
         exit_signals = {
             'global_reversal': self._check_reversal(global_signal, position_direction),
             'trend_weakening': self._check_weakening(trend_signal, position_direction),
             'trend_reversal': self._check_reversal(trend_signal, position_direction),
-            'entry_reversal': self._check_reversal(entry_signal, position_direction)
         }
 
         # Комбинируем сигналы с приоритетом каскадной логики
@@ -189,7 +180,6 @@ class ExitSignalDetector:
         # ═══════════════════════════════════════════════════════════════
 
         all_levels_detect = (
-                entry_rev['detected'] and
                 (trend_rev['detected'] or trend_weak['detected']) and
                 global_rev['detected']
         )
@@ -216,14 +206,12 @@ class ExitSignalDetector:
 
         # 1m важнее 10s (вес 75% vs 25%)
         lower_tf_weighted = (
-                0.75 * max(trend_rev['confidence'], trend_weak['confidence']) +
-                0.25 * entry_rev['confidence']
+                0.75 * max(trend_rev['confidence'], trend_weak['confidence'])
         )
 
         # Хотя бы один из младших достаточно силен
         any_lower_strong = (
-                max(trend_rev['confidence'], trend_weak['confidence']) >= self.cascading_thresholds['lower_tf_min'] or
-                entry_rev['confidence'] >= self.cascading_thresholds['lower_tf_min']
+                max(trend_rev['confidence'], trend_weak['confidence']) >= self.cascading_thresholds['lower_tf_min']
         )
 
         # ═══════════════════════════════════════════════════════════════
@@ -392,14 +380,12 @@ class AdaptiveExitManager:
 
     def __init__(self,
                  global_timeframe: Timeframe = "5m",
-                 trend_timeframe: Timeframe = "1m",
-                 entry_timeframe: Timeframe = "1m"):
+                 trend_timeframe: Timeframe = "1m"):
 
         # Детектор сигналов на выход (с каскадной логикой)
         self.exit_detector = ExitSignalDetector(
             global_timeframe=global_timeframe,
-            trend_timeframe=trend_timeframe,
-            entry_timeframe=entry_timeframe
+            trend_timeframe=trend_timeframe
         )
 
         # Параметры трейлинг стопа
