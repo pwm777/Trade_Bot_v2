@@ -791,6 +791,84 @@ class AdaptiveExitManager:
                 'error': str(e)
             }
 
+    def update_trailing_state(self, position: Dict, current_price: float) -> Dict[str, Any]:
+        """
+        Централизованное управление peak_price, breakeven, trailing_active.
+        Возвращает:
+          {
+            'new_stop_loss': Optional[float],
+            'changed': bool,
+            'reason': str,
+            'tracking': updated_tracking
+          }
+        """
+        signal = position.get("signal", {})
+        direction_raw = signal.get("direction", 0)
+        entry_price = signal.get("entry_price", 0.0)
+        original_stop = signal.get("stop_loss", 0.0)
+
+        if entry_price <= 0 or current_price <= 0:
+            return {'changed': False, 'reason': 'invalid_price'}
+
+        direction = 1 if direction_raw in (1, "BUY", "LONG") else -1 if direction_raw in (-1, "SELL", "SHORT") else 0
+
+        tracking = position.get("exit_tracking")
+        if tracking is None:
+            tracking = {
+                "peak_price": entry_price,
+                "breakeven_moved": False,
+                "trailing_active": False
+            }
+            position["exit_tracking"] = tracking
+
+        # Обновление peak_price
+        if direction == 1:
+            tracking["peak_price"] = max(tracking["peak_price"], current_price)
+        elif direction == -1:
+            tracking["peak_price"] = min(tracking["peak_price"], current_price)
+
+        pnl_pct = (current_price - entry_price) / entry_price if direction == 1 else (
+                                                                                                 entry_price - current_price) / entry_price if direction == -1 else 0.0
+
+        new_stop = original_stop
+        changed = False
+        reason = "no_change"
+
+        # breakeven
+        if pnl_pct >= self.breakeven_activation and not tracking["breakeven_moved"]:
+            tracking["breakeven_moved"] = True
+            if direction == 1:
+                new_stop = entry_price * 1.002  # +0.2%
+            else:
+                new_stop = entry_price * 0.998  # -0.2%
+            changed = True
+            reason = "breakeven_adjust"
+
+        # trailing activation
+        if pnl_pct >= self.trailing_stop_activation:
+            tracking["trailing_active"] = True
+            peak = tracking["peak_price"]
+            if direction == 1:
+                trailing_stop = peak * (1 - self.trailing_stop_distance)
+                if trailing_stop > new_stop:
+                    new_stop = trailing_stop
+                    changed = True
+                    reason = "trailing_adjust"
+            elif direction == -1:
+                trailing_stop = peak * (1 + self.trailing_stop_distance)
+                if trailing_stop < new_stop:
+                    new_stop = trailing_stop
+                    changed = True
+                    reason = "trailing_adjust"
+
+        return {
+            "new_stop_loss": new_stop if changed else None,
+            "changed": changed,
+            "reason": reason,
+            "tracking": tracking,
+            "pnl_pct": pnl_pct
+        }
+
     def _get_trailing_config_for_symbol(self, symbol: str) -> Dict[str, Any]:
         """
         Получить конфигурацию trailing stop для символа.

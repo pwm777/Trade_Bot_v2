@@ -10,7 +10,7 @@ PositionTracker — отслеживает активные и закрытые 
 from collections import deque
 import asyncio
 import logging
-from typing import Dict, List, Optional, cast, Literal
+from typing import Dict, List, Optional, cast, Literal, Any
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from ImprovedQualityTrendSystem import ImprovedQualityTrendSystem
 from enhanced_monitoring import EnhancedMonitoringSystem, enhanced_telegram_alert, enhanced_email_alert
 from iqts_standards import ( TradeSignalIQTS,  TradeResult, REQUIRED_OHLCV_COLUMNS)
+from signal_validator import validate_signal
 from exit_system import AdaptiveExitManager
 from risk_manager import EnhancedRiskManager
 
@@ -107,7 +108,8 @@ class EnhancedTradingBot:
         self.data_provider = data_provider
         self.execution_engine = execution_engine
         self.logger = self._setup_logging()
-        self.risk_manager = risk_manager or EnhancedRiskManager(config.get('risk', {}))
+        self.risk_manager = risk_manager
+        self.validator = validator
         # ⭐ ИСПРАВЛЕНО: Используем переданную стратегию или создаем новую
         if trading_system is not None:
             self.trading_system = trading_system
@@ -339,7 +341,8 @@ class EnhancedTradingBot:
             self.logger.error(f"Error converting IQTS signal to TradeSignal: {e}", exc_info=True)
             return None
 
-    async def _process_trade_signal(self, trade_signal: TradeSignalIQTS):
+    @validate_signal(signal_type="trade_iqts", layer="bot_process", strict=False)
+    async def _process_trade_signal(self, trade_signal: Dict[str, Any]):
         """
         ✅ ОБНОВЛЕНО: Обработка через PositionManager с поддержкой risk_context.
 
@@ -844,26 +847,50 @@ class EnhancedTradingBot:
 
     async def _manage_existing_positions(self,
                                          market_data: Dict[Literal["1m", "5m", "15m", "1h"], pd.DataFrame]):
-        """✅ ОБНОВЛЕНО: Управление с адаптивным выходом с правильным типом"""
+        """
+        ✅ ОБНОВЛЕНО:
+        - Централизация трейлинга в ExitManager: используем update_trailing_state() при наличии
+        - Безопасное определение primary_timeframe
+        - Корректная обработка закрытия и обновления SL
+        - Fallback на старый update_position_stops(), если нет нового метода
+        """
         if not self.active_positions:
             return
 
-        # ✅ ИСПРАВЛЕНО: Явное приведение типа primary_timeframe
+        # Определяем основной таймфрейм для текущих данных
         from typing import cast, Literal
-        primary_timeframe_str = min(self.timeframes, key=self._parse_timeframe)
-        primary_timeframe = cast(Literal["1m", "5m", "15m", "1h"], primary_timeframe_str)
+        try:
+            primary_timeframe_str = min(self.timeframes, key=self._parse_timeframe)
+            primary_timeframe = cast(Literal["1m", "5m", "15m", "1h"], primary_timeframe_str)
+            if primary_timeframe not in market_data:
+                # Fallback: берём любой доступный из market_data
+                primary_timeframe = cast(
+                    Literal["1m", "5m", "15m", "1h"],
+                    next(iter(market_data.keys()))
+                )
+        except Exception:
+            # Совсем безопасный fallback
+            primary_timeframe = cast(Literal["1m", "5m", "15m", "1h"], "1m")
 
-        current_price = float(market_data[primary_timeframe]['close'].iloc[-1])
+        # Текущая цена по основному ТФ
+        try:
+            current_price = float(market_data[primary_timeframe]['close'].iloc[-1])
+        except Exception:
+            self.logger.warning("Cannot get current_price from market_data; skip manage positions")
+            return
 
         for position_id, position in list(self.active_positions.items()):
             try:
+                # 1) Обновляем PnL трекера
                 self.position_tracker.update_position_pnl(position_id, current_price)
-                # ✅ ИСПРАВЛЕНО: Передаем market_data с правильным типом
+
+                # 2) Решение о выходе (каскад/жёсткие условия/сигналы)
                 should_exit, reason, details = await self.exit_manager.should_exit_position(
                     position=position,
-                    market_data=market_data,  # Тип уже приведен
+                    market_data=market_data,
                     current_price=current_price
                 )
+
                 if should_exit:
                     self.logger.info(
                         f"Closing position {position_id}: {reason} "
@@ -879,25 +906,42 @@ class EnhancedTradingBot:
                             f"Failed to close position {position_id}: "
                             f"{close_result.get('error', 'Unknown error')}"
                         )
+                    continue  # позиция закрыта/попытка закрытия выполнена
+
+                # 3) Управление трейлингом/безубытком — централизовано в ExitManager
+                if hasattr(self.exit_manager, "update_trailing_state"):
+                    upd = self.exit_manager.update_trailing_state(position, current_price)
+                    if upd.get("changed") and upd.get("new_stop_loss"):
+                        new_sl = float(upd["new_stop_loss"])
+                        # Обновляем локальный сигнал (для консистентности)
+                        position['signal']['stop_loss'] = new_sl
+                        # Сохраняем обновлённый tracking
+                        if 'tracking' in upd:
+                            position['exit_tracking'] = upd['tracking']
+
+                        self.logger.info(
+                            f"Trailing SL updated for {position_id}: {new_sl:.5f} "
+                            f"({upd.get('reason', 'trailing_adjust')})"
+                        )
+                        await self._update_position_stop_loss(position_id, new_sl)
+
                 else:
-                    # ✅ НОВОЕ: Обновляем стопы (трейлинг, break-even)
+                    # Fallback на существующую логику ExitManager (legacy)
                     updated_stops = self.exit_manager.update_position_stops(
                         position=position,
                         current_price=current_price
                     )
                     if updated_stops.get('updated', False):
-                        position['signal']['stop_loss'] = updated_stops['stop_loss']
+                        new_sl = float(updated_stops['stop_loss'])
+                        position['signal']['stop_loss'] = new_sl
                         self.logger.info(
                             f"Updated stop-loss for {position_id}: "
-                            f"{updated_stops['stop_loss']:.5f} ({updated_stops['reason']})"
+                            f"{new_sl:.5f} ({updated_stops.get('reason', 'unknown')})"
                         )
-                        await self._update_position_stop_loss(
-                            position_id,
-                            updated_stops['stop_loss']
-                        )
+                        await self._update_position_stop_loss(position_id, new_sl)
+
             except Exception as e:
                 self.logger.error(f"Error managing position {position_id}: {e}", exc_info=True)
-
 
     async def _send_trade_notification(self, trade_signal: TradeSignalIQTS, execution_result: Dict):
         """Отправка уведомления об открытии сделки"""

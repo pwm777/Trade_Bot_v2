@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 from market_aggregator import MarketAggregatorFactory
 from ImprovedQualityTrendSystem import ImprovedQualityTrendSystem
+from signal_validator import SignalValidator
 from trading_logger import TradingLogger
 import config as cfg
 import os
@@ -374,13 +375,13 @@ class BotLifecycleManager:
 
             # --- Exit Manager (DI) ---
             exit_manager = await self._create_exit_manager(logger)
+            validator = SignalValidator(strict_mode=self.config.get("validation", {}).get("strict_mode", False),
+                                        logger=logger)
+            logger.info("✅ SignalValidator created (DI)")
 
             # --- Exchange Manager (нужен до PositionManager для связки) ---
             exchange_manager = await self._create_exchange_manager(trade_log, logger)
 
-            # --- Position Manager с DI ---
-            # Обнови _create_position_manager чтобы он принимал risk_manager / exit_manager,
-            # либо передай их после создания (если конструктор уже модифицирован).
             position_manager = await self._create_position_manager(
                 trade_log=trade_log,
                 logger=logger
@@ -394,6 +395,8 @@ class BotLifecycleManager:
             if hasattr(position_manager, 'exit_manager') and not position_manager.exit_manager and exit_manager:
                 position_manager.exit_manager = exit_manager
                 logger.info("🔗 Injected exit_manager into PositionManager")
+
+            position_manager.validator = validator
 
             # Связка execution engine
             position_manager.execution_engine = exchange_manager
@@ -1547,7 +1550,7 @@ class BotLifecycleManager:
             logger=logger
         )
         logger.info("✅ ExecutionEngine created with PositionManager integration")
-
+        exchange_manager.validator = validator
         # BEGIN REPLACE: создание core_bot с DI risk_manager и exit_manager
         core_bot = EnhancedTradingBot(
             config=self.config,
