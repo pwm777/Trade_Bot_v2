@@ -4,7 +4,6 @@ market_data_utils.py - Утилиты для расчета индикаторо
 """
 
 from __future__ import annotations
-import time
 import asyncio
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import  create_async_engine
@@ -18,7 +17,6 @@ from dataclasses import dataclass
 from typing import Optional
 import statistics
 from dataclasses import asdict,field
-from sqlalchemy.ext.asyncio import AsyncEngine
 from iqts_standards import FEATURE_NAME_MAP
 from datetime import datetime, timedelta, timezone, UTC
 from tqdm import tqdm

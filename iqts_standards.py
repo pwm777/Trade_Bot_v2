@@ -16,7 +16,7 @@ import pandas as pd
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from enum import Enum, IntEnum
+from enum import IntEnum
 import uuid
 import time
 import logging
@@ -51,9 +51,8 @@ class Direction(IntEnum):
     FLAT = 0
 
     @property
-    def side(self) -> str:
-        """Строковое представление для биржевых API"""
-        return self.name  # "BUY", "SELL", "FLAT"
+    def side(self) -> DirectionStr:
+        return cast(DirectionStr, self.name)
 
     def opposite(self) -> 'Direction':
         """Возвращает противоположное направление"""
@@ -907,13 +906,6 @@ def is_successful_reason(reason: ReasonCode) -> bool:
         False
     """
     return get_reason_category(reason) == "success"
-
-
-class Direction(Enum):
-    """Направление торговли"""
-    BUY = "BUY"
-    SELL = "SELL"
-    FLAT = "FLAT"
 
 
 @dataclass

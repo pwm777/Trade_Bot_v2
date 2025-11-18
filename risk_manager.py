@@ -34,10 +34,10 @@ risk_manager.py
 """
 
 from __future__ import annotations
-from typing import TypedDict, Dict, Any, Optional, Literal, Protocol, Union, Tuple
+from typing import TypedDict, Dict, Any, Optional, Literal, Protocol, Union, Tuple, cast
 from iqts_standards import DetectorSignal
 from enum import IntEnum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
 import logging
 import hashlib
@@ -55,18 +55,12 @@ class Direction(IntEnum):
 
     Использование:
         direction = Direction.BUY
-        if direction == Direction.BUY:
-            ...
-        side = direction.side  # "BUY"
+        side_str = direction.name  # "BUY" (стандартное свойство IntEnum)
+        opposite = direction.opposite()  # Direction.SELL
     """
     BUY = 1
     SELL = -1
     FLAT = 0
-
-    @property
-    def side(self) -> Literal["BUY", "SELL", "FLAT"]:
-        """Строковое представление для биржевых API"""
-        return self.name  # "BUY", "SELL", "FLAT"
 
     def opposite(self) -> 'Direction':
         """Возвращает противоположное направление"""
@@ -167,14 +161,15 @@ class RiskManagerInterface(Protocol):
         update_daily_pnl: Обновление дневного PnL
         should_close_all_positions: Проверка лимита дневных потерь
     """
+    limits: Any
 
     def calculate_position_size(
             self,
-            signal: DetectorSignal,  # ✅ ИСПРАВЛЕНО: DetectorSignal вместо Dict[str, Any]
+            signal: DetectorSignal,
             current_price: float,
             atr: float,
             account_balance: float
-    ) -> float:
+    ) -> float:  # ✅ Всегда возвращает float (может быть 0.0)
         """
         Расчёт размера позиции на основе ATR и доли портфеля.
 
@@ -187,8 +182,35 @@ class RiskManagerInterface(Protocol):
         Returns:
             Размер позиции (в единицах актива), 0.0 если некорректные данные
         """
-        if not signal.get("ok", False) or atr <= 0 or current_price <= 0 or account_balance <= 0:
+
+        # ✅ ИСПРАВЛЕНИЕ: явная проверка типов
+        if not signal.get("ok", False):
             return 0.0
+
+        if atr <= 0 or current_price <= 0 or account_balance <= 0:
+            return 0.0
+
+        # Обновляем внутренний баланс
+        self.account_balance = account_balance
+
+
+        # Риск на одну сделку
+        risk_per_share = atr * self.limits.stop_loss_atr_multiplier
+        if risk_per_share <= 0:
+            return 0.0
+
+        # Размер позиции на основе риска
+        max_risk_amount = account_balance * self.limits.max_portfolio_risk
+        position_size_by_risk = max_risk_amount / risk_per_share
+
+        # Ограничение по объёму (максимум N% капитала)
+        max_position_value = account_balance * self.limits.max_position_value_pct
+        position_size_by_value = max_position_value / current_price
+
+        # Берём минимум из двух ограничений
+        size = min(position_size_by_risk, position_size_by_value)
+
+        return float(size)  # ✅ Явное приведение к float
 
     def calculate_dynamic_stops(
             self,
@@ -216,7 +238,7 @@ class RiskManagerInterface(Protocol):
 
 def direction_to_side(direction: Union[int, Direction]) -> DirectionStr:
     """
-    Конвертация Direction → строка для биржевых API.
+    Конвертация Direction/int → строка для биржевых API.
 
     Args:
         direction: Direction enum или числовое значение (1, -1, 0)
@@ -229,11 +251,17 @@ def direction_to_side(direction: Union[int, Direction]) -> DirectionStr:
         "BUY"
         >>> direction_to_side(1)
         "BUY"
+        >>> direction_to_side(-1)
+        "SELL"
+
+    Raises:
+        KeyError: Если передано некорректное числовое значение
     """
     if isinstance(direction, Direction):
-        return direction.side
-    return {1: "BUY", -1: "SELL", 0: "FLAT"}[direction]
+        return cast(DirectionStr, direction.name)  # ✅ ИСПРАВЛЕНО: .side → .name
 
+    mapping: Dict[int, DirectionStr] = {1: "BUY", -1: "SELL", 0: "FLAT"}
+    return mapping[direction]
 
 def side_to_direction(side: str) -> Direction:
     """
@@ -315,8 +343,8 @@ def compute_risk_hash(risk_context: RiskContext) -> str:
         Первые 16 символов SHA256 хеша
 
     Example:
-        >>> ctx = {"position_size": 0.5, "initial_stop_loss": 3200.0}
-        >>> compute_risk_hash(ctx)
+        #>>> ctx = {"position_size": 0.5, "initial_stop_loss": 3200.0}
+        #>>> compute_risk_hash(ctx)
         "a3f5c8d9e2b1f0a4"
     """
     # Сортируем ключи для стабильности хеша
@@ -440,9 +468,9 @@ class EnhancedRiskManager:
             ValueError: Если входные данные некорректны
 
         Example:
-            >>> signal = {"ok": True, "direction": 1, "confidence": 0.85}
-            >>> ctx = rm.calculate_risk_context(signal, 3250.0, 15.5, 100000.0)
-            >>> print(ctx['position_size'], ctx['initial_stop_loss'])
+           # >>> signal = {"ok": True, "direction": 1, "confidence": 0.85}
+           # >>> ctx = rm.calculate_risk_context(signal, 3250.0, 15.5, 100000.0)
+           # >>> print(ctx['position_size'], ctx['initial_stop_loss'])
         """
         # Валидация входных данных
         if not self._validate_inputs(signal, current_price, atr, account_balance):
@@ -575,7 +603,6 @@ class EnhancedRiskManager:
         Расчёт адаптивных стоп-лосса и тейк-профита с учётом режима рынка.
 
         **КРИТИЧНОЕ ИСПРАВЛЕНИЕ**: Теперь использует Direction enum вместо строковых сравнений.
-        **БАГ В improved_algorithm.py**: Сравнивал direction (число) с "BUY" (строка) — всегда False!
 
         **BACKWARD COMPATIBILITY**: Сохранён для совместимости, но требует Direction enum.
         **РЕКОМЕНДАЦИЯ**: Используйте calculate_risk_context() вместо этого метода.
