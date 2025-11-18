@@ -17,7 +17,7 @@ from threading import Lock
 from iqts_standards import (Timeframe,
     DetectorSignal, TradingSystemInterface,
      normalize_trading_hours, SystemStatus,TradeSignalIQTS,
-    get_current_timestamp_ms)
+    get_current_timestamp_ms, create_trade_signal)
 
 # Ядро анализа
 from multi_timeframe_confirmator import ThreeLevelHierarchicalConfirmator
@@ -297,126 +297,129 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             self.logger.error(f"Critical error in update_performance: {e}", exc_info=True)
 
     async def analyze_and_trade(self, market_data: Dict[Timeframe, pd.DataFrame]):
+        """
+        Обновлённый метод:
+        - Использует RiskManager.calculate_risk_context() как единственный источник SL/TP/position_size
+        - Формирует сигнал через фабрику create_trade_signal()
+        - Direction → enum Direction
+        - Уход от legacy полей stop_loss/take_profit/position_size в корневом сигнале
+        - Возвращает TradeSignalIQTS с risk_context и stops_precomputed=True
+        """
         try:
+            # 1. Базовые проверки наличия таймфреймов
             required_tfs: list[Timeframe] = ['1m', '5m']
             for tf in required_tfs:
                 if tf not in market_data or market_data[tf] is None or market_data[tf].empty:
                     self.logger.warning(f"Missing or empty timeframe: {tf}")
                     return None
 
+            # 2. Сессионные / рыночные проверки
             if not self._is_trading_session_now():
                 return None
-
             if not self._check_trading_conditions():
                 return None
-
             if not self._validate_market_data_quality(market_data):
                 return None
 
+            # 3. Обновляем режим рынка
             await self._update_market_regime(market_data)
 
-            # Основной анализ — напрямую через confirmator
-            signal = await self.three_level_confirmator.analyze(market_data)
-            if not signal["ok"]:
+            # 4. Анализ детекторами (иерархический confirmator)
+            raw_signal = await self.three_level_confirmator.analyze(market_data)
+            if not raw_signal.get("ok", False):
                 return None
 
-            # Применяем фильтры качества
-            filtered_signal = await self._apply_quality_filters(signal, market_data)
-            if not filtered_signal["ok"]:
+            # 5. Применяем фильтры качества
+            filtered_signal = await self._apply_quality_filters(raw_signal, market_data)
+            if not filtered_signal.get("ok", False):
                 return None
 
-            # Расчёт ATR
+            # 6. ATR
             atr = self._calculate_atr(market_data["1m"])
             if atr <= 0:
+                self.logger.debug("ATR <= 0, skipping")
                 return None
 
-            # Текущая цена
+            # 7. Текущая цена
             price = float(market_data["1m"]["close"].iloc[-1])
             if price <= 0:
+                self.logger.debug("Price <= 0, skipping")
                 return None
 
-            # Размер позиции
-            size = self.risk_manager.calculate_position_size(
-                signal=filtered_signal,
-                current_price=price,
-                atr=atr,
-                account_balance=self.account_balance
-            )
-            if size <= 0:
+            # 8. Direction → enum
+            try:
+                direction_enum = Direction(int(filtered_signal.get("direction", 0)))
+            except Exception:
+                direction_enum = Direction.FLAT
+
+            if direction_enum == Direction.FLAT:
+                self.logger.debug("Direction FLAT → no trade")
                 return None
 
-            # ✅ ИСПРАВЛЕНО: Убраны лишние отступы - этот код должен выполняться после проверки size
-
-            # Конвертация direction: детекторы возвращают int, TradeSignalIQTS ожидает string
-            direction_int = int(filtered_signal["direction"])
-            direction_map = {1: "BUY", -1: "SELL", 0: "FLAT"}
-
-
-            # Если FLAT - не торгуем
-            if direction_int == 0:
-                self.logger.debug("Direction is FLAT, skipping trade")
-                return None
-
-            # Безопасное получение regime с приведением типа
-            current_regime = getattr(self.current_regime, 'regime', 'uncertain')
-            regime_typed: RegimeType = current_regime if current_regime in [
+            # 9. Определяем текущий режим рынка
+            current_regime_name = getattr(self.current_regime, 'regime', 'uncertain')
+            regime_typed: RegimeType = current_regime_name if current_regime_name in [
                 "strong_uptrend", "weak_uptrend", "strong_downtrend", "weak_downtrend", "sideways", "uncertain"
             ] else "uncertain"
 
-            # Расчет стопов - используем string direction для risk_manager
-            sl, tp = self.risk_manager.calculate_dynamic_stops(
-                entry_price=price,
-                direction=direction_int,
-                atr=atr,
-                regime_ctx={
-                    "atr": float(atr),
-                    "volatility_regime": getattr(self.current_regime, 'volatility_level', 0.02),
-                    "regime": regime_typed,
-                    "regime_confidence": getattr(self.current_regime, 'confidence', 0.0)
-                }
-            )
-            if sl <= 0 or tp <= 0:
-                return None
-
-            # Финальный сигнал
-            risk_reward_ratio = abs(tp - price) / max(1e-12, abs(price - sl))
-
-            out: TradeSignalIQTS = {
-                "direction": cast(Literal[1, -1, 0], direction_int),
-                "entry_price": price,
-                "position_size": float(size),
-                "stop_loss": float(sl),
-                "take_profit": float(tp),
-                "confidence": float(filtered_signal["confidence"]),
-                "regime": regime_typed,  # ✅ Теперь правильный тип
-                "metadata": {
-                    "atr": float(atr),
-                    "risk_reward_ratio": risk_reward_ratio,
-                    "regime": regime_typed,  # ✅ И здесь тоже
-                    "regime_confidence": float(getattr(self.current_regime, 'confidence', 0.0)),
-                    "signal_source": "hierarchical_quality",
-                    "extra": {
-                        "entry_time": datetime.now().isoformat(),
-                        "correlation_id": filtered_signal.get("metadata", {}).get("extra", {}).get("correlation_id",
-                                                                                                   ""),
-                        "entry_quality_score": filtered_signal.get("metadata", {}).get("extra", {}).get(
-                            "entry_quality_score", 0.0),
-                        "trend_quality_score": filtered_signal.get("metadata", {}).get("extra", {}).get(
-                            "trend_quality_score", 0.0),
-                        "global_quality_score": filtered_signal.get("metadata", {}).get("extra", {}).get(
-                            "global_quality_score", 0.0),
-                        "entry_reason": filtered_signal.get("metadata", {}).get("extra", {}).get("entry_reason", ""),
-                        "trend_reason": filtered_signal.get("metadata", {}).get("extra", {}).get("trend_reason", ""),
-                        "global_reason": filtered_signal.get("metadata", {}).get("extra", {}).get("global_reason", ""),
-                    }
-                }
+            regime_ctx = {
+                "atr": float(atr),
+                "volatility_regime": float(getattr(self.current_regime, 'volatility_level', 0.0)),
+                "regime": regime_typed,
+                "regime_confidence": float(getattr(self.current_regime, 'confidence', 0.0))
             }
 
-            # Увеличиваем счётчик сделок
+            # 10. Полный RiskContext (единая точка входа)
+            risk_context = self.risk_manager.calculate_risk_context(
+                signal=filtered_signal,          # DetectorSignal (ok, direction, confidence)
+                current_price=price,
+                atr=atr,
+                account_balance=self.account_balance,
+                regime=regime_typed
+            )
+
+            # 11. Проверка risk_context
+            if risk_context.get("position_size", 0) <= 0:
+                self.logger.debug("RiskContext produced zero position_size → skip")
+                return None
+            if risk_context.get("initial_stop_loss", 0) <= 0 or risk_context.get("take_profit", 0) <= 0:
+                self.logger.debug("RiskContext invalid SL/TP → skip")
+                return None
+
+            # 12. Формирование сигнала через фабрику
+            # Дополнительные метаданные (обогащение из filtered_signal)
+            meta_extra = filtered_signal.get("metadata", {}).get("extra", {})
+            trade_signal = create_trade_signal(
+                symbol=filtered_signal.get("symbol", getattr(market_data["1m"], 'symbol', 'UNKNOWN')),
+                direction=direction_enum,
+                entry_price=price,
+                confidence=float(filtered_signal.get("confidence", 0.0)),
+                risk_context=risk_context,
+                metadata={
+                    "atr": float(atr),
+                    "regime": regime_typed,
+                    "regime_confidence": regime_ctx["regime_confidence"],
+                    "signal_source": "hierarchical_quality",
+                    "raw_reason": filtered_signal.get("reason"),
+                    "extra": {
+                        "entry_time": datetime.now().isoformat(),
+                        "trend_quality_score": meta_extra.get("trend_quality_score"),
+                        "global_quality_score": meta_extra.get("global_quality_score"),
+                        "entry_quality_score": meta_extra.get("entry_quality_score"),
+                        "entry_reason": meta_extra.get("entry_reason"),
+                        "trend_reason": meta_extra.get("trend_reason"),
+                        "global_reason": meta_extra.get("global_reason"),
+                    }
+                },
+                regime=regime_typed,
+                correlation_id=meta_extra.get("correlation_id")
+            )
+
+            # 13. Счётчики дневной активности
             self.trades_today += 1
             self.daily_stats['trades_count'] += 1
 
-            return out
+            return trade_signal
 
         except Exception as e:
             self.logger.error(f"Error in analyze_and_trade: {e}", exc_info=True)

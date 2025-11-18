@@ -18,9 +18,18 @@ from abc import ABC, abstractmethod
 from decimal import Decimal
 from enum import IntEnum
 import uuid
-import time
+import time, json, hashlib
 import logging
 from datetime import datetime, UTC
+try:
+    from risk_manager import Direction  # если уже есть
+except ImportError:
+    from enum import IntEnum
+    class Direction(IntEnum):
+        BUY = 1
+        SELL = -1
+        FLAT = 0
+
 # =============================================================================
 # === ЛИТЕРАЛЫ / КОНСТАНТЫ =====================================================
 # =============================================================================
@@ -181,6 +190,65 @@ DEFAULT_TRADING_HOURS = (6, 22)
 # =============================================================================
 # === UTILITY FUNCTIONS =======================================================
 # =============================================================================
+
+def _compute_risk_hash_light(risk_context: Dict[str, Any]) -> str:
+    """Лёгкая версия хеширования RiskContext (без внешних зависимостей)"""
+    canonical = json.dumps(risk_context, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+def create_trade_signal(
+    *,
+    symbol: str,
+    direction: Direction,
+    entry_price: float,
+    confidence: float,
+    risk_context: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    regime: Optional[str] = None,
+    correlation_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Factory: формирует единый TradeSignalIQTS
+    Гарантии:
+      - direction → Direction (enum)
+      - stops_precomputed=True если есть risk_context
+      - validation_hash добавляется автоматически
+      - entry_price/position_size > 0 проверяются минимально
+    """
+    if not isinstance(direction, Direction):
+        # автоматическая нормализация
+        direction = Direction(int(direction)) if str(direction).isdigit() else Direction.FLAT
+
+    if entry_price <= 0:
+        raise ValueError(f"Invalid entry_price: {entry_price}")
+
+    signal: Dict[str, Any] = {
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": float(entry_price),
+        "confidence": float(confidence),
+        "regime": regime,
+        "metadata": metadata or {},
+        "generated_at_ms": int(time.time() * 1000),
+        "correlation_id": correlation_id
+    }
+
+    if risk_context:
+        # минимальная проверка
+        if risk_context.get("position_size", 0) <= 0:
+            raise ValueError("risk_context.position_size must be > 0")
+        if risk_context.get("initial_stop_loss", 0) <= 0:
+            raise ValueError("risk_context.initial_stop_loss must be > 0")
+        if risk_context.get("take_profit", 0) <= 0:
+            raise ValueError("risk_context.take_profit must be > 0")
+
+        signal["risk_context"] = risk_context
+        signal["stops_precomputed"] = True
+        signal["validation_hash"] = _compute_risk_hash_light(risk_context)
+    else:
+        signal["stops_precomputed"] = False
+
+    return signal
 
 def safe_nested_getattr(obj: Any, attr_path: str, default: Any = None) -> Any:
     """
