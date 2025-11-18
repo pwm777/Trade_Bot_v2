@@ -1,4 +1,4 @@
-# train_ml_global_v2_windowed.py
+# train_ml_global_v2.py
 """
 Обучение LightGBM модели с ОКНОМ ИСТОРИИ
 

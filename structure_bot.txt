@@ -9,7 +9,7 @@
     └── market_data_utils.py (утилиты данных)
 	
 ДОПОЛНЕННЫЕ МОДУЛИ:
-    ├── EnhancedRiskManager (риск-менеджер) - improved_algorithm.py
+    ├── EnhancedRiskManager (риск-менеджер) - risk_manager.py
     ├── AdaptiveExitManager (менеджер выхода) - exit_system.py   ← ДОБАВИТЬ СЮДА
     ├── TradingLogger (логгер торговли) - trading_logger.py
     ├── MLGlobalDetector (ML детектор) - ml_global_detector.py
@@ -164,10 +164,10 @@ run_bot.py
     │   └── get_component_health() → Dict
     ├── Обработка событий:
     │   ├── add_event_handler() → None
-    │   └── handle_candle_ready() → None 
+    │   └── handle_candle_ready() → None
     └── Управление данными:
         └── Интеграция с DataProvider.update_from_candle_event()
-		
+
 
 ==================================================================
 
@@ -257,11 +257,11 @@ trade_bot.py
     └── История:
         └── get_closed_positions() → List[Dict]
 =========================================================================
-		
+
 Модуль: ImprovedQualityTrendSystem.py
 Типы данных:
 ImprovedQualityTrendSystem.py
-├── RegimeType = Literal["strong_uptrend", "weak_uptrend", "strong_downtrend", 
+├── RegimeType = Literal["strong_uptrend", "weak_uptrend", "strong_downtrend",
 │                       "weak_downtrend", "sideways", "uncertain"]
 ├── VolumeProfileType = Literal["high", "normal", "low"]
 │
@@ -452,7 +452,7 @@ ml_global_detector.py
 ├── ✅ Rich metadata в DetectorSignal (probabilities, lookback, policy, vector_dim)
 └── ✅ Потокобезопасность: нет shared mutable state (за исключением _last_signal_ts — один детектор на экземпляр)
 ===========================================================================
-	
+
 Модуль: iqts_detectors.py
 Базовый класс:
 
@@ -512,7 +512,7 @@ iqts_detectors.py
         └── reset_state() → None
 
 ==================================================================
-		
+
 Модуль: multi_timeframe_confirmator.py
 multi_timeframe_confirmator.py
 └── ThreeLevelHierarchicalConfirmator (Detector)
@@ -593,7 +593,7 @@ multi_timeframe_confirmator.py
 ImprovedQualityTrendSystem → ThreeLevelHierarchicalConfirmator.analyze()
     ├── global_detector.analyze() → MLGlobalTrendDetector (5m)
     └── trend_detector.analyze() → RoleBasedOnlineTrendDetector (1m)
-========================================================		
+========================================================
 Модуль: market_aggregator.py
 Абстрактный базовый класс:
 market_aggregator.py
@@ -866,7 +866,7 @@ MarketHistoryManager → Binance API
 Процесс загрузки истории:
 BotLifecycleManager.start()
     → _create_history_manager() → MarketHistoryManager
-    → load_history() 
+    → load_history()
         → BinanceDataFetcher.fetch_candles()
         → IndicatorWarmupManager.warmup_*_indicators()
         → MarketDataUtils.upsert_candles_*m()
@@ -905,13 +905,13 @@ BacktestMarketAggregatorFixed (режим BACKTEST)
     → Инкрементальный расчет индикаторов
     → Эмуляция рыночных событий
 
-		
+
 BotLifecycleManager.start()
     → _create_components()
         → _create_strategy() → ImprovedQualityTrendSystem
         → _create_main_bot() → EnhancedTradingBot
             → DataProviderFromDB
-            → ExecutionEngineFromExchangeManager  
+            → ExecutionEngineFromExchangeManager
             → MainBotAdapter
 
 EnhancedTradingBot.start()
@@ -927,7 +927,7 @@ ThreeLevelHierarchicalConfirmator.analyze()
 EnhancedTradingBot._process_trade_signal()
     → execution_engine.place_order() → ExecutionEngineFromExchangeManager.place_order()
     → position_tracker.add_position() → PositionTracker.add_position()
-================================================================	
+================================================================
 
 Модуль: iqts_standards.py
 Типы данных и литералы:
@@ -1262,7 +1262,7 @@ EnhancedTradingBot._manage_existing_positions()
 
 Комиссии и slippage:
 ├── MARKET ордера: 0.1% slippage + 0.04% taker fee
-├── LIMIT ордера: 0% slippage + 0.02% maker fee  
+├── LIMIT ордера: 0% slippage + 0.02% maker fee
 ├── STOP ордера: 0.01% slippage + 0.04% taker fee
 └── BACKTEST режим: минимальный slippage для точности
 
@@ -1417,12 +1417,12 @@ exit_system.py
 
 Основные классы:
 ├── ExitSignalDetector
-│   ├── Конструктор: global_timeframe="5m", trend_timeframe="1m", entry_timeframe="10s"
+│   ├── Конструктор: global_timeframe="5m", trend_timeframe="1m"
 │   │
 │   ├── Компоненты-детекторы:
 │   │   ├── global_detector: MLGlobalTrendDetector (с fallback)
 │   │   ├── trend_detector: RoleBasedOnlineTrendDetector (роль="trend")
-│   │   └── entry_detector: RoleBasedOnlineTrendDetector (роль="entry", 10s)
+│   │
 │   │
 │   ├── Пороги:
 │   │   ├── cascading_thresholds: Dict (all_levels_sum, global_hint, lower_tf_min...)
@@ -1520,7 +1520,7 @@ signal_validator.py
             ├── Автоматическая валидация возвращаемых значений
             ├── Поддержка async и sync функций
             └── Логирование ошибок и предупреждений
-			
+
 Глобальный доступ:
 ├── Глобальный валидатор (singleton):
 │   ├── _global_validator: Optional[SignalValidator]
@@ -1538,7 +1538,7 @@ signal_validator.py
         → DetectorSignal → SignalValidator.validate_detector_signal()
 
     ImprovedQualityTrendSystem.analyze_and_trade()
-        → @validate_signal('trade_iqts') 
+        → @validate_signal('trade_iqts')
         → TradeSignalIQTS → SignalValidator.validate_trade_signal_iqts()
 
     PositionManager.handle_signal()
@@ -1550,73 +1550,77 @@ signal_validator.py
         → OrderReq → SignalValidator.validate_order_req()
 =================================================================
 
-МОДУЛЬ: improved_algorithm.py
-improved_algorithm.py
-└── EnhancedRiskManager
-    ├── Конструктор:
-    │   ├── max_portfolio_risk: float = 0.02 (2% риск на сделку)
-    │   ├── max_daily_loss: float = 0.05 (5% дневной лимит потерь)
-    │   ├── atr_periods: int = 14
-    │   ├── stop_loss_atr_multiplier: float = 2.0
-    │   └── take_profit_atr_multiplier: float = 3.0
+МОДУЛЬ: risk_manager.py
+=================================================================
+risk_manager.py
+└── Централизованное управление рисками
     │
-    ├── Состояние:
-    │   ├── daily_pnl: float = 0.0 (накопленный дневной PnL)
-    │   └── account_balance: float = 100000.0 (базовый баланс)
+    ├── Типы и константы:
+    │   ├── Direction(IntEnum)
+    │   │   ├── BUY = 1
+    │   │   ├── SELL = -1
+    │   │   ├── FLAT = 0
+    │   │   ├── .side → "BUY"/"SELL"/"FLAT"
+    │   │   └── .opposite() → Direction
+    │   │
+    │   ├── RiskContext(TypedDict)
+    │   │   ├── position_size: float
+    │   │   ├── initial_stop_loss: float
+    │   │   ├── take_profit: float
+    │   │   ├── atr: float
+    │   │   ├── stop_atr_multiplier: float
+    │   │   ├── tp_atr_multiplier: float
+    │   │   ├── volatility_regime: float
+    │   │   ├── regime: Optional[str]
+    │   │   ├── computed_at_ms: int
+    │   │   ├── risk_manager_version: str
+    │   │   └── validation_hash: Optional[str]
+    │   │
+    │   ├── RiskLimits(dataclass)
+    │   │   ├── max_portfolio_risk: float = 0.02
+    │   │   ├── max_daily_loss: float = 0.05
+    │   │   ├── max_position_value_pct: float = 0.30
+    │   │   ├── stop_loss_atr_multiplier: float = 2.0
+    │   │   ├── take_profit_atr_multiplier: float = 3.0
+    │   │   └── atr_periods: int = 14
+    │   │
+    │   └── RiskManagerInterface(Protocol)
     │
-    ├── Основные методы риск-менеджмента:
+    ├── EnhancedRiskManager(v2.0.0):
+    │   │
+    │   ├── **НОВОЕ** calculate_risk_context() → RiskContext
+    │   │   └── Единая точка входа для расчёта всех риск-параметров
+    │   │
     │   ├── calculate_position_size() → float
-    │   │   ├── Вход: signal, current_price, atr, account_balance
-    │   │   ├── Расчет на основе ATR и доли портфеля
-    │   │   ├── Ограничение: макс 30% капитала на позицию
-    │   │   └── Формула: min(risk_based_size, value_based_size)
+    │   │   └── [BACKWARD COMPATIBILITY] Старый API
     │   │
     │   ├── calculate_dynamic_stops() → Tuple[float, float]
-    │   │   ├── Вход: entry_price, direction, atr, regime_ctx
-    │   │   ├── Адаптация к волатильности рынка
-    │   │   ├── Учет volatility_regime из RiskContext
-    │   │   └── Защита от некорректных значений
+    │   │   ├── **ИСПРАВЛЕНО**: Direction enum вместо строк
+    │   │   └── [BACKWARD COMPATIBILITY] Старый API
     │   │
-    │   ├── update_daily_pnl() → None
-    │   │   └── Обновление накопленного дневного PnL
-    │   │
+    │   ├── update_daily_pnl(pnl: float) → None
     │   ├── reset_daily_pnl() → None
-    │   │   └── Сброс дневного PnL (начало дня)
-    │   │
-    │   └── should_close_all_positions() → bool
-    │       ├── Проверка лимита дневных потерь
-    │       └── Возвращает True при достижении max_daily_loss
+    │   ├── should_close_all_positions() → bool
+    │   └── get_risk_status() → Dict
     │
-    ├── Внутренние методы:
-    │   ├── _get_effective_balance() → float
-    │   │   └── Расчет эффективного баланса для лимитов
-    │   │
-    │   └── get_risk_status() → Dict[str, Any]
-    │       ├── Текущий статус риск-менеджера
-    │       ├── daily_pnl, max_daily_loss_amount
-    │       ├── should_close_positions флаг
-    │       └── Все параметры риск-менеджмента
-    │
-    └── Особенности реализации:
-        ├── Интеграция с iqts_standards (RiskContext, DetectorSignal)
-        ├── Адаптивные стопы на основе волатильности
-        ├── Двойное ограничение размера позиции (риск + объем)
-        ├── Защита от нулевых и отрицательных значений
-        └── Полный мониторинг дневного PnL
-		
-Интеграция в систему:
-ImprovedQualityTrendSystem
-    ├── _initialize_risk_manager() → EnhancedRiskManager
-    │   └── Используется для:
-    │       ├── Расчет размера позиции
-    │       ├── Определение стоп-лосса и тейк-профита
-    │       └── Контроль дневных лимитов
-    │
-    └── Поток данных:
-        TradeSignalIQTS → EnhancedRiskManager → PositionManager
-            ├── direction, confidence → calculate_position_size()
-            ├── entry_price, atr → calculate_dynamic_stops()
-            └── filled PnL → update_daily_pnl()
+    └── Вспомогательные функции:
+        ├── direction_to_side() → "BUY"/"SELL"/"FLAT"
+        ├── side_to_direction() → Direction
+        ├── normalize_direction() → Direction
+        ├── compute_risk_hash() → str
+        └── validate_risk_context() → Tuple[bool, str]
+
+**КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ ОТ improved_algorithm.py:**
+✅ Исправлен критический баг: Direction enum вместо сравнения 1 == "BUY"
+✅ Добавлен calculate_risk_context() — главный метод вместо раздельных вызовов
+✅ Добавлена валидация входных/выходных данных
+✅ Добавлена трассируемость (validation_hash, timestamps)
+✅ Backward compatibility: старые методы сохранены с deprecation warnings
+
+**МИГРАЦИЯ:**
+- improved_algorithm.py → risk_manager.py (2025-11-18)
+- Все зависимости обновлены (ImprovedQualityTrendSystem.py)
+
 ============================================================================
 
 Модуль: trading_logger.py
