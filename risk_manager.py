@@ -223,6 +223,110 @@ class RiskManagerInterface(Protocol):
         """Расчёт динамических стоп-лосса и тейк-профита"""
         ...
 
+    # ========================================================================
+    # РАСЧЁТ НАЧАЛЬНОГО СТОП-ЛОССА (НОВОЕ для DI)
+    # ========================================================================
+
+    def calculate_initial_stop(
+            self,
+            entry_price: float,
+            direction: Direction,
+            stop_loss_pct: float,
+            symbol: str = "UNKNOWN"
+    ) -> Dict[str, Any]:
+        """
+        Расчёт начального стоп-лосса для позиции.
+
+        **НОВЫЙ МЕТОД для Dependency Injection в PositionManager.**
+
+        Заменяет PositionManager.compute_entry_stop() — бизнес-логика расчёта стопов
+        должна быть в RiskManager, а не в PositionManager.
+
+        Args:
+            entry_price: Цена входа в позицию
+            direction: Направление позиции (Direction.BUY или Direction.SELL)
+            stop_loss_pct: Процент стоп-лосса от цены входа
+            symbol: Торговый символ (для логов)
+
+        Returns:
+            Dict с ключами:
+            - stop_price: float — цена стоп-лосса
+            - distance_pct: float — расстояние от входа в процентах
+            - risk_amount: float — абсолютное расстояние до стопа
+            - direction: str — направление позиции
+
+        Raises:
+            ValueError: Если входные данные некорректны
+
+        Examples:
+            >>> rm = EnhancedRiskManager()
+            >>> result = rm.calculate_initial_stop(
+            ...     entry_price=3250.0,
+            ...     direction=Direction.BUY,
+            ...     stop_loss_pct=0.30,
+            ...     symbol="ETHUSDT"
+            ... )
+            >>> print(result['stop_price'])
+            3240.25
+            >>> print(result['distance_pct'])
+            0.30
+        """
+        try:
+            # Валидация входных данных
+            if entry_price <= 0:
+                raise ValueError(f"entry_price must be positive, got {entry_price}")
+
+            if stop_loss_pct <= 0:
+                raise ValueError(f"stop_loss_pct must be positive, got {stop_loss_pct}")
+
+            if not isinstance(direction, Direction):
+                self.logger.warning(
+                    f"direction должен быть Direction enum, получен {type(direction)}. "
+                    f"Попытка конвертации..."
+                )
+                direction = normalize_direction(direction)
+
+            # Расчёт цены стопа
+            if direction == Direction.BUY:
+                # Для лонга стоп ниже цены входа
+                stop_price = entry_price * (1 - stop_loss_pct / 100)
+            elif direction == Direction.SELL:
+                # Для шорта стоп выше цены входа
+                stop_price = entry_price * (1 + stop_loss_pct / 100)
+            else:
+                raise ValueError(f"Cannot calculate stop for Direction.FLAT")
+
+            # Дополнительные метрики
+            distance = abs(entry_price - stop_price)
+            distance_pct = (distance / entry_price) * 100
+
+            result = {
+                'stop_price': float(stop_price),
+                'distance_pct': float(distance_pct),
+                'risk_amount': float(distance),
+                'direction': direction.name,  # "BUY" или "SELL"
+                'entry_price': float(entry_price),
+                'stop_loss_pct': float(stop_loss_pct)
+            }
+
+            self.logger.debug(
+                f"✅ Initial stop calculated for {symbol}: "
+                f"{direction.name} @ {entry_price:.2f} → SL {stop_price:.2f} "
+                f"({distance_pct:.2f}%)"
+            )
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ Error calculating initial stop for {symbol}: {e}")
+            return {
+                'stop_price': None,
+                'distance_pct': 0.0,
+                'risk_amount': 0.0,
+                'direction': 'UNKNOWN',
+                'error': str(e)
+            }
+
     def update_daily_pnl(self, pnl: float) -> None:
         """Обновление дневного PnL"""
         ...

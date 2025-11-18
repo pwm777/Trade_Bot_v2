@@ -18,6 +18,7 @@ from market_data_utils import ensure_market_schema
 from sqlalchemy import create_engine
 from datetime import datetime, UTC
 from market_history import MarketHistoryManager
+from risk_manager import EnhancedRiskManager, RiskLimits
 import contextlib
 from iqts_standards import (
     get_current_timestamp_ms,
@@ -52,6 +53,7 @@ class ComponentsContainer:
     market_aggregator: MarketAggregatorInterface
     main_bot: MainBotInterface
     exit_manager: Any
+    risk_manager: Optional[Any]
     logger: logging.Logger
     history_manager: Optional[MarketHistoryManager] = None
     async_store: Optional[Any] = None
@@ -326,13 +328,13 @@ class BotLifecycleManager:
 
     # ---------- Component management ----------
     async def _create_components(self) -> ComponentsContainer:
-        """Creation and initialization of all bot components with shared strategy"""
+        """Creation and initialization of all bot components with shared strategy (+ DI risk/exit managers)"""
         try:
             logger = self._create_logger()
             trade_log = await self._create_trade_log(logger)
             async_store = await self._create_async_store() if self.config.get("use_async_store") else None
 
-            # Создаем MarketDataUtils
+            # --- MarketDataUtils ---
             from market_data_utils import MarketDataUtils
             if not hasattr(trade_log, 'market_engine') or trade_log.market_engine is None:
                 logger.error("TradingLogger.market_engine is None - cannot create MarketDataUtils")
@@ -344,43 +346,87 @@ class BotLifecycleManager:
             )
             logger.info("MarketDataUtils created successfully")
 
-            # Создаем history_manager
+            # --- History Manager ---
             history_manager = await self._create_history_manager(
                 market_data_utils=market_data_utils,
                 logger=logger
             )
 
-            # ⭐ СОЗДАЕМ ЕДИНСТВЕННЫЙ ЭКЗЕМПЛЯР СТРАТЕГИИ
+            # --- Strategy (singleton) ---
             strategy = await self._create_strategy(logger)
 
-            position_manager = await self._create_position_manager(trade_log, logger)
+            # --- Risk Manager (DI) ---
+            risk_manager = None
+            if EnhancedRiskManager:
+                limits_cfg = self.config.get("risk_limits", {})
+                limits = RiskLimits(
+                    max_portfolio_risk=float(limits_cfg.get("max_portfolio_risk", 0.02)),
+                    max_daily_loss=float(limits_cfg.get("max_daily_loss", 0.05)),
+                    max_position_value_pct=float(limits_cfg.get("max_position_value_pct", 0.30)),
+                    stop_loss_atr_multiplier=float(limits_cfg.get("stop_loss_atr_multiplier", 2.0)),
+                    take_profit_atr_multiplier=float(limits_cfg.get("take_profit_atr_multiplier", 3.0)),
+                    atr_periods=int(limits_cfg.get("atr_periods", 14))
+                )
+                risk_manager = EnhancedRiskManager(limits)
+                logger.info("✅ EnhancedRiskManager created via DI")
+            else:
+                logger.warning("RiskManager not available (import failed), DI skipped")
+
+            # --- Exit Manager (DI) ---
+            exit_manager = await self._create_exit_manager(logger)
+
+            # --- Exchange Manager (нужен до PositionManager для связки) ---
             exchange_manager = await self._create_exchange_manager(trade_log, logger)
 
+            # --- Position Manager с DI ---
+            # Обнови _create_position_manager чтобы он принимал risk_manager / exit_manager,
+            # либо передай их после создания (если конструктор уже модифицирован).
+            position_manager = await self._create_position_manager(
+                trade_log=trade_log,
+                logger=logger
+            )
+
+            # Внедрение зависимостей, если не переданы через конструктор
+            if hasattr(position_manager, 'risk_manager') and not position_manager.risk_manager and risk_manager:
+                position_manager.risk_manager = risk_manager
+                logger.info("🔗 Injected risk_manager into PositionManager")
+
+            if hasattr(position_manager, 'exit_manager') and not position_manager.exit_manager and exit_manager:
+                position_manager.exit_manager = exit_manager
+                logger.info("🔗 Injected exit_manager into PositionManager")
+
+            # Связка execution engine
             position_manager.execution_engine = exchange_manager
             logger.info("✅ execution_engine linked to PositionManager")
 
+            # --- Market Aggregator ---
             market_aggregator = await self._create_market_aggregator(
                 logger=logger,
                 trade_log=trade_log
             )
 
-            exit_manager = await self._create_exit_manager(logger)
-
-            # ⭐ ПЕРЕДАЕМ СТРАТЕГИЮ В MAIN_BOT
+            # --- Main Bot (передаём strategy, PM, EM, exit_manager, risk_manager) ---
             main_bot = await self._create_main_bot(
-                market_aggregator, strategy, position_manager,  # strategy передается
-                exchange_manager, exit_manager, trade_log,
-                market_data_utils, logger
+                market_aggregator=market_aggregator,
+                strategy=strategy,
+                position_manager=position_manager,
+                exchange_manager=exchange_manager,
+                exit_manager=exit_manager,
+                risk_manager=risk_manager,
+                trade_log=trade_log,
+                market_data_utils=market_data_utils,
+                logger=logger
             )
 
             return ComponentsContainer(
                 trade_log=trade_log,
                 position_manager=position_manager,
                 exchange_manager=exchange_manager,
-                strategy=strategy,  # Сохраняем стратегию в контейнере
+                strategy=strategy,
                 market_aggregator=market_aggregator,
                 main_bot=main_bot,
                 exit_manager=exit_manager,
+                risk_manager=risk_manager,
                 logger=logger,
                 history_manager=history_manager,
                 async_store=async_store,
@@ -1073,6 +1119,7 @@ class BotLifecycleManager:
                                position_manager: PositionManagerInterface,
                                exchange_manager: ExchangeManagerInterface,
                                exit_manager: Any,
+                               risk_manager: Optional[Any],
                                trade_log: Any,
                                market_data_utils: Any,
                                logger: logging.Logger) -> MainBotInterface:
@@ -1501,13 +1548,16 @@ class BotLifecycleManager:
         )
         logger.info("✅ ExecutionEngine created with PositionManager integration")
 
-        # Создаем EnhancedTradingBot
+        # BEGIN REPLACE: создание core_bot с DI risk_manager и exit_manager
         core_bot = EnhancedTradingBot(
             config=self.config,
             data_provider=data_provider,
             execution_engine=execution_engine,
-            trading_system=cast(ImprovedQualityTrendSystem, strategy)
+            trading_system=cast(ImprovedQualityTrendSystem, strategy),
+            risk_manager=risk_manager
         )
+        logger.info("✅ EnhancedTradingBot created with RiskManager DI")
+        # END REPLACE
         logger.info("✅ EnhancedTradingBot created")
 
         # ================================================================
