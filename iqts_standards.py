@@ -283,15 +283,16 @@ class DetectorSignal(TypedDict, total=False):
 
 
 class TradeSignalIQTS(TypedDict, total=False):
-    direction: Literal[1, -1, 0]
+    direction: Direction
     entry_price: float
-    position_size: float
-    stop_loss: float
-    take_profit: float
     confidence: float
     regime: MarketRegimeLiteral
     metadata: DetectorMetadata
 
+    # v2.0 — риск-контекст
+    risk_context: RiskContext  # ✅ Полный контекст
+    stops_precomputed: bool  # ✅ Флаг
+    validation_hash: Optional[str]  # ✅ Аудит
 
 class TradeSignal(TypedDict, total=False):
     """Сигнал от стратегии"""
