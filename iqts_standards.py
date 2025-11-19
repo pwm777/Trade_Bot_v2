@@ -252,9 +252,9 @@ def create_trade_signal(
         #>>>
         #>>> # Без risk_context (старый стиль)
         #>>> signal = create_trade_signal(
-        #...     symbol="BTCUSDT",
+        #...     symbol="ETHUSDT",
         #...     direction=1,  # Автоматически → Direction.BUY
-        #...     entry_price=50000.0,
+        #...     entry_price=3200.0,
         #...     confidence=0.75
         #... )
     """
