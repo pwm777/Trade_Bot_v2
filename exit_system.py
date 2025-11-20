@@ -634,50 +634,17 @@ class AdaptiveExitManager:
             self,
             current_price: float,
             entry_price: float,
-            side: str,  # "LONG" или "SHORT"
+            side: str,
             max_pnl_percent: float,
             current_stop_price: Optional[float] = None,
             symbol: str = "UNKNOWN"
     ) -> Dict[str, Any]:
-        """
-        Расчёт нового уровня trailing stop на основе максимального PnL.
-
-        **НОВЫЙ МЕТОД для Dependency Injection в PositionManager.**
-
-        Заменяет PositionManager.compute_trailing_level() — бизнес-логика расчёта
-        trailing стопов должна быть в ExitManager, а не в PositionManager.
-
-        Args:
-            current_price: Текущая рыночная цена
-            entry_price: Цена входа в позицию
-            side: Направление позиции ("LONG" или "SHORT")
-            max_pnl_percent: Максимальный достигнутый PnL (%)
-            current_stop_price: Текущая цена стоп-лосса (для проверки выгодности)
-            symbol: Торговый символ (для логов)
-
-        Returns:
-            Dict с ключами:
-            - new_stop: float | None — новая цена стопа (или None если не выгодно)
-            - beneficial: bool — выгодно ли обновление
-            - reason: str — причина решения
-            - distance_from_entry_pct: float — расстояние от входа (%)
-            - trailing_pct: float — используемый процент trailing
-
-        Examples:
-            >>> exit_mgr = AdaptiveExitManager()
-            >>> result = exit_mgr.calculate_trailing_stop(
-            ...     current_price=3275.0,
-            ...     entry_price=3250.0,
-            ...     side="LONG",
-            ...     max_pnl_percent=1.5,
-            ...     current_stop_price=3240.0,
-            ...     symbol="ETHUSDT"
-            ... )
-            >>> print(result['new_stop'])  # 3250.0 (безубыток)
-            >>> print(result['beneficial'])  # True
-        """
+        """Расчёт trailing stop (ИСПРАВЛЕНО v3.2)"""
         try:
-            # Валидация входных данных
+            # ═══════════════════════════════════════════════════════════
+            # ВАЛИДАЦИЯ
+            # ═══════════════════════════════════════════════════════════
+
             if current_price <= 0:
                 raise ValueError(f"current_price must be positive, got {current_price}")
 
@@ -687,128 +654,171 @@ class AdaptiveExitManager:
             if side not in ("LONG", "SHORT"):
                 raise ValueError(f"side must be 'LONG' or 'SHORT', got {side}")
 
-            # Получаем конфиг trailing (используем внутренние параметры класса)
-            trailing_pct = self.trailing_stop_distance * 100  # Конвертируем в проценты
-            min_distance_pct = 0.1  # 0.1% минимальное расстояние до текущей цены
+            # ═══════════════════════════════════════════════════════════
+            # ПАРАМЕТРЫ
+            # ═══════════════════════════════════════════════════════════
+
+            trailing_pct = self.trailing_stop_distance * 100
+            min_distance_pct = 0.1
 
             self.logger.debug(
-                f"calculate_trailing_stop called for {symbol}: "
+                f"calculate_trailing_stop for {symbol}: "
                 f"side={side}, current={current_price:.2f}, entry={entry_price:.2f}, "
-                f"max_pnl={max_pnl_percent:.2f}%, trailing={trailing_pct:.2f}%"
+                f"max_pnl={max_pnl_percent:.2f}%"
             )
 
-            # Расчёт порога стопа от максимального PnL
-            # Отступаем на trailing_pct от пика
-            stop_pnl_threshold = max(0, max_pnl_percent - trailing_pct)
+            # ═══════════════════════════════════════════════════════════
+            # РАСЧЁТ ПОРОГА
+            # ═══════════════════════════════════════════════════════════
 
-            self.logger.debug(
-                f"Stop PnL threshold: {stop_pnl_threshold:.2f}% "
-                f"(max_pnl={max_pnl_percent:.2f}% - trailing={trailing_pct:.2f}%)"
-            )
+            stop_pnl_threshold = max(0.0, max_pnl_percent - trailing_pct)
 
-            # Convert side string to Direction enum
-            direction = Direction.BUY if side == "LONG" else Direction.SELL if side == "SHORT" else Direction.FLAT
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННОЙ ДО if/else
+            # ═══════════════════════════════════════════════════════════
 
-            # Расчёт новой цены стопа от entry_price
-            if direction == Direction.BUY:
-                # Для лонга: стоп = entry * (1 + stop_pnl_threshold/100)
-                new_stop = entry_price * (1 + stop_pnl_threshold / 100)
+            new_stop_price: Optional[float] = None
 
-                # Проверка выгодности: новый стоп должен быть ВЫШЕ старого
+            # ═══════════════════════════════════════════════════════════
+            # РАСЧЁТ ДЛЯ LONG
+            # ═══════════════════════════════════════════════════════════
+
+            if side == "LONG":
+                # Стоп ВЫШЕ entry (безубыток/прибыль)
+                new_stop_price = entry_price * (1.0 + stop_pnl_threshold / 100.0)
+
+                # Проверка 1: Новый стоп выше старого?
                 if current_stop_price is not None:
-                    if new_stop <= current_stop_price:
+                    if new_stop_price <= current_stop_price:
                         return {
-                            'new_stop': None,
+                            'new_stop_price': None,
                             'beneficial': False,
                             'reason': (
-                                f'Not beneficial for LONG: new_stop {new_stop:.2f} <= '
+                                f'LONG: new_stop {new_stop_price:.2f} <= '
                                 f'current_stop {current_stop_price:.2f}'
                             ),
-                            'distance_from_entry_pct': stop_pnl_threshold,
+                            'stop_distance_pct': stop_pnl_threshold,
                             'trailing_pct': trailing_pct
                         }
 
-                # Проверка минимального расстояния от текущей цены
-                max_allowed_stop = current_price * (1 - min_distance_pct / 100)
-                if new_stop >= max_allowed_stop:
+                # Проверка 2: Не слишком близко к текущей цене?
+                max_allowed_stop = current_price * (1.0 - min_distance_pct / 100.0)
+                if new_stop_price >= max_allowed_stop:
                     return {
-                        'new_stop': None,
+                        'new_stop_price': None,
                         'beneficial': False,
                         'reason': (
-                            f'Stop too close to current price for LONG: '
-                            f'new_stop {new_stop:.2f} >= max_allowed {max_allowed_stop:.2f}'
+                            f'LONG: stop {new_stop_price:.2f} too close to '
+                            f'current {current_price:.2f}'
                         ),
-                        'distance_from_entry_pct': stop_pnl_threshold,
+                        'stop_distance_pct': stop_pnl_threshold,
                         'trailing_pct': trailing_pct
                     }
 
-            elif direction == Direction.SELL:
-                # Для шорта: стоп = entry * (1 - stop_pnl_threshold/100)
-                new_stop = entry_price * (1 - stop_pnl_threshold / 100)
+            # ═══════════════════════════════════════════════════════════
+            # РАСЧЁТ ДЛЯ SHORT
+            # ═══════════════════════════════════════════════════════════
 
-                # Проверка выгодности: новый стоп должен быть НИЖЕ старого
+            elif side == "SHORT":
+                # Стоп ВЫШЕ entry (защита от роста)
+                new_stop_price = entry_price * (1.0 + stop_pnl_threshold / 100.0)
+
+                # Проверка 1: Новый стоп ниже старого?
                 if current_stop_price is not None:
-                    if new_stop >= current_stop_price:
+                    if new_stop_price >= current_stop_price:
                         return {
-                            'new_stop': None,
+                            'new_stop_price': None,
                             'beneficial': False,
                             'reason': (
-                                f'Not beneficial for SHORT: new_stop {new_stop:.2f} >= '
+                                f'SHORT: new_stop {new_stop_price:.2f} >= '
                                 f'current_stop {current_stop_price:.2f}'
                             ),
-                            'distance_from_entry_pct': stop_pnl_threshold,
+                            'stop_distance_pct': stop_pnl_threshold,
                             'trailing_pct': trailing_pct
                         }
 
-                # Проверка минимального расстояния от текущей цены
-                min_allowed_stop = current_price * (1 + min_distance_pct / 100)
-                if new_stop <= min_allowed_stop:
+                # Проверка 2: Не слишком близко к текущей цене?
+                min_allowed_stop = current_price * (1.0 + min_distance_pct / 100.0)
+                if new_stop_price <= min_allowed_stop:
                     return {
-                        'new_stop': None,
+                        'new_stop_price': None,
                         'beneficial': False,
                         'reason': (
-                            f'Stop too close to current price for SHORT: '
-                            f'new_stop {new_stop:.2f} <= min_allowed {min_allowed_stop:.2f}'
+                            f'SHORT: stop {new_stop_price:.2f} too close to '
+                            f'current {current_price:.2f}'
                         ),
-                        'distance_from_entry_pct': stop_pnl_threshold,
+                        'stop_distance_pct': stop_pnl_threshold,
                         'trailing_pct': trailing_pct
                     }
 
-            # Успешный расчёт
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ЗАЩИТА: Проверка что new_stop_price был установлен
+            # ═══════════════════════════════════════════════════════════
+
+            else:
+                # Сюда не должны попасть из-за валидации выше,
+                # но для безопасности проверяем
+                raise ValueError(f"Invalid side: {side} (expected LONG or SHORT)")
+
+            # ✅ Дополнительная проверка (для типизации)
+            if new_stop_price is None:
+                raise ValueError(
+                    f"new_stop_price was not calculated for side={side}"
+                )
+
+            # ═══════════════════════════════════════════════════════════
+            # УСПЕШНЫЙ РЕЗУЛЬТАТ
+            # ═══════════════════════════════════════════════════════════
+
+            distance_from_entry_pct = abs(
+                (new_stop_price - entry_price) / entry_price
+            ) * 100.0
+
             self.logger.info(
-                f"✅ Trailing stop calculated for {symbol}: "
-                f"{side} new_stop={new_stop:.2f} (distance from entry: {stop_pnl_threshold:.2f}%)"
+                f"✅ Trailing stop for {symbol} {side}: "
+                f"new_stop={new_stop_price:.2f} "
+                f"(+{stop_pnl_threshold:.2f}% from entry={entry_price:.2f})"
             )
 
             return {
-                'new_stop': float(new_stop),
+                'new_stop_price': float(new_stop_price),
                 'beneficial': True,
-                'reason': f'Trailing stop updated: max_pnl={max_pnl_percent:.2f}%',
-                'distance_from_entry_pct': float(stop_pnl_threshold),
+                'reason': f'trailing_updated: max_pnl={max_pnl_percent:.2f}%',
+                'stop_distance_pct': float(stop_pnl_threshold),
                 'trailing_pct': float(trailing_pct),
+                'distance_from_entry_pct': float(distance_from_entry_pct),
                 'entry_price': float(entry_price),
                 'current_price': float(current_price),
-                # ✅ Новые поля для ExitDecision (Task 4)
-                'new_stop_loss': float(new_stop),
-                'new_take_profit': None,  # Не изменяется при trailing
-                'trailing_type': 'adaptive_trailing',
-                'stop_distance_pct': float(stop_pnl_threshold)
+                'new_stop_loss': float(new_stop_price),
+                'new_take_profit': None,
+                'trailing_type': 'adaptive_trailing'
+            }
+
+        except ValueError as e:
+            # Валидационные ошибки
+            self.logger.error(f"❌ Validation error for {symbol}: {e}")
+            return {
+                'new_stop_price': None,
+                'beneficial': False,
+                'reason': f'validation_error: {str(e)}',
+                'stop_distance_pct': 0.0,
+                'trailing_pct': 0.0,
+                'error': str(e)
             }
 
         except Exception as e:
-            self.logger.error(f"❌ Error calculating trailing stop for {symbol}: {e}")
+            # Неожиданные ошибки
+            self.logger.error(
+                f"❌ Unexpected error calculating trailing stop for {symbol}: {e}",
+                exc_info=True
+            )
             return {
-                'new_stop': None,
+                'new_stop_price': None,
                 'beneficial': False,
-                'reason': f'Error: {str(e)}',
-                'distance_from_entry_pct': 0.0,
+                'reason': f'calculation_error: {str(e)}',
+                'stop_distance_pct': 0.0,
                 'trailing_pct': 0.0,
-                'error': str(e),
-                # ✅ Новые поля для ExitDecision (Task 4) - ошибочный случай
-                'new_stop_loss': None,
-                'new_take_profit': None,
-                'trailing_type': None,
-                'stop_distance_pct': None
+                'error': str(e)
             }
 
     def update_trailing_state(self, position: Dict, current_price: float) -> Dict[str, Any]:
