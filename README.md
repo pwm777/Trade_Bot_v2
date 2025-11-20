@@ -1,6 +1,3 @@
-Вот **полный текст README.md** со всем содержимым:
-
-```markdown
 # 🤖 ML-Enhanced Hierarchical Trading System
 
 **Intelligent Cryptocurrency Trading System with LightGBM Trend Detection**
