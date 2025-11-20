@@ -692,7 +692,10 @@ class TradingSystemInterface(Protocol):
 class StrategyInterface(Protocol):
     """Интерфейс торговой стратегии"""
 
-    def generate_signal(self, symbol: str, candles: pd.DataFrame) -> Optional[StrategySignal]: ...
+    async def generate_signal(
+        self,
+        market_data: Dict[str, pd.DataFrame]
+    ) -> Optional[Union[StrategySignal, TradeSignalIQTS]]: ...
 
     def get_required_history(self) -> int: ...
 
