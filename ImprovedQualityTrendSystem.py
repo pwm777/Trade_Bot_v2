@@ -334,14 +334,29 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             if not filtered_signal.get("ok", False):
                 return None
 
-            # 6. ATR
-            atr = self._calculate_atr(market_data["1m"])
+            # 6. ATR (БЕЗОПАСНО)
+            df_1m = market_data.get("1m")
+            if df_1m is None or df_1m.empty:
+                self.logger.debug("Cannot calculate ATR - no 1m data")
+                return None
+
+            atr = self._calculate_atr(df_1m)
             if atr <= 0:
                 self.logger.debug("ATR <= 0, skipping")
                 return None
 
-            # 7. Текущая цена
-            price = float(market_data["1m"]["close"].iloc[-1])
+            # 7. Текущая цена (БЕЗОПАСНО)
+            df_1m = market_data.get("1m")
+            if df_1m is None or df_1m.empty or 'close' not in df_1m.columns:
+                self.logger.debug("Cannot get current price from 1m data")
+                return None
+
+            try:
+                price = float(df_1m["close"].iloc[-1])
+            except (IndexError, ValueError, TypeError) as e:
+                self.logger.debug(f"Error extracting price: {e}")
+                return None
+
             if price <= 0:
                 self.logger.debug("Price <= 0, skipping")
                 return None
@@ -425,58 +440,23 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             self.logger.error(f"Error in analyze_and_trade: {e}", exc_info=True)
             return None
 
+    # Строка 428-497
     async def _update_market_regime(self, market_data: Dict[Timeframe, pd.DataFrame]) -> None:
-        """✅ ИСПРАВЛЕНО: Обновление рыночного режима с правильными типами"""
+        """✅ ИСПРАВЛЕНО: Обновление рыночного режима с проверкой минимального количества данных"""
         try:
             # Базовая логика определения режима
             df_5m = market_data.get("5m")
-            if df_5m is not None and len(df_5m) > 20:
-                prices = df_5m['close'].tail(20)
-                sma_20 = prices.mean()
-                current_price = prices.iloc[-1]
-                price_change_pct = (current_price - sma_20) / sma_20
 
-                # ✅ Используем Literal типы
-                if price_change_pct > 0.02:
-                    regime: RegimeType = "strong_uptrend"
-                    confidence = min(0.9, abs(price_change_pct) * 10)
-                elif price_change_pct > 0.005:
-                    regime: RegimeType = "weak_uptrend"
-                    confidence = min(0.7, abs(price_change_pct) * 20)
-                elif price_change_pct < -0.02:
-                    regime: RegimeType = "strong_downtrend"
-                    confidence = min(0.9, abs(price_change_pct) * 10)
-                elif price_change_pct < -0.005:
-                    regime: RegimeType = "weak_downtrend"
-                    confidence = min(0.7, abs(price_change_pct) * 20)
+            # ✅ ПРОВЕРКА: Минимум 20 свечей для корректного расчёта
+            if df_5m is None or len(df_5m) < 20:
+                if df_5m is None:
+                    self.logger.debug("No 5m data available for regime calculation")
                 else:
-                    regime: RegimeType = "sideways"
-                    confidence = 0.5
+                    self.logger.debug(
+                        f"Not enough 5m bars for regime calculation: {len(df_5m)} < 20"
+                    )
 
-                # Расчет волатильности
-                volatility = prices.pct_change().std()
-
-                # Определение профиля объема
-                volume_mean = df_5m['volume'].tail(20).mean()
-                current_volume = df_5m['volume'].iloc[-1]
-                volume_ratio = current_volume / volume_mean if volume_mean > 0 else 1.0
-
-                if volume_ratio > 1.5:
-                    volume_profile: VolumeProfileType = "high"
-                elif volume_ratio < 0.7:
-                    volume_profile: VolumeProfileType = "low"
-                else:
-                    volume_profile: VolumeProfileType = "normal"
-
-                self.current_regime = MarketRegime(
-                    regime=regime,
-                    confidence=float(confidence),
-                    volatility_level=float(volatility),
-                    trend_strength=float(abs(price_change_pct)),
-                    volume_profile=volume_profile
-                )
-            else:
-                # Режим по умолчанию с правильными типами
+                # Устанавливаем режим по умолчанию
                 self.current_regime = MarketRegime(
                     regime="uncertain",
                     confidence=0.0,
@@ -484,9 +464,65 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                     trend_strength=0.0,
                     volume_profile="normal"
                 )
+                return
+
+            # ✅ Теперь гарантированно len(df_5m) >= 20
+            prices = df_5m['close'].tail(20)
+            sma_20 = prices.mean()
+            current_price = prices.iloc[-1]
+            price_change_pct = (current_price - sma_20) / sma_20
+
+            # ✅ Используем Literal типы
+            if price_change_pct > 0.02:
+                regime: RegimeType = "strong_uptrend"
+                confidence = min(0.9, abs(price_change_pct) * 10)
+            elif price_change_pct > 0.005:
+                regime: RegimeType = "weak_uptrend"
+                confidence = min(0.7, abs(price_change_pct) * 20)
+            elif price_change_pct < -0.02:
+                regime: RegimeType = "strong_downtrend"
+                confidence = min(0.9, abs(price_change_pct) * 10)
+            elif price_change_pct < -0.005:
+                regime: RegimeType = "weak_downtrend"
+                confidence = min(0.7, abs(price_change_pct) * 20)
+            else:
+                regime: RegimeType = "sideways"
+                confidence = 0.5
+
+            # Расчет волатильности
+            volatility = prices.pct_change().std()
+
+            # ✅ ЗАЩИТА: Проверка на NaN/Inf
+            if pd.isna(volatility) or not pd.np.isfinite(volatility):
+                volatility = 0.02  # Fallback значение
+
+            # Определение профиля объема
+            volume_mean = df_5m['volume'].tail(20).mean()
+            current_volume = df_5m['volume'].iloc[-1]
+            volume_ratio = current_volume / volume_mean if volume_mean > 0 else 1.0
+
+            if volume_ratio > 1.5:
+                volume_profile: VolumeProfileType = "high"
+            elif volume_ratio < 0.7:
+                volume_profile: VolumeProfileType = "low"
+            else:
+                volume_profile: VolumeProfileType = "normal"
+
+            self.current_regime = MarketRegime(
+                regime=regime,
+                confidence=float(confidence),
+                volatility_level=float(volatility),
+                trend_strength=float(abs(price_change_pct)),
+                volume_profile=volume_profile
+            )
+
+            self.logger.debug(
+                f"Market regime updated: {regime} "
+                f"(conf={confidence:.2f}, vol={volatility:.4f}, trend_str={abs(price_change_pct):.4f})"
+            )
 
         except Exception as e:
-            self.logger.warning(f"Error updating market regime: {e}")
+            self.logger.warning(f"Error updating market regime: {e}", exc_info=True)
             self.current_regime = MarketRegime(
                 regime="uncertain",
                 confidence=0.0,
@@ -617,32 +653,29 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                 self.logger.info(f"Trading conditions not met for {symbol}")
                 return None
 
-            # ✅ ШАГ 7: Формируем торговый сигнал
-            # УПРОЩЕННАЯ ЛОГИКА: Только направление и уверенность
-            # PositionManager сам рассчитает size, stop_loss, take_profit
+            # ✅ ШАГ 7: Формируем торговый сигнал с безопасным извлечением цены
             direction = int(result['direction'])
             confidence = result['confidence']
 
-            # Получаем текущую цену для entry_price
-            current_price = float(market_data['5m']['close'].iloc[-1])
+            # Получаем текущую цену для entry_price (БЕЗОПАСНО)
+            df_5m = market_data.get('5m')
+            if df_5m is None or df_5m.empty:
+                self.logger.warning(f"No 5m data available for {symbol}")
+                return None
 
-            # Формируем минимальный сигнал для PositionManager
-            signal = {
-                'symbol': symbol,
-                'direction': direction,
-                'confidence': confidence,
-                'entry_price': current_price,
-                'regime': self.current_regime.regime if self.current_regime else 'uncertain',
-                'metadata': result.get('metadata', {}),
-                # PositionManager сам добавит: position_size, stop_loss, take_profit
-            }
+            if 'close' not in df_5m.columns:
+                self.logger.warning(f"No 'close' column in 5m data for {symbol}")
+                return None
 
-            self.logger.info(
-                f"✅ Signal generated for {symbol}: dir={direction}, conf={confidence:.2f}, "
-                f"entry={current_price:.2f}"
-            )
+            try:
+                current_price = float(df_5m['close'].iloc[-1])
+            except (IndexError, ValueError, TypeError) as e:
+                self.logger.warning(f"Cannot extract current price from 5m data: {e}")
+                return None
 
-            return signal
+            if current_price <= 0:
+                self.logger.warning(f"Invalid current price: {current_price}")
+                return None
 
         except Exception as e:
             self.logger.error(f"Error generating signal: {e}", exc_info=True)
