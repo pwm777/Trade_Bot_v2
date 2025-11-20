@@ -798,7 +798,6 @@ Tree structure:
     ¦   L-- Submodule2
     L-- Module2
         L-- Submodule3
-```
 
 ## 4. модуль run_bot.py
 Основные классы:
@@ -928,8 +927,6 @@ L-- MainBotAdapter (MainBotInterface)
     ¦   L-- handle_candle_ready() > None 
     L-- Управление данными:
         L-- Интеграция с DataProvider.update_from_candle_event()	
-```
-
 
 ## 5. Модуль: trade_bot.py
 
