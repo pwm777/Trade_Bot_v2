@@ -508,6 +508,8 @@ class TradeSignalIQTS(TypedDict, total=False):
     regime: MarketRegimeLiteral
     metadata: DetectorMetadata
     # v2.0 — риск-контекст (новый стандарт)
+    intent: SignalIntent
+    decision_price: Optional[float]
     risk_context: RiskContext  # Полный контекст риск-параметров
     stops_precomputed: bool  # Флаг: True если стопы уже в risk_context
     validation_hash: Optional[str]  # SHA256 hash для проверки целостности
@@ -1610,6 +1612,7 @@ __all__ = [
     "OrderUpd",
     "PositionSnapshot",
     "Candle1m",
+     PositionEvent,
 
     # Lifecycle types
     "BotLifecycleEvent",

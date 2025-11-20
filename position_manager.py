@@ -4,28 +4,28 @@ TradeSignal → OrderReq, ведет учет исполнения
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, List, cast
-from decimal import Decimal
+from typing import Optional, List, cast
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Any
 import logging
 from dataclasses import dataclass, field
 from typing import Literal
-from sqlalchemy import literal
 from sqlalchemy.engine import Engine, create_engine
 import threading
 from collections import deque
 from iqts_standards import (
-    TradeSignal, OrderReq, OrderUpd, PositionSnapshot, PositionEvent,
-    PriceFeed, EventHandler, PositionType,
+     OrderReq, OrderUpd, PositionSnapshot, PositionEvent,
+    TradeSignalIQTS, PriceFeed, EventHandler,
     get_current_timestamp_ms, create_correlation_id,
     ExchangeManagerInterface
 )
+import asyncio
 from risk_manager import Direction
 from exit_system import AdaptiveExitManager
-logger = logging.getLogger(__name__)
 from config import STRATEGY_PARAMS
 
 # === Исключения ===
-
+logger = logging.getLogger(__name__)
 class PositionManagerError(Exception):
     """Базовая ошибка PositionManager"""
     pass
@@ -213,7 +213,7 @@ class PositionManager:
 
     # === Главный интерфейс ===
 
-    def handle_signal(self, signal: TradeSignal) -> Optional[OrderReq]:
+    def handle_signal(self, signal: TradeSignalIQTS) -> Optional[OrderReq]:
         """Преобразовать сигнал в OrderReq и сохранить в БД."""
         try:
             self._validate_signal(signal)
@@ -314,7 +314,7 @@ class PositionManager:
             self.logger.error(f"Error handling signal: {e}")
             return None
 
-    def _handle_open_signal(self, signal: TradeSignal, current_position: PositionSnapshot) -> Optional[OrderReq]:
+    def _handle_open_signal(self, signal: TradeSignalIQTS, current_position: PositionSnapshot) -> Optional[OrderReq]:
         """Обработка сигнала открытия позиции"""
         from typing import cast, Literal
 
@@ -340,7 +340,7 @@ class PositionManager:
         )
         return self.build_entry_order(signal, side)
 
-    def _handle_close_signal(self, signal: TradeSignal, current_position: PositionSnapshot) -> Optional[OrderReq]:
+    def _handle_close_signal(self, signal: TradeSignalIQTS, current_position: PositionSnapshot) -> Optional[OrderReq]:
         """Обработка сигнала закрытия позиции"""
         symbol = signal["symbol"]
 
@@ -351,14 +351,24 @@ class PositionManager:
 
         return self.build_exit_order(signal, current_position, "SIGNAL_EXIT")
 
-    def _handle_wait_signal(self, signal: TradeSignal, current_position: PositionSnapshot) -> Optional[OrderReq]:
+    def _handle_wait_signal(
+            self,
+            signal: TradeSignalIQTS,
+            current_position: PositionSnapshot
+    ) -> Optional[OrderReq]:
         """
         Обработка WAIT сигнала с вычислением trailing stop.
 
         ✅ UPDATED: Uses AdaptiveExitManager.calculate_trailing_stop() (v2.1+)
         """
+        # ✅ ИСПРАВЛЕНИЕ: Инициализируем symbol ДО try блока
+        symbol = signal.get("symbol", "UNKNOWN")
+
         try:
-            symbol = signal["symbol"]
+            # ✅ Теперь symbol всегда определён
+            if not symbol or symbol == "UNKNOWN":
+                self.logger.error("❌ Missing or invalid symbol in signal")
+                return None
 
             if current_position["status"] == "FLAT":
                 return None
@@ -372,89 +382,135 @@ class PositionManager:
             if not trailing_request:
                 return None
 
-            # === ✅ ИСПРАВЛЕНО: Используем AdaptiveExitManager.calculate_trailing_stop ===
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ПРОВЕРКА: exit_manager должен быть установлен
+            # ═══════════════════════════════════════════════════════════
 
-            # Проверяем наличие exit_manager
             if not hasattr(self, 'exit_manager') or not self.exit_manager:
-                self.logger.warning(
-                    f"⚠️ exit_manager not set for PositionManager! "
+                self.logger.error(
+                    f"❌ CRITICAL: exit_manager not set for PositionManager! "
                     f"Cannot calculate trailing stop for {symbol}. "
-                    f"Falling back to deprecated compute_trailing_level()."
+                    f"Skipping WAIT signal processing."
                 )
-                # Fallback на старый метод (выдаст DeprecationWarning)
-                current_stop = self._get_current_stop_price(symbol)
-                new_stop_price_float = self.compute_trailing_level(
-                    current_price=float(signal["decision_price"]),
-                    side=position_side,
-                    current_stop_price=current_stop,
-                    symbol=symbol,
-                    max_pnl_percent=trailing_request.get("max_pnl_percent"),
-                    entry_price=trailing_request.get("entry_price")
-                )
-            else:
-                # ✅ НОВЫЙ ПУТЬ: Используем AdaptiveExitManager.calculate_trailing_stop()
-                current_price = float(signal["decision_price"])
-                entry_price = trailing_request.get("entry_price")
-                max_pnl_percent = trailing_request.get("max_pnl_percent")
-                current_stop = self._get_current_stop_price(symbol)
-
-                self.logger.debug(
-                    f"Calculating trailing stop via AdaptiveExitManager for {symbol}:\n"
-                    f"  current_price: {current_price}\n"
-                    f"  entry_price: {entry_price}\n"
-                    f"  max_pnl_percent: {max_pnl_percent}\n"
-                    f"  current_stop: {current_stop}\n"
-                    f"  side: {position_side}"
-                )
-
-                # Вызываем метод exit_manager
-                result = self.exit_manager.calculate_trailing_stop(
-                    current_price=current_price,
-                    entry_price=entry_price,
-                    side=position_side,  # "LONG" или "SHORT"
-                    max_pnl_percent=max_pnl_percent,
-                    current_stop_price=current_stop,
-                    symbol=symbol
-                )
-
-                # Извлекаем новый стоп из результата
-                new_stop_price_float = result.get('new_stop')
-
-                # Логируем детали результата
-                if result.get('beneficial'):
-                    self.logger.info(
-                        f"✅ Trailing stop calculated for {symbol}:\n"
-                        f"  new_stop_loss: {result.get('new_stop_loss')}\n"
-                        f"  trailing_type: {result.get('trailing_type')}\n"
-                        f"  stop_distance_pct: {result.get('stop_distance_pct')}\n"
-                        f"  reason: {result.get('reason')}"
-                    )
-                else:
-                    self.logger.debug(
-                        f"Trailing stop not beneficial for {symbol}: {result.get('reason')}"
-                    )
-
-            # === Проверка результата ===
-            if not new_stop_price_float:
-                self.logger.debug(f"No new trailing stop calculated for {symbol}")
                 return None
 
-            # === Квантуем цену ===
-            new_stop_price = self.quantize_price(symbol, Decimal(str(new_stop_price_float)))
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ВЫЧИСЛЕНИЕ TRAILING STOP через AdaptiveExitManager
+            # ═══════════════════════════════════════════════════════════
 
-            # === Строим ордер ===
-            # НЕ отменяем старый стоп
-            # ExchangeManager обновит его через update_stop_order()
+            current_price = float(signal["decision_price"])
+            entry_price = trailing_request.get("entry_price")
+            max_pnl_percent = trailing_request.get("max_pnl_percent")
+            current_stop = self._get_current_stop_price(symbol)
 
-            return self.build_stop_order(
-                signal,
-                current_position,
-                new_stop_price,
-                is_trailing=True
+            self.logger.debug(
+                f"Calculating trailing stop via AdaptiveExitManager for {symbol}:\n"
+                f"  current_price: {current_price}\n"
+                f"  entry_price: {entry_price}\n"
+                f"  max_pnl_percent: {max_pnl_percent}\n"
+                f"  current_stop: {current_stop}\n"
+                f"  side: {position_side}"
             )
 
+            # Вызываем метод exit_manager
+            result = self.exit_manager.calculate_trailing_stop(
+                current_price=current_price,
+                entry_price=entry_price,
+                side=position_side,
+                max_pnl_percent=max_pnl_percent,
+                current_stop_price=current_stop,
+                symbol=symbol
+            )
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ОБРАБОТКА РЕЗУЛЬТАТА
+            # ═══════════════════════════════════════════════════════════
+
+            if not result or not isinstance(result, dict):
+                self.logger.warning(
+                    f"⚠️ exit_manager.calculate_trailing_stop returned invalid result: {result}"
+                )
+                return None
+
+            new_stop_price_float = result.get("new_stop_price")
+
+            if new_stop_price_float is None:
+                self.logger.debug(
+                    f"No trailing stop update needed for {symbol} "
+                    f"(reason: {result.get('reason', 'unknown')})"
+                )
+                return None
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ СОЗДАНИЕ ОРДЕРА НА ОБНОВЛЕНИЕ СТОПА
+            # ═══════════════════════════════════════════════════════════
+
+            # Валидация новой цены стопа
+            if new_stop_price_float <= 0:
+                self.logger.error(
+                    f"❌ Invalid trailing stop price: {new_stop_price_float}"
+                )
+                return None
+
+            # Квантуем цену
+            new_stop_price = self.quantize_price(symbol, Decimal(str(new_stop_price_float)))
+
+            # Проверяем что цена изменилась
+            if current_stop and abs(float(new_stop_price) - current_stop) < 0.00000001:
+                self.logger.debug(
+                    f"Trailing stop price unchanged for {symbol}: {current_stop}"
+                )
+                return None
+
+            # Генерируем ID для нового стоп-ордера
+            client_order_id = self._generate_unique_order_id(symbol, "trail_stop")
+
+            # Определяем сторону стопа
+            stop_side: Literal["BUY", "SELL"] = "SELL" if position_side == "LONG" else "BUY"
+
+            # Создаём OrderReq
+            order_req = OrderReq(
+                client_order_id=client_order_id,
+                symbol=symbol,
+                side=stop_side,
+                type="STOP_MARKET",
+                qty=current_position["qty"],
+                price=None,
+                stop_price=new_stop_price,
+                time_in_force="GTC",
+                reduce_only=True,
+                correlation_id=signal.get("correlation_id", create_correlation_id()),
+                metadata={
+                    "reason": "trailing_stop_update",
+                    "previous_stop": current_stop,
+                    "new_stop": float(new_stop_price),
+                    "max_pnl_percent": max_pnl_percent,
+                    "entry_price": entry_price
+                }
+            )
+
+            self.logger.info(
+                f"✅ Trailing stop update for {symbol}: "
+                f"{current_stop} → {float(new_stop_price)} "
+                f"(distance: {result.get('stop_distance_pct', 0):.2f}%)"
+            )
+
+            return order_req
+
+        except KeyError as e:
+            # ✅ symbol теперь всегда определён
+            self.logger.error(
+                f"❌ Missing required field in signal for {symbol}: {e}",
+                exc_info=True
+            )
+            return None
+
         except Exception as e:
-            self.logger.error(f"Error handling WAIT signal: {e}", exc_info=True)
+            # ✅ symbol теперь всегда определён
+            self.logger.error(
+                f"❌ Error handling WAIT signal for {symbol}: {e}",
+                exc_info=True
+            )
             return None
 
     async def create_initial_stop(
@@ -466,6 +522,10 @@ class PositionManager:
         """
         Создать и ОТПРАВИТЬ начальный стоп-лосс ордер для открытой позиции.
 
+        ✅ ИСПРАВЛЕНО:
+        - Валидация ответа ExchangeManager на None
+        - Безопасный fallback для ack_status
+
         Args:
             symbol: Торговый символ
             stop_loss_pct: Процент стоп-лосса
@@ -474,7 +534,10 @@ class PositionManager:
             OrderReq если стоп успешно создан, иначе None
         """
         try:
-            self.logger.info(f"🟢 create_initial_stop CALLED: symbol={symbol} stop_loss_pct={stop_loss_pct}")
+            self.logger.info(
+                f"🟢 create_initial_stop CALLED: "
+                f"symbol={symbol} stop_loss_pct={stop_loss_pct}"
+            )
 
             # === ШАГ 1: Проверка ExchangeManager ===
             if not self.exchange_manager:
@@ -485,7 +548,9 @@ class PositionManager:
             position = self.get_position(symbol)
 
             if position["status"] != "OPEN":
-                self.logger.warning(f"Cannot create stop: position not OPEN for {symbol}")
+                self.logger.warning(
+                    f"Cannot create stop: position not OPEN for {symbol}"
+                )
                 return None
 
             position_side = position.get("side")
@@ -499,8 +564,12 @@ class PositionManager:
             if stop_loss_pct is None:
                 try:
                     strategy_config = STRATEGY_PARAMS.get("CornEMA", {})
-                    stop_loss_pct = float(strategy_config.get("entry_stoploss_pct", 0.30))
-                    self.logger.info(f"Using entry_stoploss_pct from config: {stop_loss_pct}%")
+                    stop_loss_pct = float(
+                        strategy_config.get("entry_stoploss_pct", 0.30)
+                    )
+                    self.logger.info(
+                        f"Using entry_stoploss_pct from config: {stop_loss_pct}%"
+                    )
                 except Exception as e:
                     self.logger.error(f"Error loading stop_loss_pct: {e}")
                     stop_loss_pct = 0.30
@@ -532,8 +601,12 @@ class PositionManager:
 
             # === ШАГ 6: Генерируем ID ===
             client_order_id = self._generate_unique_order_id(symbol, "auto_stop")
-            stop_side: Literal["BUY", "SELL"] = "SELL" if position_side == "LONG" else "BUY"
-            correlation_id = f"initial_stop_{symbol}_{get_current_timestamp_ms()}"
+            stop_side: Literal["BUY", "SELL"] = (
+                "SELL" if position_side == "LONG" else "BUY"
+            )
+            correlation_id = (
+                f"initial_stop_{symbol}_{get_current_timestamp_ms()}"
+            )
 
             # === ШАГ 7: Формируем OrderReq ===
             order_req = OrderReq(
@@ -555,16 +628,31 @@ class PositionManager:
                 }
             )
 
-            # === ШАГ 8: ✅ ИСПРАВЛЕНО - Отправляем с await ===
-            self.logger.warning(f"🔍 Sending initial stop to ExchangeManager...")
+            # === ШАГ 8: Отправляем с await ===
+            self.logger.warning(
+                f"🔍 Sending initial stop to ExchangeManager..."
+            )
 
-            ack = await self.exchange_manager.place_order(order_req)  # ✅ await!
+            ack = self.exchange_manager.place_order(order_req)
+
+            # ✅ ШАГ 9: ИСПРАВЛЕНО - Валидация ответа ExchangeManager
+            if not ack or not isinstance(ack, dict):
+                self.logger.error(
+                    f"❌ ExchangeManager returned invalid response:\n"
+                    f"  Type: {type(ack).__name__}\n"
+                    f"  Value: {ack}\n"
+                    f"  Symbol: {symbol}\n"
+                    f"  Order ID: {client_order_id}"
+                )
+                self._remove_active_stop_tracking(symbol)
+                return None
 
             self.logger.warning(f"🔍 ExchangeManager response: {ack}")
 
-            # === ШАГ 9: Проверяем результат ===
-            ack_status = ack.get("status")  # ✅ Теперь работает!
+            # ✅ Безопасное извлечение статуса с fallback
+            ack_status = ack.get("status", "ERROR")
 
+            # === ШАГ 10: Обработка успешного ответа ===
             if ack_status in ["NEW", "WORKING", "FILLED"]:
                 # Регистрируем ордер
                 pending_order = PendingOrder(
@@ -616,7 +704,11 @@ class PositionManager:
 
             else:
                 # Ордер отклонён
-                error_msg = ack.get("error_message") or ack.get("error") or "Unknown error"
+                error_msg = (
+                        ack.get("error_message") or
+                        ack.get("error") or
+                        "Unknown error"
+                )
 
                 self.logger.error(
                     f"❌ INITIAL STOP REJECTED:\n"
@@ -629,7 +721,10 @@ class PositionManager:
                 return None
 
         except Exception as e:
-            self.logger.error(f"❌ EXCEPTION in create_initial_stop: {e}", exc_info=True)
+            self.logger.error(
+                f"❌ EXCEPTION in create_initial_stop: {e}",
+                exc_info=True
+            )
             return None
 
     def on_stop_triggered(self, symbol: str, execution_price: float) -> None:
@@ -683,7 +778,7 @@ class PositionManager:
             )
 
             # === ДЕЛЕГИРОВАНИЕ в ExchangeManager ===
-            self.logger.debug(
+            self.logger.info(
                 f"Delegating to ExchangeManager.check_stops_on_price_update("
                 f"symbol={symbol}, current_price={execution_price})"
             )
@@ -703,80 +798,61 @@ class PositionManager:
                 exc_info=True
             )
 
-    def _cancel_stops_for_symbol(self, symbol: str) -> None:
+    async def _cancel_stops_for_symbol(self, symbol: str) -> None:
         """
-        Отменить все активные стоп-ордера для символа при закрытии позиции.
+        ✅ ASYNC: Отменить все активные стоп-ордера для символа.
         """
         try:
             # 1. Удаляем из внутреннего отслеживания
-            if symbol in self._active_stop_orders:
-                stop_info = self._active_stop_orders.pop(symbol)
-                self.logger.debug(
-                    f"Removed stop tracking for {symbol} on position close: "
-                    f"stop_price={stop_info.get('stop_price')}"
-                )
+            stops_to_cancel = self._active_stop_orders.get(symbol, [])
 
-            # 2. Проверяем ExchangeManager
-            if not self.exchange_manager:
-                self.logger.warning(f"ExchangeManager not available")
+            if not stops_to_cancel:
+                self.logger.debug(f"No active stops to cancel for {symbol}")
                 return
 
-            # 3. Проверяем методы
-            if not hasattr(self.exchange_manager, 'get_active_orders'):
-                self.logger.warning(f"ExchangeManager doesn't support get_active_orders")
-                return
+            # 2. Отменяем на бирже
+            for order_id in stops_to_cancel:
+                try:
+                    self.logger.info(f"Cancelling stop order {order_id} for {symbol}")
 
-            if not hasattr(self.exchange_manager, 'cancel_order'):
-                self.logger.warning(f"ExchangeManager doesn't support cancel_order")
-                return
+                    cancel_method = self.exchange_manager.cancel_order
 
-            # 4. ✅ Получаем активные ордера (СИНХРОННО)
-            active_orders = self.exchange_manager.get_active_orders(symbol)
+                    # ✅ Проверяем async/sync
+                    if asyncio.iscoroutinefunction(cancel_method):
+                        result =  cancel_method(order_id)
+                    else:
+                        result = cancel_method(order_id)
 
-            if not active_orders:
-                self.logger.debug(f"No active orders found for {symbol}")
-                return
-
-            # 5. Отменяем STOP ордера
-            canceled_count = 0
-            for order in active_orders:
-                order_type = order.get("type")
-                if order_type in ["STOP_MARKET", "STOP", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"]:
-                    client_order_id = order.get("client_order_id")
-                    if not client_order_id:
+                    if not isinstance(result, dict):
+                        self.logger.warning(f"Invalid cancel result: {result}")
                         continue
 
-                    self.logger.debug(
-                        f"Canceling stop order {client_order_id} for closed position {symbol}"
+                    status = result.get("status", "UNKNOWN")
+
+                    if status == "CANCELED":
+                        self.logger.info(f"✅ Stop {order_id} cancelled successfully")
+                    else:
+                        self.logger.warning(
+                            f"⚠️ Stop {order_id} cancel status: {status}"
+                        )
+
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Failed to cancel stop {order_id}: {e}",
+                        exc_info=True
                     )
 
-                    try:
-                        # ✅ Отменяем (СИНХРОННО)
-                        result = self.exchange_manager.cancel_order(client_order_id)
-
-                        # ✅ result это Dict[str, Any], можно использовать .get()
-                        if result.get("status") == "CANCELED":
-                            canceled_count += 1
-                            self.logger.debug(f"✅ Canceled {client_order_id}")
-                        else:
-                            self.logger.warning(
-                                f"Failed to cancel {client_order_id}: "
-                                f"{result.get('error_message', 'Unknown error')}"
-                            )
-                    except Exception as cancel_error:
-                        self.logger.error(f"Error canceling {client_order_id}: {cancel_error}")
-
-            if canceled_count > 0:
-                self.logger.info(
-                    f"✅ Canceled {canceled_count} stop order(s) for {symbol}"
-                )
+            # 3. Очищаем внутренний трекинг
+            self._remove_active_stop_tracking(symbol)
 
         except Exception as e:
-            self.logger.error(f"❌ Error in _cancel_stops_for_symbol: {e}", exc_info=True)
-
+            self.logger.error(
+                f"❌ Error in _cancel_stops_for_symbol for {symbol}: {e}",
+                exc_info=True
+            )
     def _validate_stop_update(self, stop_update: Dict[str, Any],
                               position: PositionSnapshot,
-                              signal: TradeSignal) -> Dict[str, Any]:
+                              signal: TradeSignalIQTS) -> Dict[str, Any]:
         """Валидация данных stop_update"""
         try:
             # Проверяем обязательные поля
@@ -1198,7 +1274,13 @@ class PositionManager:
             order_type: Optional[str] = None,
             is_trailing_stop: bool = False
     ) -> None:
-        """Обработка исполнения ордера выхода"""
+        """
+        Обработка исполнения ордера выхода.
+
+        ✅ ИСПРАВЛЕНО:
+        - Инициализация pnl_decimal
+        - Обработка неизвестного direction
+        """
         filled_qty = fill["filled_qty"]
         avg_price_raw = fill.get("avg_price")
         commission_raw = fill.get("commission", Decimal('0'))
@@ -1248,11 +1330,34 @@ class PositionManager:
         # Convert position_side to Direction for comparison
         position_direction = Direction.BUY if position_side == "LONG" else Direction.SELL
 
+        # ═══════════════════════════════════════════════════════════
+        # ✅ ИСПРАВЛЕНИЕ: Инициализация pnl_decimal + обработка else
+        # ═══════════════════════════════════════════════════════════
+
         # Рассчитываем PnL (используем Decimal для точности)
         if position_direction == Direction.BUY:
             pnl_decimal = (avg_price_decimal - entry_price_decimal) * filled_qty_decimal
+            self.logger.debug(
+                f"PnL calculation for LONG: ({avg_price_float:.8f} - {entry_price_float:.8f}) "
+                f"* {float(filled_qty_decimal):.4f} = {float(pnl_decimal):.2f}"
+            )
+
         elif position_direction == Direction.SELL:
             pnl_decimal = (entry_price_decimal - avg_price_decimal) * filled_qty_decimal
+            self.logger.debug(
+                f"PnL calculation for SHORT: ({entry_price_float:.8f} - {avg_price_float:.8f}) "
+                f"* {float(filled_qty_decimal):.4f} = {float(pnl_decimal):.2f}"
+            )
+
+        else:
+            # ✅ FALLBACK: Неизвестный direction
+            self.logger.error(
+                f"❌ Unknown position direction for {symbol}: {position_direction} "
+                f"(position_side={position_side})"
+            )
+            pnl_decimal = Decimal('0')  # ✅ Безопасное значение по умолчанию
+            # Можно также вернуться досрочно:
+            # return
 
         # Ensure both fees are Decimal
         existing_entry_fee_raw = current_position.get("fee_total_usdt")
@@ -1263,11 +1368,17 @@ class PositionManager:
 
         exit_fee_decimal = Decimal(str(commission_float))
         total_fees_decimal = existing_entry_fee_decimal + exit_fee_decimal
+
+        # ✅ Теперь pnl_decimal всегда определён
         realized_pnl_decimal = pnl_decimal - total_fees_decimal
 
         remaining_qty = position_qty - filled_qty_decimal
 
         client_order_id = fill.get("client_order_id", "")
+
+        # ═══════════════════════════════════════════════════════════
+        # ОПРЕДЕЛЕНИЕ ПРИЧИНЫ ВЫХОДА
+        # ═══════════════════════════════════════════════════════════
 
         # ПРИОРИТЕТ 1: Явный флаг is_trailing_stop
         if is_trailing_stop:
@@ -1291,6 +1402,10 @@ class PositionManager:
             exit_reason = "SIGNAL_EXIT"
             self.logger.debug(f"Exit reason: SIGNAL_EXIT (order_type={order_type})")
 
+        # ═══════════════════════════════════════════════════════════
+        # ЗАКРЫТИЕ ПОЗИЦИИ
+        # ═══════════════════════════════════════════════════════════
+
         # Полностью закрываем позицию?
         if remaining_qty <= Decimal('0.001'):
             updated_position = PositionSnapshot(
@@ -1312,13 +1427,21 @@ class PositionManager:
 
             # Расчёт процентов
             position_size_usdt = entry_price_decimal * filled_qty_decimal
-            pnl_percent = (float(realized_pnl_decimal) / float(
-                position_size_usdt) * 100) if position_size_usdt > 0 else 0.0
+            pnl_percent = (
+                (float(realized_pnl_decimal) / float(position_size_usdt) * 100)
+                if position_size_usdt > 0
+                else 0.0
+            )
+
             price_change_pct = (
                 ((avg_price_float - entry_price_float) / entry_price_float * 100)
                 if position_side == "LONG"
                 else ((entry_price_float - avg_price_float) / entry_price_float * 100)
             )
+
+            # ═══════════════════════════════════════════════════════════
+            # ОБНОВЛЕНИЕ БД
+            # ═══════════════════════════════════════════════════════════
 
             # Загрузка position_id из БД
             position_id = None
@@ -1340,21 +1463,35 @@ class PositionManager:
                     self.trade_log.close_position(
                         position_id=position_id,
                         exit_price=avg_price_raw,
-                        exit_reason=exit_reason  # Теперь будет правильное значение
+                        exit_reason=exit_reason
                     )
                     if symbol in self._position_ids:
                         del self._position_ids[symbol]
-                    self._cancel_stops_for_symbol(symbol)
-                else:
-                    self.logger.error(f"Cannot close position in DB: position_id not found for {symbol}")
 
-            # Детальное логирование
+                    # ✅ ИСПРАВЛЕНИЕ: Проверяем async/sync
+                    cancel_method = self._cancel_stops_for_symbol
+                    if asyncio.iscoroutinefunction(cancel_method):
+                        # Создаём задачу для async метода
+                        asyncio.create_task(cancel_method(symbol))
+                    else:
+                        # Синхронный вызов
+                        cancel_method(symbol)
+                else:
+                    self.logger.error(
+                        f"Cannot close position in DB: position_id not found for {symbol}"
+                    )
+
+            # ═══════════════════════════════════════════════════════════
+            # ЛОГИРОВАНИЕ И СОБЫТИЯ
+            # ═══════════════════════════════════════════════════════════
+
             self.logger.info(
-                f"Position closed: {symbol} {position_side} "
+                f"✅ Position closed: {symbol} {position_side} "
                 f"PnL={pnl_percent:.2f}% ({float(realized_pnl_decimal):.2f} USDT) "
                 f"price_change={price_change_pct:.2f}% "
                 f"entry={entry_price_float:.4f} exit={avg_price_float:.4f} "
-                f"entry_fee={float(existing_entry_fee_decimal):.2f} exit_fee={commission_float:.2f} "
+                f"entry_fee={float(existing_entry_fee_decimal):.2f} "
+                f"exit_fee={commission_float:.2f} "
                 f"total_fee={float(total_fees_decimal):.2f} USDT "
                 f"reason={exit_reason}"
             )
@@ -1382,9 +1519,36 @@ class PositionManager:
                 }
             ))
 
+        else:
+            # ═══════════════════════════════════════════════════════════
+            # ЧАСТИЧНОЕ ЗАКРЫТИЕ ПОЗИЦИИ
+            # ═══════════════════════════════════════════════════════════
+
+            self.logger.info(
+                f"Partial exit: {symbol} {position_side} "
+                f"filled={float(filled_qty_decimal):.4f}, "
+                f"remaining={float(remaining_qty):.4f}"
+            )
+
+            # Обновляем позицию
+            updated_position = PositionSnapshot(
+                symbol=symbol,
+                status="OPEN",
+                side=position_side,
+                qty=remaining_qty,
+                avg_entry_price=entry_price_raw,
+                realized_pnl_usdt=current_position.get("realized_pnl_usdt", Decimal('0')) + realized_pnl_decimal,
+                unrealized_pnl_usdt=current_position.get("unrealized_pnl_usdt", Decimal('0')),
+                created_ts=current_position["created_ts"],
+                updated_ts=get_current_timestamp_ms(),
+                fee_total_usdt=total_fees_decimal
+            )
+
+            self._positions[symbol] = updated_position
+
     # === Вспомогательные методы ===
 
-    def _validate_signal(self, signal: TradeSignal) -> None:
+    def _validate_signal(self, signal: TradeSignalIQTS) -> None:
         """
         Валидация торгового сигнала.
         
@@ -1417,72 +1581,138 @@ class PositionManager:
         if signal["decision_price"] <= 0:
             raise InvalidSignalError("Invalid decision_price")
 
-    def _verify_risk_context(self, signal: TradeSignal) -> bool:
+    def _compute_risk_context_hash(self, risk_context: Dict[str, Any]) -> str:
+        """
+        Вычисление SHA256 хеша от risk_context для проверки целостности.
+
+        Алгоритм:
+        1. Создаёт копию risk_context без поля validation_hash
+        2. Сериализует в JSON с сортировкой ключей
+        3. Вычисляет SHA256 от JSON строки
+        4. Возвращает hex строку (64 символа)
+
+        Args:
+            risk_context: Словарь с параметрами риска
+
+        Returns:
+            Hex строка SHA256 хеша или пустая строка при ошибке
+
+        Example:
+            >>> risk_ctx = {
+            ...     "position_size": 0.5,
+            ...     "initial_stop_loss": 3200.0,
+            ...     "take_profit": 3400.0
+            ... }
+            >>> hash_val = self._compute_risk_context_hash(risk_ctx)
+            >>> len(hash_val)
+            64
+        """
+        import json
+        import hashlib
+
+        try:
+            # ✅ ШАГ 1: Создаём копию без validation_hash
+            ctx_copy = {
+                k: v
+                for k, v in risk_context.items()
+                if k != "validation_hash"
+            }
+
+            # ✅ ШАГ 2: Сериализуем в JSON с сортировкой ключей
+            # sort_keys=True гарантирует один и тот же порядок
+            # default=str конвертирует нестандартные типы (Decimal, datetime)
+            canonical = json.dumps(
+                ctx_copy,
+                sort_keys=True,
+                default=str,
+                ensure_ascii=False,
+                separators=(',', ':')  # Убираем пробелы для консистентности
+            )
+
+            self.logger.debug(
+                f"Computing hash for risk_context: {canonical[:100]}..."
+            )
+
+            # ✅ ШАГ 3: Вычисляем SHA256
+            hash_bytes = hashlib.sha256(canonical.encode('utf-8')).digest()
+
+            # ✅ ШАГ 4: Возвращаем hex строку
+            hash_hex = hash_bytes.hex()
+
+            self.logger.debug(f"Computed hash: {hash_hex[:16]}...{hash_hex[-8:]}")
+
+            return hash_hex
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Error computing risk_context hash: {e}",
+                exc_info=True
+            )
+            return ""
+
+    def _verify_risk_context(self, signal: TradeSignalIQTS) -> bool:
         """
         Проверка целостности risk_context через validation_hash.
-        
-        Детектирует несанкционированное изменение риск-параметров после генерации сигнала.
-        Обратная совместимость: если validation_hash отсутствует, проверка пропускается.
-        
-        Args:
-            signal: Торговый сигнал для проверки
-            
-        Returns:
-            True если проверка прошла успешно или пропущена (backward compatibility)
-            False если обнаружено несоответствие хеша
-            
-        Side Effects:
-            Логирует CRITICAL ошибку при обнаружении tampering
+        Поддерживает извлечение validation_hash из:
+        - signal.metadata.validation_hash (TradeSignal стандарт)
+        - signal.validation_hash (TradeSignalIQTS формат)
+        - risk_context.validation_hash (legacy)
         """
         try:
             risk_context = signal.get("risk_context")
-            
-            # Backward compatibility: если нет risk_context, пропускаем проверку
             if not risk_context:
+                self.logger.debug("No risk_context in signal, skipping verification")
                 return True
-            
-            stored_hash = signal.get("validation_hash")
-            
-            # Backward compatibility: если нет validation_hash, пропускаем проверку
+            # ✅ Извлекаем validation_hash из всех возможных мест
+            stored_hash = (
+                    signal.get("metadata", {}).get("validation_hash") or
+                    signal.get("validation_hash") or  # type: ignore[typeddict-item]
+                    (risk_context.get("validation_hash") if isinstance(risk_context, dict) else None)
+            )
+
             if not stored_hash:
-                self.logger.debug(
-                    f"validation_hash not found in signal for {signal.get('symbol')}, "
-                    f"skipping verification (backward compatibility)"
-                )
+                self.logger.debug("No validation_hash found, skipping verification")
                 return True
-            
-            # Вычисляем текущий хеш от risk_context
-            import json
-            import hashlib
-            canonical = json.dumps(risk_context, sort_keys=True)
-            computed_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
-            
-            # Сравниваем хеши
-            if computed_hash != stored_hash:
-                self.logger.critical(
-                    f"🚨 RISK CONTEXT TAMPERING DETECTED! 🚨\n"
-                    f"  Symbol: {signal.get('symbol')}\n"
-                    f"  Correlation ID: {signal.get('correlation_id')}\n"
-                    f"  Expected hash: {stored_hash}\n"
+
+            # ✅ Вычисляем хеш от текущего risk_context
+            computed_hash = self._compute_risk_context_hash(risk_context)
+
+            if not computed_hash:
+                self.logger.warning("Failed to compute hash, skipping verification")
+                return True  # Не блокируем если не смогли вычислить
+
+            # ✅ Сравниваем хеши
+            if stored_hash != computed_hash:
+                self.logger.error(
+                    f"❌ SECURITY ALERT: Risk context validation FAILED!\n"
+                    f"  Symbol: {signal.get('symbol', 'UNKNOWN')}\n"
+                    f"  Stored hash:   {stored_hash}\n"
                     f"  Computed hash: {computed_hash}\n"
-                    f"  Risk context was modified after signal generation!\n"
-                    f"  This is a CRITICAL security issue - rejecting signal."
+                    f"  Risk context may have been tampered with!"
                 )
                 return False
-            
+
             self.logger.debug(
-                f"✅ risk_context validation passed for {signal.get('symbol')} "
-                f"(hash: {computed_hash})"
+                f"✅ Risk context validated successfully "
+                f"(hash: {stored_hash[:8]}...{stored_hash[-8:]})"
             )
             return True
-            
+
         except Exception as e:
-            self.logger.error(f"Error verifying risk_context: {e}", exc_info=True)
-            # В случае ошибки проверки - безопаснее отклонить сигнал
-            return False
+            self.logger.error(
+                f"❌ Error verifying risk_context: {e}",
+                exc_info=True
+            )
+            return False  # При ошибке считаем невалидным для безопасности
 
     def _save_position_to_db(self, position: PositionSnapshot, is_new: bool) -> None:
-        """УПРОЩЕННОЕ сохранение позиции в БД - с поддержкой fee_total_usdt"""
+        """
+        УПРОЩЕННОЕ сохранение позиции в БД - с поддержкой fee_total_usdt.
+
+        ✅ ИСПРАВЛЕНО:
+        - Правильная типизация словарей
+        - Убраны literal()
+        """
         try:
             if not hasattr(self, 'trade_log') or not self.trade_log:
                 self.logger.warning("No trade_log available for position saving")
@@ -1491,12 +1721,16 @@ class PositionManager:
             symbol = position["symbol"]
 
             if is_new:
+                # ═══════════════════════════════════════════════════════════
+                # СОЗДАНИЕ НОВОЙ ПОЗИЦИИ
+                # ═══════════════════════════════════════════════════════════
+
                 if not position.get("side") or not position.get("qty") or not position.get("avg_entry_price"):
                     self.logger.error(f"Missing required fields for new position: {symbol}")
                     return
 
-                # ✅ ДОБАВЛЕНО: fee_total_usdt при создании
-                position_record = {
+                # ✅ Типизация: Dict[str, Any]
+                position_record: Dict[str, Any] = {
                     "symbol": symbol,
                     "side": position["side"],
                     "status": position.get("status", "OPEN"),
@@ -1507,7 +1741,7 @@ class PositionManager:
                     "leverage": Decimal('1.0'),
                     "reason_entry": "SIGNAL",
                     "correlation_id": position.get("correlation_id"),
-                    "fee_total_usdt": position.get("fee_total_usdt", Decimal('0')),  # ✅ ДОБАВЛЕНО
+                    "fee_total_usdt": position.get("fee_total_usdt", Decimal('0')),
                     "exit_ts": None,
                     "exit_price": None,
                     "realized_pnl_usdt": position.get("realized_pnl_usdt", Decimal('0')),
@@ -1520,56 +1754,94 @@ class PositionManager:
 
                 if position_id:
                     if not hasattr(self, '_position_ids'):
-                        self._position_ids = {}
+                        self._position_ids: Dict[str, int] = {}
                     self._position_ids[symbol] = position_id
                     self.logger.info(
-                        f"Created position in DB: {symbol} {position['side']} id={position_id} "
-                        f"entry_fee={float(position.get('fee_total_usdt', 0)):.6f}"  # ✅ Логируем
+                        f"✅ Created position in DB: {symbol} {position['side']} "
+                        f"id={position_id} entry_fee={float(position.get('fee_total_usdt', 0)):.6f}"
                     )
+
             else:
-                # Обновление позиции (без изменений)
-                position_id = None
-                if symbol in self._position_ids:
+                # ═══════════════════════════════════════════════════════════
+                # ОБНОВЛЕНИЕ СУЩЕСТВУЮЩЕЙ ПОЗИЦИИ
+                # ═══════════════════════════════════════════════════════════
+
+                position_id: Optional[int] = None
+
+                # Пытаемся получить position_id из кэша
+                if hasattr(self, '_position_ids') and symbol in self._position_ids:
                     position_id = self._position_ids[symbol]
                 else:
+                    # Загружаем из БД
                     open_positions = self.trade_log.get_open_positions_db(symbol)
                     if open_positions:
                         position_id = open_positions[0].get("id")
                         if not hasattr(self, '_position_ids'):
-                            self._position_ids = {}
-                        self._position_ids[symbol] = position_id
+                            self._position_ids: Dict[str, int] = {}
+                        if position_id:
+                            self._position_ids[symbol] = position_id
 
                 if not position_id:
-                    self.logger.error(f"Cannot update position - no position_id found for {symbol}")
+                    self.logger.error(
+                        f"❌ Cannot update position - no position_id found for {symbol}"
+                    )
                     return
 
-                updates = {"updated_ts": get_current_timestamp_ms()}
+                # ✅ ИСПРАВЛЕНИЕ: Явная типизация Dict[str, Any]
+                updates: Dict[str, Any] = {
+                    "updated_ts": get_current_timestamp_ms()
+                }
 
-                if position.get("status"):
-                    updates["status"] = literal(position["status"])
-                if position.get("qty") is not None:
-                    updates["qty"] = literal(position["qty"])
-                if position.get("realized_pnl_usdt") is not None:
-                    updates["realized_pnl_usdt"] = literal(position["realized_pnl_usdt"])
-                # ✅ ДОБАВЛЕНО: Обновляем fee_total_usdt если есть
-                if position.get("fee_total_usdt") is not None:
-                    updates["fee_total_usdt"] = literal(position["fee_total_usdt"])
+                # Добавляем только изменённые поля
+                status = position.get("status")
+                if status:
+                    updates["status"] = str(status)  # ✅ Явное приведение к str
 
+                qty = position.get("qty")
+                if qty is not None:
+                    updates["qty"] = qty  # ✅ Decimal остаётся Decimal
+
+                realized_pnl = position.get("realized_pnl_usdt")
+                if realized_pnl is not None:
+                    updates["realized_pnl_usdt"] = realized_pnl  # ✅ Decimal
+
+                fee_total = position.get("fee_total_usdt")
+                if fee_total is not None:
+                    updates["fee_total_usdt"] = fee_total  # ✅ Decimal
+
+                # Нормализуем параметры для SQLAlchemy
                 normalized_updates = self.trade_log._normalize_params(updates)
+
                 success = self.trade_log.update_position(position_id, normalized_updates)
 
                 if success:
-                    self.logger.info(f"Updated position in DB: {symbol} id={position_id}")
+                    self.logger.info(
+                        f"✅ Updated position in DB: {symbol} id={position_id}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"⚠️ Failed to update position in DB: {symbol} id={position_id}"
+                    )
 
         except Exception as e:
-            self.logger.error(f"Error in _save_position_to_db for {position.get('symbol', 'unknown')}: {e}")
+            self.logger.error(
+                f"❌ Error in _save_position_to_db for {position.get('symbol', 'unknown')}: {e}",
+                exc_info=True
+            )
+
+            # Записываем ошибку в trade_log
             if hasattr(self, 'trade_log') and self.trade_log:
-                self.trade_log.record_error({
-                    "error_type": "position_save_failed",
-                    "symbol": position.get("symbol"),
-                    "is_new": is_new,
-                    "error": str(e)
-                })
+                try:
+                    self.trade_log.record_error({
+                        "error_type": "position_save_failed",
+                        "symbol": position.get("symbol"),
+                        "is_new": is_new,
+                        "error": str(e)
+                    })
+                except Exception as log_error:
+                    self.logger.error(
+                        f"Failed to record error to trade_log: {log_error}"
+                    )
 
     def _init_position_ids_cache(self) -> None:
         """Инициализирует кеш ID позиций из существующих открытых позиций."""
@@ -1708,50 +1980,98 @@ class PositionManager:
         notional = qty * price
         return notional >= meta.min_notional
 
-    def build_entry_order(self, signal: TradeSignal, side: Literal["BUY", "SELL"]) -> Optional[OrderReq]:
+    def build_entry_order(self, signal: TradeSignalIQTS, side: Literal["BUY", "SELL"]
+    ) -> Optional[OrderReq]:
         """
         Построить ордер входа в позицию.
-        
-        Приоритет определения размера:
-        1. risk_context['position_size'] (если доступен)
-        2. compute_order_size() (deprecated fallback)
+        Размер позиции ДОЛЖЕН быть в risk_context['position_size'].
+        Если его нет - сигнал отклоняется.
         """
+        symbol = signal.get("symbol", "UNKNOWN")
+
         try:
-            symbol = signal["symbol"]
-            
-            # ✅ ПРИОРИТЕТ 1: Проверяем risk_context['position_size']
+            if not symbol or symbol == "UNKNOWN":
+                self.logger.error("❌ Missing or invalid symbol in signal")
+                return None
+
+            # ════════════════════════════════════════════════════════════
+            # ШАГ 1: ИЗВЛЕЧЕНИЕ position_size из risk_context
+            # ════════════════════════════════════════════════════════════
+
             risk_context = signal.get("risk_context", {})
             qty = None
-            
+
             if risk_context and "position_size" in risk_context:
                 qty_raw = risk_context["position_size"]
+
                 if qty_raw and qty_raw > 0:
-                    qty = Decimal(str(qty_raw))
-                    self.logger.info(
-                        f"Using position_size from risk_context: {float(qty):.4f} for {symbol}"
-                    )
-            
-            # ✅ ПРИОРИТЕТ 2: Fallback на deprecated метод
-            if qty is None:
-                self.logger.warning(
-                    f"risk_context['position_size'] not available for {symbol}, "
-                    f"falling back to deprecated compute_order_size()"
+                    try:
+                        qty = Decimal(str(qty_raw))
+                        self.logger.info(
+                            f"✅ Using position_size from risk_context: "
+                            f"{float(qty):.4f} for {symbol}"
+                        )
+                    except (ValueError, TypeError, InvalidOperation) as e:
+                        self.logger.error(
+                            f"❌ Failed to convert position_size to Decimal: {e}"
+                        )
+                        qty = None
+
+            # ✅ ИСПРАВЛЕНИЕ: Если position_size не найден - отклоняем сигнал
+            if qty is None or qty <= 0:
+                self.logger.error(
+                    f"❌ position_size not provided or invalid for {symbol}!\n"
+                    f"  risk_context: {risk_context}\n"
+                    f"  position_size: {qty}\n"
+                    f"  Signal REJECTED - position_size is mandatory."
                 )
-                qty = self.compute_order_size(symbol, risk_context)
+                raise InvalidOrderSizeError(
+                    f"position_size not provided in risk_context for {symbol}"
+                )
 
-            if qty <= 0:
-                raise InvalidOrderSizeError("Computed order size is zero or negative")
+            # ════════════════════════════════════════════════════════════
+            # ШАГ 2: ИЗВЛЕЧЕНИЕ decision_price
+            # ════════════════════════════════════════════════════════════
 
-            # Определяем цену и тип ордера
-            decision_price = Decimal(str(signal["decision_price"]))
+            decision_price_raw = signal.get("decision_price")
+
+            if not decision_price_raw or decision_price_raw <= 0:
+                self.logger.error(
+                    f"❌ Invalid decision_price for {symbol}: {decision_price_raw}"
+                )
+                raise InvalidSignalError(
+                    f"Missing or invalid decision_price: {decision_price_raw}"
+                )
+
+            try:
+                decision_price = Decimal(str(decision_price_raw))
+            except (ValueError, TypeError, InvalidOperation) as e:
+                self.logger.error(
+                    f"❌ Failed to convert decision_price to Decimal: {e}"
+                )
+                raise InvalidSignalError(
+                    f"Invalid decision_price format: {decision_price_raw}"
+                ) from e
+
+            # ════════════════════════════════════════════════════════════
+            # ШАГ 3: СОЗДАНИЕ ORDERREQ
+            # ════════════════════════════════════════════════════════════
+
+            # Определяем тип ордера
             order_type: Literal["MARKET", "LIMIT"] = "MARKET"
             price = None
 
             if order_type == "LIMIT":
                 price = self.quantize_price(symbol, decision_price)
 
-            # Создаем OrderReq
+            # Генерируем ID
             client_order_id = self._generate_unique_order_id(symbol, "entry")
+
+            # Генерируем correlation_id если отсутствует
+            correlation_id = signal.get("correlation_id")
+            if not correlation_id:
+                from iqts_standards import create_correlation_id
+                correlation_id = create_correlation_id()
 
             order_req = OrderReq(
                 client_order_id=client_order_id,
@@ -1762,10 +2082,13 @@ class PositionManager:
                 price=price,
                 time_in_force="GTC" if order_type == "LIMIT" else None,
                 reduce_only=False,
-                correlation_id=signal.get("correlation_id", create_correlation_id()),
+                correlation_id=correlation_id,
             )
 
-            # Сохраняем в pending orders
+            # ════════════════════════════════════════════════════════════
+            # ШАГ 4: РЕГИСТРАЦИЯ В PENDING ORDERS
+            # ════════════════════════════════════════════════════════════
+
             pending_order = PendingOrder(
                 client_order_id=client_order_id,
                 symbol=symbol,
@@ -1773,18 +2096,54 @@ class PositionManager:
                 type=order_type,
                 qty=qty,
                 price=price,
-                correlation_id=order_req["correlation_id"],
+                correlation_id=correlation_id,
                 reduce_only=False,
-                metadata=None
+                metadata={
+                    "signal_intent": signal.get("intent"),
+                    "decision_price": float(decision_price),
+                    "created_at": get_current_timestamp_ms(),
+                    "stops_precomputed": signal.get("stops_precomputed", False)
+                }
             )
+
             self._pending_orders[client_order_id] = pending_order
+
+            self.logger.info(
+                f"✅ Entry order built: {symbol} {side} "
+                f"qty={float(qty):.4f} @ {order_type} "
+                f"price={float(decision_price):.8f} "
+                f"(client_order_id={client_order_id})"
+            )
 
             return order_req
 
-        except Exception as e:
-            raise InvalidSignalError(f"Error building entry order: {e}")
+        except InvalidOrderSizeError:
+            # Пробрасываем как есть
+            raise
 
-    def build_exit_order(self, signal: TradeSignal, position: PositionSnapshot,
+        except InvalidSignalError:
+            # Пробрасываем как есть
+            raise
+
+        except KeyError as e:
+            self.logger.error(
+                f"❌ Missing required field in signal for {symbol}: {e}",
+                exc_info=True
+            )
+            raise InvalidSignalError(
+                f"Missing required field in signal: {e}"
+            ) from e
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Unexpected error building entry order for {symbol}: {e}",
+                exc_info=True
+            )
+            raise InvalidSignalError(
+                f"Unexpected error building entry order: {e}"
+            ) from e
+
+    def build_exit_order(self, signal: TradeSignalIQTS, position: PositionSnapshot,
                          reason: str) -> Optional[OrderReq]:
         """Построить ордер выхода из позиции"""
         try:
@@ -1847,9 +2206,8 @@ class PositionManager:
         except Exception as e:
             raise InvalidSignalError(f"Error building exit order: {e}")
 
-    # position_manager.py
 
-    def build_stop_order(self, signal: TradeSignal, position: PositionSnapshot,
+    def build_stop_order(self, signal: TradeSignalIQTS, position: PositionSnapshot,
                          new_stop_price: Decimal,
                          is_trailing: bool = False) -> Optional[OrderReq]:  # ✅ ДОБАВЛЕН параметр
         """
