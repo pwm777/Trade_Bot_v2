@@ -777,7 +777,6 @@ new_stop = result['new_stop_loss']  # ✅ Structured result
     ├── MLGlobalModelTrainer (офлайн обучение ML-модели глобального тренда) - ml_train_global_v2.py
 	└──SignalValidator (Глобальный валидатор) - signal_validator.py
 
-
 ## 3. Общая архитектура системы
 
 BotLifecycleManager (run_bot.py) - главный координатор
@@ -794,8 +793,6 @@ BotLifecycleManager (run_bot.py) - главный координатор
     ├── MarketDataUtils (утилиты данных) - market_data_utils.py
     └── MarketHistoryManager (менеджер исторических данных)
 
-
-=====================================================================
 ## 4. модуль run_bot.py
 
 Основные классы:
