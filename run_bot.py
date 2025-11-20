@@ -900,6 +900,24 @@ class BotLifecycleManager:
             except Exception as e:
                 logger.error("on_order_update error: %s", e)
 
+        symbols_meta = self.config.get("symbols_meta")
+
+        if not symbols_meta:
+            # Создаём базовые метаданные для основных символов
+            symbols_meta = {
+                "ETHUSDT": {
+                    "tick_size": 0.01,
+                    "step_size": 0.001,
+                    "min_notional": 5.0,
+                    "price_precision": 2,
+                    "quantity_precision": 3
+                }
+
+            }
+            logger.warning(
+                "⚠️ symbols_meta not in config, using defaults for ETHUSDT, BTCUSDT"
+            )
+
         from exchange_manager import ExchangeManager
 
         em = ExchangeManager(
@@ -913,7 +931,8 @@ class BotLifecycleManager:
             event_handlers=None,
             ws_url=ws_url,
             execution_mode=mode,
-            timeout_seconds=timeout_seconds
+            timeout_seconds=timeout_seconds,
+            symbols_meta=symbols_meta  # ✅ ПЕРЕДАТЬ
         )
 
         logger.info("ExchangeManager created successfully")

@@ -907,12 +907,24 @@ class OrderReq(TypedDict, total=False):
 
 
 class OrderUpd(TypedDict, total=False):
-    """Обновление статуса ордера"""
+    """
+    Обновление статуса ордера.
+
+    ✅ РАСШИРЕНО v3.0 (2025-11-20):
+    - Добавлены поля для полной трассировки
+    - Поддержка validation_hash для риск-событий
+    - Метаданные для аудита
+    """
+    # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ ===
     client_order_id: str
-    exchange_order_id: Optional[str]
     symbol: str
     side: OrderSide
     status: OrderStatus
+    correlation_id: str
+    reduce_only: bool
+
+    # === ОПЦИОНАЛЬНЫЕ ПОЛЯ (ОСНОВНЫЕ) ===
+    exchange_order_id: Optional[str]
     qty: Optional[Decimal]
     price: Optional[Decimal]
     filled_qty: Optional[Decimal]
@@ -920,9 +932,13 @@ class OrderUpd(TypedDict, total=False):
     commission: Optional[Decimal]
     ts_ms_exchange: Optional[int]
     trade_id: Optional[str]
-    reduce_only: bool
-    correlation_id: str
 
+    # ✅ НОВЫЕ ПОЛЯ (v3.0)
+    type: Optional[str]  # Тип ордера: MARKET, LIMIT, STOP_MARKET
+    timestamp_ms: Optional[int]  # Время создания события (локальное)
+    commission_asset: Optional[str]  # Валюта комиссии (обычно USDT)
+    validation_hash: Optional[str]  # SHA256 хеш risk_context для валидации
+    metadata: Optional[Dict[str, Any]]  # Дополнительные метаданные для аудита
 
 class PositionSnapshot(TypedDict, total=False):
     """Снимок текущей позиции"""

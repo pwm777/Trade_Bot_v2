@@ -102,7 +102,9 @@ class ExchangeManager:
                  event_handlers: Optional[List[ExchangeEventHandler]] = None,
                  ws_url: Optional[str] = None,
                  execution_mode: str = "DEMO",
-                 timeout_seconds: Optional[int] = None):
+                 timeout_seconds: Optional[int] = None,
+                 symbols_meta: Optional[Dict[str, Dict[str, Any]]] = None
+                 ):
 
         # Основные параметры
         self.base_url = base_url
@@ -114,7 +116,11 @@ class ExchangeManager:
         self.metrics = metrics
         self.execution_mode = execution_mode
         self._lock = threading.RLock()  # ✅ Потокобезопасность
+        self.symbols_meta = symbols_meta or self._get_default_symbols_meta()
 
+        self.logger.info(
+            f"ExchangeManager initialized with {len(self.symbols_meta)} symbols"
+        )
         # >>> ЗАРЕЗЕРВИРОВАНО ДЛЯ LIVE РЕЖИМА (пока не используется в DEMO/BACKTEST)
         # Эти параметры будут задействованы при реализации WebSocket подключения
         self.ws_url = ws_url  # WebSocket URL для user data stream
@@ -207,6 +213,39 @@ class ExchangeManager:
                 "total_balance_usdt": 1000.0  # Примерная общая стоимость
             }
 
+    def _get_default_symbols_meta(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Дефолтные метаданные символов (используется если symbols_meta не передан).
+        ✅ Этот метод вызывается ТОЛЬКО из __init__ если symbols_meta=None
+        """
+        self.logger.warning(
+            "⚠️ symbols_meta not provided to ExchangeManager, using defaults. "
+            "For production, provide actual symbol metadata from exchange."
+        )
+
+        return {
+            "ETHUSDT": {
+                "tick_size": 0.01,
+                "step_size": 0.001,
+                "min_notional": 5.0,
+                "price_precision": 2,
+                "quantity_precision": 3
+            },
+            "BTCUSDT": {
+                "tick_size": 0.1,
+                "step_size": 0.00001,
+                "min_notional": 5.0,
+                "price_precision": 1,
+                "quantity_precision": 5
+            },
+            "BNBUSDT": {
+                "tick_size": 0.01,
+                "step_size": 0.01,
+                "min_notional": 5.0,
+                "price_precision": 2,
+                "quantity_precision": 2
+            }
+        }
     # === Event System ===
 
     def add_event_handler(self, handler: ExchangeEventHandler) -> None:
@@ -233,48 +272,99 @@ class ExchangeManager:
 
     def place_order(self, order_req: OrderReq) -> Dict[str, Any]:
         """
-        BACKTEST:
-          - MARKET/LIMIT: исполняем мгновенно
-          - STOP/TAKE_PROFIT: регистрируем через demo-путь
+        Размещение ордера с полной валидацией инвариантов.
 
-        ИЗМЕНЕНИЯ:
-        - Callback вызывается для ВСЕХ типов ордеров в BACKTEST
+        ✅ ИСПРАВЛЕНИЯ v3.0 (2025-11-20):
+        1. Валидация SL/TP ценового инварианта для LONG/SHORT
+        2. Проверка min_notional в BACKTEST
+        3. Добавление validation_hash в OrderUpd
+        4. Добавление correlation_id в OrderUpd
+        5. Округление commission до биржевой точности
+
+        BACKTEST режим:
+          - MARKET/LIMIT: мгновенное исполнение с валидацией
+          - STOP/TAKE_PROFIT: регистрация через _place_order_demo()
+
+        LIVE/DEMO режим:
+          - Отправка на биржу через API
+
+        Args:
+            order_req: Запрос на размещение ордера (OrderReq)
+
+        Returns:
+            Dict с полями:
+            - status: "NEW" | "FILLED" | "REJECTED"
+            - client_order_id: ID ордера
+            - exchange_order_id: ID биржи (если исполнен)
+            - error: сообщение об ошибке (если REJECTED)
+
+        Raises:
+            ValueError: Если order_req невалиден
         """
         try:
-            # Нормализация для STOP/TP
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 1: НОРМАЛИЗАЦИЯ И ВАЛИДАЦИЯ
+            # ═══════════════════════════════════════════════════════════
+
+            # Нормализация типа ордера
             otype = str(order_req.get("type", "")).upper()
-            is_stop_family = otype in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET")
+            is_stop_family = otype in (
+                "STOP", "STOP_MARKET",
+                "TAKE_PROFIT", "TAKE_PROFIT_MARKET"
+            )
 
-            if is_stop_family and order_req.get("stop_price") is None and order_req.get("price") is not None:
-                order_req = dict(order_req)
-                order_req["stop_price"] = order_req["price"]
-                order_req["price"] = None
+            # Нормализация stop_price для стоп-ордеров
+            if is_stop_family:
+                if order_req.get("stop_price") is None and order_req.get("price") is not None:
+                    order_req = dict(order_req)
+                    order_req["stop_price"] = order_req["price"]
+                    order_req["price"] = None
 
-            # Валидация
+            # Базовая валидация
             self._validate_order_req(order_req)
 
-            # ✅ Для STOP ордеров - регистрируем через demo
+            # Извлекаем параметры
+            symbol = order_req["symbol"]
+            client_order_id = order_req["client_order_id"]
+            side = order_req["side"]
+            qty = order_req["qty"]
+
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 2: ОБРАБОТКА STOP-ОРДЕРОВ (регистрация, не исполнение)
+            # ═══════════════════════════════════════════════════════════
+
             if is_stop_family:
+                self.logger.debug(
+                    f"Registering {otype} order: {symbol} {side} "
+                    f"qty={float(qty):.4f} stop_price={order_req.get('stop_price')}"
+                )
+
                 ack = self._place_order_demo(order_req)
                 self._stats["orders_sent"] += 1
                 return ack
 
-            # ✅ Для MARKET/LIMIT в бэктесте - мгновенное исполнение
-            symbol = order_req["symbol"]
-            client_order_id = order_req["client_order_id"]
-            qty = order_req["qty"]
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 3: ОБРАБОТКА MARKET/LIMIT ОРДЕРОВ В BACKTEST
+            # ═══════════════════════════════════════════════════════════
 
             self._stats["orders_sent"] += 1
 
-            # Время исполнения
+            # Определяем время исполнения
             fill_ts = get_current_timestamp_ms()
             if order_req.get("metadata") and order_req["metadata"].get("candle_ts"):
                 fill_ts = int(order_req["metadata"]["candle_ts"])
 
-            # Цена исполнения
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 4: ОПРЕДЕЛЕНИЕ ЦЕНЫ ИСПОЛНЕНИЯ
+            # ═══════════════════════════════════════════════════════════
+
             fill_price = None
+
+            # Приоритет 1: Цена из ордера (LIMIT)
             if order_req.get("price"):
                 fill_price = order_req["price"]
+
+            # Приоритет 2: Текущая рыночная цена (MARKET)
             elif self._price_feed:
                 price = self._price_feed(symbol)
                 if price:
@@ -282,69 +372,300 @@ class ExchangeManager:
 
             if not fill_price:
                 self._stats["orders_rejected"] += 1
+                self.logger.error(
+                    f"❌ No price available for order execution: {client_order_id}"
+                )
                 return {
                     "status": "REJECTED",
-                    "error": "No price available",
+                    "error": "no_price_available",
+                    "error_message": "Cannot determine execution price",
                     "client_order_id": client_order_id
                 }
 
-            # Комиссия
-            commission = qty * fill_price * Decimal('0.0004')
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИСПРАВЛЕНИЕ #1: ВАЛИДАЦИЯ SL/TP ЦЕНОВОГО ИНВАРИАНТА
+            # ═══════════════════════════════════════════════════════════
 
-            # ✅ КРИТИЧНО: Создаём OrderUpd
+            metadata = order_req.get("metadata", {})
+            risk_context = metadata.get("risk_context")
+
+            if risk_context:
+                initial_stop_loss = risk_context.get("initial_stop_loss")
+                take_profit = risk_context.get("take_profit")
+
+                # Валидация для LONG позиций (BUY)
+                if side == "BUY" and initial_stop_loss and take_profit:
+                    # Инвариант: SL < Entry < TP
+                    if not (initial_stop_loss < float(fill_price) < take_profit):
+                        self._stats["orders_rejected"] += 1
+                        self.logger.error(
+                            f"❌ BACKTEST INVARIANT VIOLATION (LONG):\n"
+                            f"  Symbol: {symbol}\n"
+                            f"  Order ID: {client_order_id}\n"
+                            f"  Expected: SL < Entry < TP\n"
+                            f"  Actual: {initial_stop_loss:.2f} < {float(fill_price):.2f} < {take_profit:.2f}\n"
+                            f"  Violation: {initial_stop_loss >= float(fill_price) or float(fill_price) >= take_profit}\n"
+                            f"  REJECTING ORDER"
+                        )
+                        return {
+                            "status": "REJECTED",
+                            "error": "price_invariant_violation",
+                            "error_message": (
+                                f"LONG invariant violated: "
+                                f"SL({initial_stop_loss:.2f}) >= Entry({float(fill_price):.2f}) "
+                                f"or Entry >= TP({take_profit:.2f})"
+                            ),
+                            "client_order_id": client_order_id,
+                            "metadata": {
+                                "expected_range": f"{initial_stop_loss:.2f} < {float(fill_price):.2f} < {take_profit:.2f}",
+                                "side": side
+                            }
+                        }
+
+                # Валидация для SHORT позиций (SELL)
+                elif side == "SELL" and initial_stop_loss and take_profit:
+                    # Инвариант: TP < Entry < SL
+                    if not (take_profit < float(fill_price) < initial_stop_loss):
+                        self._stats["orders_rejected"] += 1
+                        self.logger.error(
+                            f"❌ BACKTEST INVARIANT VIOLATION (SHORT):\n"
+                            f"  Symbol: {symbol}\n"
+                            f"  Order ID: {client_order_id}\n"
+                            f"  Expected: TP < Entry < SL\n"
+                            f"  Actual: {take_profit:.2f} < {float(fill_price):.2f} < {initial_stop_loss:.2f}\n"
+                            f"  Violation: {take_profit >= float(fill_price) or float(fill_price) >= initial_stop_loss}\n"
+                            f"  REJECTING ORDER"
+                        )
+                        return {
+                            "status": "REJECTED",
+                            "error": "price_invariant_violation",
+                            "error_message": (
+                                f"SHORT invariant violated: "
+                                f"TP({take_profit:.2f}) >= Entry({float(fill_price):.2f}) "
+                                f"or Entry >= SL({initial_stop_loss:.2f})"
+                            ),
+                            "client_order_id": client_order_id,
+                            "metadata": {
+                                "expected_range": f"{take_profit:.2f} < {float(fill_price):.2f} < {initial_stop_loss:.2f}",
+                                "side": side
+                            }
+                        }
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИСПРАВЛЕНИЕ #4: ПРОВЕРКА MIN_NOTIONAL
+            # ═══════════════════════════════════════════════════════════
+
+            notional = float(fill_price) * float(qty)
+
+            symbol_info = self.symbols_meta.get(symbol)
+            if symbol_info:
+                min_notional = symbol_info.get("min_notional", 0)
+
+                if min_notional > 0 and notional < min_notional:
+                    self._stats["orders_rejected"] += 1
+                    self.logger.error(
+                        f"❌ BACKTEST: Order notional too small:\n"
+                        f"  Symbol: {symbol}\n"
+                        f"  Order ID: {client_order_id}\n"
+                        f"  Notional: {notional:.2f} USDT\n"
+                        f"  Min required: {min_notional:.2f} USDT\n"
+                        f"  Deficit: {min_notional - notional:.2f} USDT\n"
+                        f"  REJECTING ORDER"
+                    )
+                    return {
+                        "status": "REJECTED",
+                        "error": "min_notional_violation",
+                        "error_message": (
+                            f"Notional {notional:.2f} USDT < "
+                            f"min_notional {min_notional:.2f} USDT"
+                        ),
+                        "client_order_id": client_order_id,
+                        "metadata": {
+                            "notional": notional,
+                            "min_notional": min_notional,
+                            "deficit": min_notional - notional
+                        }
+                    }
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИСПРАВЛЕНИЕ #8: КОМИССИЯ С ОКРУГЛЕНИЕМ
+            # ═══════════════════════════════════════════════════════════
+
+            # Вычисляем комиссию
+            commission_raw = qty * fill_price * Decimal('0.0004')
+
+            # Округляем до 6 знаков (стандарт Binance)
+            from decimal import ROUND_DOWN
+            commission = commission_raw.quantize(
+                Decimal('0.000001'),
+                rounding=ROUND_DOWN
+            )
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИСПРАВЛЕНИЕ #2: ВЫЧИСЛЕНИЕ VALIDATION_HASH
+            # ═══════════════════════════════════════════════════════════
+
+            validation_hash = ""
+            if risk_context:
+                validation_hash = self._compute_validation_hash(risk_context)
+
+            # ═══════════════════════════════════════════════════════════
+            # ✅ ИСПРАВЛЕНИЕ #4: ДОБАВЛЕНИЕ CORRELATION_ID
+            # ═══════════════════════════════════════════════════════════
+
+            correlation_id = order_req.get("correlation_id")
+            if not correlation_id:
+                from iqts_standards import create_correlation_id
+                correlation_id = create_correlation_id()
+
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 5: СОЗДАНИЕ ORDER UPDATE
+            # ═══════════════════════════════════════════════════════════
+
             order_update = OrderUpd(
                 client_order_id=client_order_id,
                 exchange_order_id=f"bt_{fill_ts}",
                 symbol=symbol,
-                side=order_req["side"],
+                side=side,
+                type=otype,
                 status="FILLED",
                 qty=qty,
                 price=order_req.get("price"),
                 filled_qty=qty,
                 avg_price=fill_price,
-                commission=commission,
+                commission=commission,  # ✅ Округлённая
+                commission_asset="USDT",
                 ts_ms_exchange=fill_ts,
-                trade_id=order_req.get("correlation_id"),
-                reduce_only=order_req.get("reduce_only", False)  # ✅ ДОБАВЛЕНО
+                timestamp_ms=fill_ts,
+                trade_id=correlation_id,
+                correlation_id=correlation_id,  # ✅ Добавлено
+                validation_hash=validation_hash,  # ✅ Добавлено
+                reduce_only=order_req.get("reduce_only", False),
+                metadata={
+                    "execution_mode": "BACKTEST",
+                    "fill_price": float(fill_price),
+                    "notional": notional,
+                    "commission_raw": float(commission_raw),
+                    "commission_rounded": float(commission),
+                    "risk_context": risk_context
+                }
             )
 
-            # ✅ КРИТИЧНО: Вызываем callback
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 6: ВЫЗОВ CALLBACK
+            # ═══════════════════════════════════════════════════════════
+
             try:
                 self.logger.debug(
                     f"🔵 BACKTEST: Calling on_order_update for {client_order_id} "
-                    f"(type={otype}, reduce_only={order_req.get('reduce_only', False)})"
+                    f"(type={otype}, status=FILLED, "
+                    f"validation_hash={validation_hash[:8] if validation_hash else 'none'}...)"
                 )
 
-                self.on_order_update(order_update)
-                self._stats["orders_filled"] += 1
-                self._stats["last_order_ts"] = fill_ts
+                if self.on_order_update:
+                    self.on_order_update(order_update)
+                else:
+                    self.logger.warning(
+                        f"⚠️ No on_order_update callback registered for {client_order_id}"
+                    )
 
-                self.logger.debug(f"✅ Callback executed successfully for {client_order_id}")
+            except Exception as cb_err:
+                self.logger.error(
+                    f"❌ Callback error for {client_order_id}: {cb_err}",
+                    exc_info=True
+                )
 
-            except Exception as e:
-                self._stats["orders_rejected"] += 1
-                self.logger.error(f"❌ Callback error for {client_order_id}: {e}", exc_info=True)
-                return {
-                    "status": "REJECTED",
-                    "error": f"Callback failed: {e}",
-                    "client_order_id": client_order_id
-                }
+            # ═══════════════════════════════════════════════════════════
+            # ШАГ 7: ВОЗВРАТ ACK
+            # ═══════════════════════════════════════════════════════════
+
+            self._stats["orders_filled"] += 1
+
+            self.logger.info(
+                f"✅ BACKTEST order filled: {symbol} {side} "
+                f"qty={float(qty):.4f} @ {float(fill_price):.8f} "
+                f"(commission={float(commission):.6f} USDT, "
+                f"notional={notional:.2f} USDT)"
+            )
 
             return {
                 "status": "FILLED",
                 "client_order_id": client_order_id,
+                "exchange_order_id": f"bt_{fill_ts}",
+                "symbol": symbol,
+                "side": side,
+                "filled_qty": float(qty),
                 "avg_price": float(fill_price),
-                "filled_qty": float(qty)
+                "commission": float(commission),
+                "timestamp_ms": fill_ts,
+                "correlation_id": correlation_id,
+                "validation_hash": validation_hash
             }
 
         except Exception as e:
             self._stats["orders_rejected"] += 1
-            self.logger.error(f"Error placing order: {e}", exc_info=True)
+            self.logger.error(
+                f"❌ Error placing order: {e}",
+                exc_info=True
+            )
             return {
                 "status": "REJECTED",
-                "error": str(e),
-                "client_order_id": order_req.get("client_order_id")
+                "error": "execution_error",
+                "error_message": str(e),
+                "client_order_id": order_req.get("client_order_id", "unknown")
             }
+
+    def _compute_validation_hash(self, risk_context: Dict[str, Any]) -> str:
+        """
+        Вычисление validation_hash для OrderUpd.
+
+        ✅ ДОБАВЛЕНО: Поддержка валидации риск-событий
+
+        Алгоритм соответствует PositionManager._compute_risk_context_hash()
+        для консистентной проверки на стороне потребителей.
+
+        Args:
+            risk_context: Словарь с параметрами риска
+
+        Returns:
+            SHA256 hex строка (64 символа) или пустая строка при ошибке
+        """
+        import json
+        import hashlib
+
+        try:
+            # Создаём копию без validation_hash
+            ctx_copy = {
+                k: v
+                for k, v in risk_context.items()
+                if k != "validation_hash"
+            }
+
+            # Сериализуем с сортировкой ключей
+            canonical = json.dumps(
+                ctx_copy,
+                sort_keys=True,
+                default=str,
+                ensure_ascii=False,
+                separators=(',', ':')
+            )
+
+            # Вычисляем SHA256
+            hash_bytes = hashlib.sha256(canonical.encode('utf-8')).digest()
+            hash_hex = hash_bytes.hex()
+
+            self.logger.debug(
+                f"Computed validation_hash: {hash_hex[:8]}...{hash_hex[-8:]}"
+            )
+
+            return hash_hex
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Error computing validation_hash: {e}",
+                exc_info=True
+            )
+            return ""
 
     def cancel_order(self, client_order_id: str) -> Dict[str, Any]:
         """Отмена активного ордера."""

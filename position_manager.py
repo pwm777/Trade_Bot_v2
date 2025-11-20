@@ -110,8 +110,7 @@ class PositionManager:
                  price_feed: Optional[PriceFeed] = None,
                  execution_mode: Literal["LIVE", "DEMO", "BACKTEST"] = "DEMO",
                  db_engine: Optional[Engine] = None,
-                 signal_validator: Optional[Any] = None,
-                 exit_manager: Optional[AdaptiveExitManager] = None):
+                 signal_validator: Optional[Any] = None,):
 
         self.exchange_manager: Optional[ExchangeManagerInterface] = None
         self.exit_manager: Optional[AdaptiveExitManager] = None
@@ -850,7 +849,9 @@ class PositionManager:
                 f"❌ Error in _cancel_stops_for_symbol for {symbol}: {e}",
                 exc_info=True
             )
-    def _validate_stop_update(self, stop_update: Dict[str, Any],
+
+    @staticmethod
+    def _validate_stop_update(stop_update: Dict[str, Any],
                               position: PositionSnapshot,
                               signal: TradeSignalIQTS) -> Dict[str, Any]:
         """Валидация данных stop_update"""
@@ -1443,8 +1444,6 @@ class PositionManager:
             # ОБНОВЛЕНИЕ БД
             # ═══════════════════════════════════════════════════════════
 
-            # Загрузка position_id из БД
-            position_id = None
             if hasattr(self, '_position_ids') and hasattr(self, 'trade_log') and self.trade_log:
                 position_id = self._position_ids.get(symbol)
 
@@ -1570,9 +1569,9 @@ class PositionManager:
         
         # Базовая валидация (backward compatibility)
         required_fields = ["symbol", "intent", "decision_price"]
-        for field in required_fields:
-            if field not in signal:
-                raise InvalidSignalError(f"Missing required field: {field}")
+        for field1 in required_fields:
+            if field1 not in signal:
+                raise InvalidSignalError(f"Missing required field: {field1}")
 
         symbol = signal["symbol"]
         if symbol not in self.symbols_meta:
