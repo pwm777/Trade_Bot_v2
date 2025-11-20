@@ -17,7 +17,7 @@ _DEFAULT_TABLES: Dict[str, str] = {
     "1m":  "candles_1m",
     "5m":  "candles_5m",
 }
-_PRIORITY = ["10s", "1m", "5m"]  # выбор по приоритету, если cfg.BACKTEST_TIMEFRAME не задан
+_PRIORITY = ["1m", "5m"]  # выбор по приоритету, если cfg.BACKTEST_TIMEFRAME не задан
 
 
 # ----------------- Helpers (SQLAlchemy) -----------------
@@ -30,7 +30,6 @@ def _get_engine() -> Engine:
     if not isinstance(dsn, str) or not dsn:
         raise ValueError("Invalid or missing cfg.MARKET_DB_DSN")
     return create_engine(dsn, future=True)
-
 
 def _table_exists(engine: Engine, table: str) -> bool:
     return inspect(engine).has_table(table)
@@ -199,12 +198,32 @@ def get_available_data_range(symbols: list = None,
         return None, None
 
 
-def build_backtest_config() -> dict:
+async def build_backtest_config() -> dict:
     """
     Конфиг backtest с использованием полного диапазона данных и выбранного таймфрейма (20s/1m/5m).
     Не использует текущую дату — только границы данных в БД.
     """
-    runtime_cfg = cfg.build_runtime_config()
+    # ✅ СОЗДАЁМ TradingLogger ДО вызова build_runtime_config
+    from trading_logger import TradingLogger
+    import logging
+
+    logger = logging.getLogger("BacktestSetup")
+
+    # Создаём временный TradingLogger для получения engine
+    market_db_path = cfg.MARKET_DB_DSN.replace("sqlite:///", "")
+    trading_db_path = cfg.TRADING_DB_DSN.replace("sqlite:///", "")
+
+    trading_logger = TradingLogger(
+        market_db_path=market_db_path,
+        trades_db_path=trading_db_path,
+        on_alert=lambda level, data: None,
+        pool_size=4,
+        enable_async=False,  # ✅ Отключаем async для простоты
+        logger_instance=logger
+    )
+
+    # ✅ ТЕПЕРЬ передаём trading_logger в build_runtime_config
+    runtime_cfg = await cfg.build_runtime_config(trading_logger=trading_logger)
 
     test_symbols = list(runtime_cfg.get("symbols") or getattr(cfg, "TRADING_SYMBOLS", []) or [])
     if not test_symbols:
@@ -254,7 +273,6 @@ def build_backtest_config() -> dict:
     })
 
     return runtime_cfg
-
 
 if __name__ == "__main__":
     try:
