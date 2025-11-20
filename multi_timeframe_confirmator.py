@@ -173,18 +173,25 @@ class ThreeLevelHierarchicalConfirmator(Detector):
                           (self.trend_detector, "trend")):
 
             # у тренд/entry детекторов уже есть warmup_from_history
+            # Строка 176-188
             if hasattr(det, "warmup_from_history"):
                 tf = det.timeframe
                 df = data.get(tf)
                 if df is None or df.empty:
-                    self.logger.warning("Нет данных %s для разогрева %s", tf, name)
-                    continue
+                    error_msg = f"No data for {tf} to warmup {name}"
+                    self.logger.error(error_msg)
+                    raise RuntimeError(error_msg)  # ✅ Прерываем инициализацию
 
-                ok = det.warmup_from_history(df)  # он синхронный
-                self.logger.info("%s разогрет: %s", name, "ОК" if ok else "FAIL")
+                ok = det.warmup_from_history(df)
 
+                if not ok:
+                    error_msg = f"Warmup failed for {name} detector on {tf}"
+                    self.logger.error(error_msg)
+                    raise RuntimeError(error_msg)  # ✅ Прерываем инициализацию
+
+                self.logger.info(f"✅ {name} warmed up successfully")
             else:
-                self.logger.info(f"{name} не умеет разогрев – пропускаем")
+                self.logger.warning(f"⚠️ {name} doesn't support warmup - will start cold")
 
         self.logger.info("✅ warmup TwoLevelConfirmator ok")
 
@@ -271,15 +278,28 @@ class ThreeLevelHierarchicalConfirmator(Detector):
             return out
 
         # 4. LEVEL 2: Анализ локального тренда (1m)
-        self.logger.info(f" Calling trend_detector.analyze()...")
+
+        self.logger.info(f"🔄 Calling trend_detector.analyze()...")
         trend_signal = await self.trend_detector.analyze(data)
+
+        # ✅ ПРОВЕРКА: Валидация результата детектора
+        if not trend_signal or not isinstance(trend_signal, dict):
+            self.logger.error("❌ Trend detector returned invalid result (None or not dict)")
+            out = self._error_signal(
+                "detector_error",
+                "trend_detector_crash",
+                {"error": "trend_signal_is_none"}
+            )
+            self._set_last_signal(out)
+            self._log_result(out)
+            return out
+
         self._update_trend_history(trend_signal)
 
-        self.logger.info(f" Trend detector result: ok={trend_signal.get('ok')}, "
+        self.logger.info(f"✅ Trend detector result: ok={trend_signal.get('ok')}, "
                          f"direction={trend_signal.get('direction')}, "
                          f"confidence={trend_signal.get('confidence'):.2f}, "
                          f"reason={trend_signal.get('reason')}")
-
         # ✅ ИСПРАВЛЕНО: Обработка слабого или отсутствующего тренда
         trend_conf = float(trend_signal.get("confidence", 0.0))
         trend_dir = int(trend_signal.get("direction", 0))
@@ -715,7 +735,6 @@ class ThreeLevelHierarchicalConfirmator(Detector):
             'last_confirmed_direction': self.last_confirmed_direction,
             'global_history_length': len(self.global_signal_history),
             'trend_history_length': len(self.trend_signal_history),
-            'trend_history_length_duplicate': len(self.trend_signal_history),
             'global_detector_status': self.global_detector.get_status(),
             'trend_detector_status': self.trend_detector.get_status(),
             'confidence_weights': self.weights,

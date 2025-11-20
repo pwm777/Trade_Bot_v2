@@ -801,17 +801,23 @@ class GlobalTrendDetector(Detector):
         mean_price = float(np.mean(self.price_history))
         std_price = float(np.std(self.price_history))
 
-        if std_price == 0:
-            std_price = 0.001  # Избегаем деления на 0
+        #  Динамический минимум на основе текущей цены
+        if std_price <= 0 or std_price < current_price * 0.0001:
+            # Минимум = 0.01% от текущей цены
+            std_price = max(current_price * 0.0001, 0.001)
+            self.logger.debug(
+                f"Using dynamic std_price: {std_price:.6f} "
+                f"(0.01% of price {current_price:.2f})"
+            )
 
-        # ✅ ИСПРАВЛЕНО: Все переменные теперь чистые float
+        #  Все переменные теперь чистые float
         z_score = (current_price - mean_price) / std_price
 
         # Обновление CUSUM
         self.cusum_pos = max(0.0, self.cusum_pos + z_score - 0.5)
         self.cusum_neg = max(0.0, self.cusum_neg - z_score - 0.5)
 
-        # ✅ ИСПРАВЛЕНИЕ: Генерация сигнала на основе конфига
+        #  Генерация сигнала на основе конфига
         direction = 0
         confidence = 0.0
         reason = "no_signal"
