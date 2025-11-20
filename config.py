@@ -25,10 +25,6 @@ DATA_DIR.mkdir(exist_ok=True)
 MARKET_DB_DSN: str = f"sqlite:///{DATA_DIR}/market_data.sqlite"
 TRADING_DB_DSN: str = f"sqlite:///{DATA_DIR}/trading_data.sqlite"
 
-#  загрузка истории для прогрева индикаторов
-HISTORY_CONFIG = {
-    "days_back": 1,  # Сколько дней истории загружать
-}
 
 # Таблицы БД
 TABLES: Dict[str, str] = {
@@ -91,40 +87,14 @@ WEBSOCKET_CONFIG: Dict[str, Any] = {
 FEE_RATE: float = 0.0004  # 0.04% для Binance Futures
 DEMO_BALANCE_USDT: int = 10000
 
-# Основные торговые лимиты
-MAX_POSITIONS: int = 5
-POSITION_SIZE_PERCENT: float = 20.0  # % от баланса на позицию
-MAX_DAILY_TRADES: int = 20
-MAX_DAILY_LOSS_PERCENT: float = 5.0
-
 # === ВРЕМЕННЫЕ ИНТЕРВАЛЫ ===
 
-# Агрегация данных
-AGGREGATION_TIMEFRAME: str = "1m"
-CANDLE_INTERVAL_MS: int = 20_000
-
-# Таймауты и интервалы
-CONNECTION_TIMEOUT_SECONDS: int = 20
-HEARTBEAT_INTERVAL_SECONDS: int = 20
-RECONNECT_DELAY_SECONDS: int = 5
-MAX_RECONNECT_ATTEMPTS: int = 10
 
 # === СИМВОЛЫ И ИНСТРУМЕНТЫ ===
-
-# Целевое количество символов
-TARGET_SYMBOLS_COUNT: int = 50
 
 # Основные торговые символы
 TRADING_SYMBOLS: List[str] = [
     "ETHUSDT"
-]
-
-# Потоки данных
-STREAMS: List[str] = [
-    "aggTrade",
-    "kline_1m",
-    "bookTicker",
-    "miniTicker"
 ]
 
 STRATEGY_PARAMS: Dict[str, Any] = {
@@ -295,60 +265,16 @@ LOGGING_CONFIG: Dict[str, Any] = {
     "console_output": bool(os.getenv("LOG_CONSOLE", "true").lower() == "true")
 }
 
-# Настройки метрик
-METRICS_CONFIG: Dict[str, Any] = {
-    "enabled": bool(os.getenv("METRICS_ENABLED", "true").lower() == "true"),
-    "flush_interval_seconds": int(os.getenv("METRICS_FLUSH_INTERVAL", "60")),
-    "batch_size": int(os.getenv("METRICS_BATCH_SIZE", "100")),
-    "retention_days": int(os.getenv("METRICS_RETENTION_DAYS", "30")),
-    "export_format": os.getenv("METRICS_EXPORT_FORMAT", "json"),
-    "export_path": f"{DATA_DIR}/metrics"
-}
-
-# === АЛЕРТИНГ И УВЕДОМЛЕНИЯ ===
-
-# Настройки алертов
-ALERT_CONFIG: Dict[str, Any] = {
-    "enabled": bool(os.getenv("ALERTS_ENABLED", "true").lower() == "true"),
-    "channels": ["log", "file"],  # Можно добавить "telegram", "email"
-    "levels": {
-        "position_opened": "INFO",
-        "position_closed": "INFO",
-        "stop_loss_hit": "WARNING",
-        "daily_loss_limit": "ERROR",
-        "connection_lost": "ERROR",
-        "system_error": "CRITICAL"
-    },
-    "file_path": f"{DATA_DIR}/alerts.log",
-    "max_alerts_per_hour": int(os.getenv("ALERTS_MAX_PER_HOUR", "100"))
-}
-
 # === ПРОИЗВОДИТЕЛЬНОСТЬ И ОГРАНИЧЕНИЯ ===
 
 # Настройки производительности
 PERFORMANCE_CONFIG: Dict[str, Any] = {
-    "max_memory_usage_mb": int(os.getenv("MAX_MEMORY_MB", "1024")),
-    "max_cpu_usage_percent": int(os.getenv("MAX_CPU_PERCENT", "80")),
-    "gc_interval_seconds": int(os.getenv("GC_INTERVAL", "300")),
     "connection_pool_size": int(os.getenv("CONNECTION_POOL_SIZE", "10")),
-    "async_task_limit": int(os.getenv("ASYNC_TASK_LIMIT", "50")),
     "buffer_sizes": {
         "candle_buffer": int(os.getenv("CANDLE_BUFFER_SIZE", "1000")),
         "order_buffer": int(os.getenv("ORDER_BUFFER_SIZE", "500")),
         "event_buffer": int(os.getenv("EVENT_BUFFER_SIZE", "1000"))
     }
-}
-
-# === СРЕДА И РАЗВЕРТЫВАНИЕ ===
-
-# Настройки среды
-ENVIRONMENT_CONFIG: Dict[str, Any] = {
-    "environment": os.getenv("TRADING_ENV", "development"),
-    "debug_mode": os.getenv("DEBUG", "false").lower() == "true",
-    "health_check_port": int(os.getenv("HEALTH_CHECK_PORT", "8080")),
-    "metrics_port": int(os.getenv("METRICS_PORT", "8081")),
-    "graceful_shutdown_timeout": int(os.getenv("SHUTDOWN_TIMEOUT", "30")),
-    "startup_timeout": int(os.getenv("STARTUP_TIMEOUT", "60"))
 }
 
 
@@ -400,9 +326,6 @@ def validate_config() -> List[str]:
 
     if DEMO_BALANCE_USDT <= 0:
         errors.append(f"Invalid DEMO_BALANCE_USDT: {DEMO_BALANCE_USDT}")
-
-    if CANDLE_INTERVAL_MS <= 0:
-        errors.append(f"Invalid CANDLE_INTERVAL_MS: {CANDLE_INTERVAL_MS}")
 
     # Проверяем пути к файлам
     try:
@@ -521,7 +444,6 @@ def build_runtime_config(trading_logger: Optional[Any] = None) -> Dict[str, Any]
     return {
         "execution_mode": EXECUTION_MODE,
         "symbols": TRADING_SYMBOLS,
-        "interval_ms": CANDLE_INTERVAL_MS,
         "market_db_dsn": MARKET_DB_DSN,
         "trading_db_dsn": TRADING_DB_DSN,
 
@@ -538,8 +460,6 @@ def build_runtime_config(trading_logger: Optional[Any] = None) -> Dict[str, Any]
         "websocket": WEBSOCKET_CONFIG,
 
         "market_data": {
-            "interval_ms": CANDLE_INTERVAL_MS,
-            "loop_interval": 10,
             "history_limit": 50,
             "buffer_size": PERFORMANCE_CONFIG["buffer_sizes"]["candle_buffer"]
         },
