@@ -14,7 +14,7 @@ import asyncio
 import json
 import websockets
 from typing import (Dict, Any, List, Callable,
-                    Coroutine, TypeVar, cast, Optional)
+                    Coroutine, TypeVar, cast, Optional, Awaitable)
 from decimal import Decimal
 from collections import deque
 from datetime import datetime, UTC
@@ -209,7 +209,7 @@ class LiveMarketAggregator(BaseMarketAggregator):
 
     def __init__(self,
                  db_dsn: str,
-                 on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], None],
+                 on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], Awaitable[None]],
                  on_connection_state_change: Optional[Callable[[NetConnState], None]] = None,
                  interval_ms: int = 10_000,
                  logger_instance: Optional[logging.Logger] = None,
@@ -851,7 +851,7 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
 
     def __init__(self,
                  trading_logger: Optional[Any],
-                 on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], None],
+                 on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], Awaitable[None]],
                  symbols: List[str],
                  virtual_clock_start_ms: int,
                  virtual_clock_end_ms: int,
@@ -931,11 +931,12 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                     recent = list(self._symbol_buffers[s])[-50:]
 
                     try:
+                        # ✅ ИСПРАВЛЕНИЕ: Правильная обработка async/sync callback
                         result = self.on_candle_ready(s, candle, recent)
                         if asyncio.iscoroutine(result):
-                            asyncio.create_task(result)
+                            await result
                     except Exception as e:
-                        self.logger.error(f"on_candle_ready error: {e}")
+                        self.logger.error(f"on_candle_ready error: {e}", exc_info=True)
 
                     with self._main_lock:
                         self._stats["candles_processed"] += 1
@@ -1109,7 +1110,7 @@ class MarketAggregatorFactory:
     def create_market_aggregator(
             execution_mode: ExecutionMode,  # Literal["LIVE","DEMO","BACKTEST"]
             config: Dict[str, Any],
-            on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], None],
+            on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], Awaitable[None]],
             on_connection_state_change: Optional[Callable[[NetConnState], None]] = None,
             event_handlers: Optional[List[MarketEventHandler]] = None,
             logger_instance: Optional[logging.Logger] = None,

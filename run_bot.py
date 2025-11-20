@@ -562,7 +562,6 @@ class BotLifecycleManager:
                             logger.error(f"Error in handle_candle_ready: {handle_err}")
 
                     # ✅ НОВАЯ ЛОГИКА: Обработка 1m свечи с кэшированным 5m сигналом
-                    # ✅ НОВАЯ ЛОГИКА: Обработка 1m свечи с кэшированным 5m сигналом
                     if timeframe == '1m':
                         # Проверяем есть ли кэшированный 5m сигнал для этого символа
                         strategy_impl = cast(ImprovedQualityTrendSystem, strategy)
@@ -634,72 +633,89 @@ class BotLifecycleManager:
 
                     logger.info(f"🔍 Detected {timeframe} candle for {symbol}, triggering strategy analysis")
 
-                    # 7. ЗАПУСКАЕМ АНАЛИЗ ДЕТЕКТОРАМИ
-                    if not hasattr(strategy, 'generate_signal'):
-                        logger.error("Strategy missing generate_signal method")
-                        return
+                    # ✅ ИСПРАВЛЕНИЕ: Запускаем анализ в фоновой задаче
+                    async def analyze_and_trade():
+                        """Фоновая задача для анализа и торговли"""
+                        try:
+                            logger.info(f"🔧 Starting analysis task for {symbol}")
 
-                    # Получаем data_provider из main_bot
-                    core_bot = getattr(main_bot, 'core', None)
-                    if not core_bot or not hasattr(core_bot, 'data_provider'):
-                        logger.error("Cannot access data_provider")
-                        return
+                            # 7. ЗАПУСКАЕМ АНАЛИЗ ДЕТЕКТОРАМИ
+                            if not hasattr(strategy, 'generate_signal'):
+                                logger.error("❌ Strategy missing generate_signal method")
+                                return
 
-                    data_provider = core_bot.data_provider
+                            # Получаем data_provider из main_bot
+                            core_bot = getattr(main_bot, 'core', None)
+                            if not core_bot or not hasattr(core_bot, 'data_provider'):
+                                logger.error("❌ Cannot access data_provider")
+                                return
 
-                    # 8. Получаем market_data для анализа
-                    try:
-                        required_timeframes = ['1m', '5m']
-                        logger.debug(f"Requesting market_data for {symbol}: {required_timeframes}")
+                            data_provider = core_bot.data_provider
 
-                        market_data = await data_provider.get_market_data(
-                            symbol,
-                            required_timeframes
-                        )
+                            # 8. Получаем market_data для анализа
+                            required_timeframes = ['1m', '5m']
+                            logger.info(f"🔧 Requesting market_data for {symbol}: {required_timeframes}")
 
-                        if not market_data:
-                            logger.warning(f"market_data is None for {symbol}")
-                            return
-
-                        missing_tfs = [tf for tf in required_timeframes if
-                                       tf not in market_data or market_data[tf].empty]
-                        if missing_tfs:
-                            logger.warning(f"Missing or empty timeframes for {symbol}: {missing_tfs}")
-                            return
-
-                        data_info = {tf: len(df) for tf, df in market_data.items()}
-                        logger.info(f"📊 market_data ready for {symbol}: {data_info}")
-
-                        # 9. ВЫЗЫВАЕМ ДЕТЕКТОРЫ СТРАТЕГИИ
-                        logger.info(f"🚀 Calling strategy.generate_signal for {symbol}")
-
-                        strategy_impl = cast(ImprovedQualityTrendSystem, strategy)
-                        signal = await strategy_impl.generate_signal(market_data)
-
-                        if signal:
-                            logger.info(
-                                f"✅ SIGNAL GENERATED: {symbol} "
-                                f"dir={signal.get('direction')} "
-                                f"conf={signal.get('confidence', 0):.2f} "
-                                f"entry={signal.get('entry_price', 0):.5f} "
-                                f"sl={signal.get('stop_loss', 0):.5f} "
-                                f"tp={signal.get('take_profit', 0):.5f}"
+                            market_data = await data_provider.get_market_data(
+                                symbol,
+                                required_timeframes
                             )
 
-                            # 10. Обрабатываем сигнал через EnhancedTradingBot
-                            if hasattr(core_bot, '_process_trade_signal'):
-                                try:
-                                    await core_bot._process_trade_signal(signal)
-                                    logger.info(f"✅ Signal processed successfully for {symbol}")
-                                except Exception as process_err:
-                                    logger.error(f"Error processing signal: {process_err}", exc_info=True)
-                            else:
-                                logger.warning("core_bot missing _process_trade_signal method")
-                        else:
-                            logger.debug(f"No signal generated for {symbol} (strategy returned None)")
+                            logger.info(f"🔧 market_data received for {symbol}")
 
-                    except Exception as analysis_err:
-                        logger.error(f"Error during strategy analysis: {analysis_err}", exc_info=True)
+                            if not market_data:
+                                logger.warning(f"⚠️ market_data is None for {symbol}")
+                                return
+
+                            missing_tfs = [tf for tf in required_timeframes if
+                                           tf not in market_data or market_data[tf].empty]
+                            if missing_tfs:
+                                logger.warning(f"⚠️ Missing or empty timeframes for {symbol}: {missing_tfs}")
+                                return
+
+                            data_info = {tf: len(df) for tf, df in market_data.items()}
+                            logger.info(f"📊 market_data ready for {symbol}: {data_info}")
+
+                            # 9. ВЫЗЫВАЕМ ДЕТЕКТОРЫ СТРАТЕГИИ
+                            logger.info(f"🚀 Calling strategy.generate_signal for {symbol}")
+
+                            strategy_impl = cast(ImprovedQualityTrendSystem, strategy)
+                            signal = await strategy_impl.generate_signal(market_data)
+
+                            if signal:
+                                logger.info(
+                                    f"✅ SIGNAL GENERATED: {symbol} "
+                                    f"dir={signal.get('direction')} "
+                                    f"conf={signal.get('confidence', 0):.2f} "
+                                    f"entry={signal.get('entry_price', 0):.5f} "
+                                    f"sl={signal.get('stop_loss', 0):.5f} "
+                                    f"tp={signal.get('take_profit', 0):.5f}"
+                                )
+
+                                # 10. Обрабатываем сигнал через EnhancedTradingBot
+                                if hasattr(core_bot, '_process_trade_signal'):
+                                    try:
+                                        await core_bot._process_trade_signal(signal)
+                                        logger.info(f"✅ Signal processed successfully for {symbol}")
+                                    except Exception as process_err:
+                                        logger.error(f"❌ Error processing signal: {process_err}", exc_info=True)
+                                else:
+                                    logger.warning("⚠️ core_bot missing _process_trade_signal method")
+                            else:
+                                logger.debug(f"ℹ️ No signal generated for {symbol} (strategy returned None)")
+
+                        except Exception as analysis_err:
+                            logger.error(f"❌ CRITICAL ERROR during strategy analysis: {analysis_err}", exc_info=True)
+
+                    # ✅ Получаем event loop и запускаем задачу
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(analyze_and_trade())
+                        logger.info(f"✅ Analysis task created for {symbol}")
+                    except RuntimeError:
+                        # Если нет активного loop, используем ensure_future
+                        asyncio.ensure_future(analyze_and_trade())
+                        logger.info(f"✅ Analysis task scheduled for {symbol}")
 
                 except Exception as err:
                     logger.error(f"Error in on_candle_ready for {symbol}: {err}", exc_info=True)
@@ -1231,15 +1247,27 @@ class BotLifecycleManager:
             async def _load_from_db(self, symbol: str, timeframe: str, limit: int = 1000) -> Optional[pd.DataFrame]:
                 """
                 Загрузить исторические данные из БД.
-                ✅ ОПТИМИЗИРОВАНО: Разные лимиты для разных таймфреймов.
+                ✅ ИСПРАВЛЕНО: SQL запросы выполняются в executor, не блокируя event loop.
                 """
                 try:
+                    import asyncio
+
                     if timeframe == '1m':
                         actual_limit = min(limit, 500)
-                        data = await self.utils.read_candles_1m(symbol=symbol, last_n=actual_limit)
+                        # ✅ Выполняем синхронный SQL в executor
+                        loop = asyncio.get_event_loop()
+                        data = await loop.run_in_executor(
+                            None,
+                            lambda: self.utils.read_candles_1m(symbol=symbol, last_n=actual_limit)
+                        )
                     elif timeframe == '5m':
                         actual_limit = min(limit, 200)
-                        data = await self.utils.read_candles_5m(symbol=symbol, last_n=actual_limit)
+                        # ✅ Выполняем синхронный SQL в executor
+                        loop = asyncio.get_event_loop()
+                        data = await loop.run_in_executor(
+                            None,
+                            lambda: self.utils.read_candles_5m(symbol=symbol, last_n=actual_limit)
+                        )
                     else:
                         self.logger.warning(f"Unsupported timeframe for DB load: {timeframe}")
                         return None
@@ -1673,7 +1701,7 @@ class BotLifecycleManager:
                 """Регистрация обработчика событий"""
                 self._handler = handler
 
-            def handle_candle_ready(self, symbol: str, candle: Candle1m, recent_stack: List[Candle1m]) -> None:
+            async def handle_candle_ready(self, symbol: str, candle: Candle1m, recent_stack: List[Candle1m]) -> None:
                 """
                 ✅ УПРОЩЕНО: Обработка готовой свечи.
                 Свеча уже сохранена в БД агрегатором с индикаторами.
