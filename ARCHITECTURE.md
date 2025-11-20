@@ -645,6 +645,12 @@ new_stop = result['new_stop_loss']  # ✅ Structured result
 | PositionManager.compute_entry_stop() | ✅ Removed | risk_manager.calculate_initial_stop() |
 | PositionManager.compute_order_size() | ✅ Removed | risk_context['position_size'] |
 | PositionManager.compute_trailing_level() | ✅ Removed | exit_manager.calculate_trailing_stop() |
+| PositionManager.create_initial_stop() | ✅ Removed v3.0 | risk_context flow (автоматически) |
+| PositionManager.on_stop_triggered() | ✅ Removed v3.0 | ExchangeManager._trigger_stop_order() |
+| PositionManager.is_on_cooldown() | ✅ Removed v3.0 | Функционал не реализован |
+| PositionManager.update_peak_pnl() | ✅ Removed v3.0 | exit_tracking в EnhancedTradingBot |
+| PositionManager._validate_stop_update() | ✅ Removed v3.0 | exit_manager.calculate_trailing_stop() |
+| PositionManager._is_stop_update_beneficial() | ✅ Removed v3.0 | exit_manager.calculate_trailing_stop() |
 | direction == int сравнения | ✅ Removed | Direction enum (exit_system.py:137 исправлено) |
 | Прямое присвоение stop_loss/take_profit без risk_context | ✅ Deprecated | RiskContext.stops_precomputed flow |
 
@@ -667,6 +673,8 @@ new_stop = result['new_stop_loss']  # ✅ Structured result
 
 | Дата | Изменение | Автор |
 |------|-----------|-------|
+| 2025-11-20 | 🗑️ Удалены мёртвые методы из PositionManager (~400 строк кода) | pwm777 |
+| 2025-11-20 | 📝 Актуализирована документация PositionManager в ARCHITECTURE.md | pwm777 |
 | 2025-11-20 | ✅ Заменены числовые сравнения на Direction enum в exit_system.py:137 | pwm777 |
 | 2025-11-20 | 📝 Обновлена документация: завершение фазы критичного рефакторинга | pwm777 |
 | 2025-11-19 | ✅ Реализован create_trade_signal() factory с auto-validation | pwm777 |
@@ -2080,7 +2088,10 @@ position_manager.py
     │   ├── trade_log: Any
     │   ├── price_feed: Optional[PriceFeed] = None
     │   ├── execution_mode: Literal["LIVE", "DEMO", "BACKTEST"] = "DEMO"
-    │   └── db_engine: Optional[Engine] = None
+    │   ├── db_engine: Optional[Engine] = None
+    │   ├── signal_validator: Optional[SignalValidator] = None
+    │   ├── exit_manager: Optional[AdaptiveExitManager] = None
+    │   └── risk_manager: Optional[EnhancedRiskManager] = None
     │
     ├── Основные публичные методы:
     │   ├── handle_signal(signal: TradeSignal) → Optional[OrderReq]
@@ -2089,9 +2100,6 @@ position_manager.py
     │   ├── get_open_positions_snapshot() → Dict[str, PositionSnapshot]
     │   ├── get_stats() → Dict[str, Any]
     │   ├── reset_for_backtest() → None
-    │   ├── create_initial_stop(symbol: str, stop_loss_pct: Optional[float]) → Optional[OrderReq]
-    │   ├── on_stop_triggered(symbol: str, execution_price: float) → None
-    │   ├── is_on_cooldown(symbol: str) → bool
     │   ├── update_peak_pnl(symbol: str, current_price: float, candle_ts: Optional[int]) → None
     │   ├── compute_order_size(symbol: str, risk_ctx: Dict[str, Any]) → Decimal
     │   ├── quantize_qty(symbol: str, qty: Decimal) → Decimal
