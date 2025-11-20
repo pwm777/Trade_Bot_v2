@@ -263,10 +263,6 @@ python ml_labeling_tool_v3.py \
 ```bash
 # Обучение LightGBM на размеченных данных
 python ml_train_global_v2.py \
-  --historical data/eth_usdt_5m_historical.csv \
-  --labeled data/eth_usdt_5m_labeled.csv \
-  --output models/ml_global_5m_lgbm.joblib \
-  --report-dir models/training_logs
 
 # Результат:
 # - models/ml_global_5m_lgbm.joblib (обученная модель)
