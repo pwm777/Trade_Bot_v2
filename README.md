@@ -242,9 +242,9 @@ pytest-asyncio>=0.21.0
 
 ```bash
 # Скачивание исторических данных ETH/USDT 5m (5 месяцев)
-python data_preparation.py
+python market_history.py
 
-# Результат: data/eth_usdt_5m_historical.csv (~40,000 свечей)
+# Результат: data/market_data.sqlite (~40,000 свечей)
 ```
 
 ### Шаг 2: Разметка данных
