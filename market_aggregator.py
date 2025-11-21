@@ -870,6 +870,13 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
 
         self._symbol_buffers: Dict[str, deque] = {s: deque(maxlen=200) for s in symbols}
 
+        # ✅ NEW: Synchronization Events for 5m candle processing
+        self._processing_5m_candle: Dict[str, asyncio.Event] = {
+            s: asyncio.Event() for s in symbols
+        }
+        for event in self._processing_5m_candle.values():
+            event.set()  # Initially ready
+
         # SQLAlchemy engine
         from sqlalchemy import create_engine
         db_dsn = "sqlite:///data/market_data.sqlite"
@@ -930,6 +937,13 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                     self._symbol_buffers[s].append(candle)
                     recent = list(self._symbol_buffers[s])[-50:]
 
+                    # ✅ NEW: For 5m candles, wait for previous processing to complete
+                    if timeframe == '5m':
+                        self.logger.debug(f"⏳ Waiting for previous 5m candle processing to complete for {s}")
+                        await self._processing_5m_candle[s].wait()
+                        self._processing_5m_candle[s].clear()  # Block next candle
+                        self.logger.debug(f"✅ Ready to process new 5m candle for {s}")
+
                     try:
                         # ✅ ИСПРАВЛЕНИЕ: Правильная обработка async/sync callback
                         result = self.on_candle_ready(s, candle, recent)
@@ -937,6 +951,11 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                             await result
                     except Exception as e:
                         self.logger.error(f"on_candle_ready error: {e}", exc_info=True)
+                    finally:
+                        # ✅ NEW: Unblock next 5m candle after processing (success or error)
+                        if timeframe == '5m':
+                            self._processing_5m_candle[s].set()
+                            self.logger.debug(f"🔓 Released lock for next 5m candle for {s}")
 
                     with self._main_lock:
                         self._stats["candles_processed"] += 1
