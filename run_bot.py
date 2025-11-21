@@ -1281,10 +1281,10 @@ class BotLifecycleManager:
             async def _load_from_db(self, symbol: str, timeframe: str, limit: int = 1000) -> Optional[pd.DataFrame]:
                 """
                 Загрузить исторические данные из БД.
-                ✅ ИСПРАВЛЕНО: Учитывает simulated_time в BACKTEST режиме + кэширование
+                ✅ ИСПРАВЛЕНО: В BACKTEST режиме загружаем данные ДО current_time_ms (не "последние N от конца БД")
                 """
                 try:
-                    # ✅ НОВОЕ: Проверяем кэш
+                    # ✅ Получаем текущее время (в BACKTEST это simulated_time)
                     from iqts_standards import get_current_timestamp_ms
                     current_time_ms = get_current_timestamp_ms()
 
@@ -1299,7 +1299,7 @@ class BotLifecycleManager:
                             )
                             return cached_df.copy()
 
-                    # ✅ Загружаем из БД (существующий код)
+                    # ✅ Определяем параметры запроса
                     if timeframe == '1m':
                         actual_limit = min(limit, 500)
                         read_method = self.utils.read_candles_1m
@@ -1310,17 +1310,16 @@ class BotLifecycleManager:
                         self.logger.warning(f"Unsupported timeframe for DB load: {timeframe}")
                         return None
 
-                    interval_ms = 300_000 if timeframe == '5m' else 60_000
-                    start_time_ms = current_time_ms - (actual_limit * interval_ms)
-
                     self.logger.debug(
-                        f"Calling {read_method.__name__} for {symbol} {timeframe} "
-                        f"(start={start_time_ms}, end={current_time_ms})"
+                        f"📊 Calling {read_method.__name__} for {symbol} {timeframe} "
+                        f"(last_n={actual_limit}, end_ts={current_time_ms})"
                     )
+
+                    # ✅ ИСПРАВЛЕНИЕ: Используем last_n + end_ts для фильтрации по времени в BACKTEST
                     data = await read_method(
                         symbol=symbol,
-                        start_ts=start_time_ms,
-                        end_ts=current_time_ms
+                        last_n=actual_limit,
+                        end_ts=current_time_ms  # ← КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Ограничиваем до текущего времени бэктеста
                     )
 
                     # ✅ Валидация данных
@@ -1350,10 +1349,10 @@ class BotLifecycleManager:
                         df['timestamp'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
                         df = df.set_index('timestamp')
 
-                    # ✅ НОВОЕ: Сохраняем в кэш
+                    # ✅ Сохраняем в кэш
                     self._cache[cache_key] = (df, current_time_ms)
 
-                    # ✅ Очистка старого кэша (каждые 100 вызовов)
+                    # ✅ Очистка старого кэша
                     if len(self._cache) > 10:
                         expired = [k for k, (_, ts) in self._cache.items()
                                    if current_time_ms - ts > self._cache_ttl_ms * 2]
@@ -1362,8 +1361,7 @@ class BotLifecycleManager:
 
                     self.logger.info(
                         f"✅ Loaded {len(df)} rows from DB for {symbol} {timeframe} "
-                        f"(range: {start_time_ms} → {current_time_ms}, "
-                        f"limit requested={limit}, actual={actual_limit})"
+                        f"(last_n={actual_limit}, end_ts={current_time_ms})"
                     )
                     return df
 

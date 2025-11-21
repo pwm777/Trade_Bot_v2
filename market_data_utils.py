@@ -2040,45 +2040,86 @@ class MarketDataUtils:
             return 0
 
     async def read_candles_1m(
-        self, symbol: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None, last_n: Optional[int] = None
+            self,
+            symbol: str,
+            last_n: Optional[int] = None,
+            start_ts: Optional[int] = None,
+            end_ts: Optional[int] = None
     ) -> List[dict]:
         """
         Чтение 1m свечей из БД.
-        ✅ ИСПРАВЛЕНО: Данные возвращаются в порядке ASC (от старых к новым, от меньшего ts к большему)
+
+        ✅ ИСПРАВЛЕНО (2025-11-21): Поддержка last_n с фильтрацией по end_ts для BACKTEST режима.
+
+        Режимы работы:
+        1. start_ts + end_ts: Диапазон времени (для загрузки истории)
+        2. last_n + end_ts: Последние N свечей ДО end_ts (для BACKTEST)
+        3. last_n: Последние N свечей (для LIVE/DEMO)
+
+        Args:
+            symbol: Торговая пара
+            last_n: Количество последних свечей
+            start_ts: Начало диапазона (timestamp в ms)
+            end_ts: Конец диапазона (timestamp в ms)
+
+        Returns:
+            Список свечей в порядке ASC (от старых к новым)
         """
         try:
             async with self.aengine.connect() as conn:
-                if last_n:
-                    sql = text(f"""
+                # Режим 1: Диапазон времени (start_ts + end_ts)
+                if start_ts is not None and end_ts is not None:
+                    query = text(f"""
                         SELECT * FROM {TABLES['candles_1m']}
                         WHERE symbol = :symbol
-                        ORDER BY ts DESC
-                        LIMIT :limit
-                    """)
-                    res = await conn.execute(sql, {"symbol": symbol, "limit": int(last_n)})
-                    rows = res.mappings().all()
-                    # ✅ ИСПРАВЛЕНИЕ: Реверсируем результат для порядка ASC (от старых к новым, от меньшего ts к большему)
-                    return list(reversed([dict(r) for r in rows]))
-                elif start_ts is not None and end_ts is not None:
-                    sql = text(f"""
-                        SELECT * FROM {TABLES['candles_1m']}
-                        WHERE symbol = :symbol AND ts >= :start AND ts <= :end
+                          AND ts >= :start_ts
+                          AND ts <= :end_ts
                         ORDER BY ts ASC
                     """)
-                    res = await conn.execute(sql, {"symbol": symbol, "start": int(start_ts), "end": int(end_ts)})
-                    rows = res.mappings().all()
+                    result = await conn.execute(query, {
+                        "symbol": symbol,
+                        "start_ts": int(start_ts),
+                        "end_ts": int(end_ts)
+                    })
+                    rows = result.mappings().all()
                     return [dict(r) for r in rows]
+
+                # Режим 2 и 3: last_n (с фильтрацией по end_ts или без)
                 else:
-                    sql = text(f"""
-                        SELECT * FROM {TABLES['candles_1m']}
-                        WHERE symbol = :symbol
-                        ORDER BY ts ASC
-                    """)
-                    res = await conn.execute(sql, {"symbol": symbol})
-                    rows = res.mappings().all()
-                    return [dict(r) for r in rows]
+                    limit = int(last_n) if last_n is not None else 500
+
+                    # ✅ НОВОЕ: Если передан end_ts - фильтруем (для BACKTEST)
+                    if end_ts is not None:
+                        query = text(f"""
+                            SELECT * FROM {TABLES['candles_1m']}
+                            WHERE symbol = :symbol
+                              AND ts <= :end_ts
+                            ORDER BY ts DESC
+                            LIMIT :limit
+                        """)
+                        result = await conn.execute(query, {
+                            "symbol": symbol,
+                            "end_ts": int(end_ts),
+                            "limit": limit
+                        })
+                    else:
+                        # Старая логика - все данные (для LIVE/DEMO)
+                        query = text(f"""
+                            SELECT * FROM {TABLES['candles_1m']}
+                            WHERE symbol = :symbol
+                            ORDER BY ts DESC
+                            LIMIT :limit
+                        """)
+                        result = await conn.execute(query, {"symbol": symbol, "limit": limit})
+
+                    rows = result.mappings().all()
+                    # ✅ Возвращаем в ASC порядке (от старых к новым)
+                    data = [dict(row) for row in rows]
+                    data.reverse()
+                    return data
+
         except Exception as e:
-            self.logger.error(f"read_candles_1m failed: {e}", exc_info=True)
+            self.logger.error(f"Error reading 1m candles for {symbol}: {e}", exc_info=True)
             return []
 
     async def read_candles_5m(
@@ -2091,16 +2132,26 @@ class MarketDataUtils:
         """
         Чтение 5m свечей из БД.
 
-        Поддерживает два режима:
-          1. last_n=N — последние N свечей (по умолчанию: 200)
-          2. start_ts, end_ts — диапазон по времени [start_ts, end_ts] включительно
+        ✅ ИСПРАВЛЕНО (2025-11-21): Поддержка last_n с фильтрацией по end_ts для BACKTEST режима.
 
-        ✅ Возвращает в порядке ASC (от старых к новым, от меньшего ts к большему)
+        Режимы работы:
+        1. start_ts + end_ts: Диапазон времени (для загрузки истории)
+        2. last_n + end_ts: Последние N свечей ДО end_ts (для BACKTEST)
+        3. last_n: Последние N свечей (для LIVE/DEMO)
+
+        Args:
+            symbol: Торговая пара
+            last_n: Количество последних свечей
+            start_ts: Начало диапазона (timestamp в ms)
+            end_ts: Конец диапазона (timestamp в ms)
+
+        Returns:
+            Список свечей в порядке ASC (от старых к новым)
         """
         try:
             async with self.aengine.connect() as conn:
+                # Режим 1: Диапазон времени (start_ts + end_ts)
                 if start_ts is not None and end_ts is not None:
-                    # Режим по диапазону времени
                     query = text(f"""
                         SELECT * FROM {TABLES['candles_5m']}
                         WHERE symbol = :symbol
@@ -2116,18 +2167,36 @@ class MarketDataUtils:
                     rows = result.mappings().all()
                     return [dict(r) for r in rows]
 
+                # Режим 2 и 3: last_n (с фильтрацией по end_ts или без)
                 else:
-                    # Режим last_n (совместимость со старыми вызовами)
                     limit = int(last_n) if last_n is not None else 200
-                    query = text(f"""
-                        SELECT * FROM {TABLES['candles_5m']}
-                        WHERE symbol = :symbol
-                        ORDER BY ts DESC
-                        LIMIT :limit
-                    """)
-                    result = await conn.execute(query, {"symbol": symbol, "limit": limit})
+
+                    # ✅ НОВОЕ: Если передан end_ts - фильтруем (для BACKTEST)
+                    if end_ts is not None:
+                        query = text(f"""
+                            SELECT * FROM {TABLES['candles_5m']}
+                            WHERE symbol = :symbol
+                              AND ts <= :end_ts
+                            ORDER BY ts DESC
+                            LIMIT :limit
+                        """)
+                        result = await conn.execute(query, {
+                            "symbol": symbol,
+                            "end_ts": int(end_ts),
+                            "limit": limit
+                        })
+                    else:
+                        # Старая логика - все данные (для LIVE/DEMO)
+                        query = text(f"""
+                            SELECT * FROM {TABLES['candles_5m']}
+                            WHERE symbol = :symbol
+                            ORDER BY ts DESC
+                            LIMIT :limit
+                        """)
+                        result = await conn.execute(query, {"symbol": symbol, "limit": limit})
+
                     rows = result.mappings().all()
-                    # ✅ Важно: возвращаем в ASC порядке (от старых к новым)
+                    # ✅ Возвращаем в ASC порядке (от старых к новым)
                     data = [dict(row) for row in rows]
                     data.reverse()
                     return data
