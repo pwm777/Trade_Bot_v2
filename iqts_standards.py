@@ -1420,7 +1420,36 @@ def normalize_direction_v2(value: Any) -> Direction:
         >>> normalize_direction_v2(1)
         Direction.BUY
         >>> normalize_direction_v2(-1)
-        """
+        Direction.SELL
+    """
+    # ✅ НОВАЯ РЕАЛИЗАЦИЯ:
+    if value is None:
+        return Direction.FLAT
+
+    # Если уже Direction enum - возвращаем как есть
+    if isinstance(value, Direction):
+        return value
+
+    # Строка → Direction
+    if isinstance(value, str):
+        return side_to_direction(value)
+
+    # Число → Direction
+    if isinstance(value, (int, float)):
+        if value > 0:
+            return Direction.BUY
+        elif value < 0:
+            return Direction.SELL
+        else:
+            return Direction.FLAT
+
+    # Enum fallback (для других IntEnum)
+    if hasattr(value, 'value'):
+        return normalize_direction_v2(value.value)
+
+    # По умолчанию FLAT
+    return Direction.FLAT
+
 def validate_market_data(data: Dict[Timeframe, pd.DataFrame]) -> bool:
     """Light-версия без тяжёлых pandas-операций"""
     if not isinstance(data, dict) or not data:

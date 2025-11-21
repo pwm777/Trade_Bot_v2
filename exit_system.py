@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 import logging
 from iqts_standards import (DetectorSignal,
-            validate_market_data, Timeframe, normalize_direction,
-                            DirectionLiteral)
+            validate_market_data, Timeframe, normalize_direction_v2,
+                            Direction)
 from iqts_detectors import (RoleBasedOnlineTrendDetector, MLGlobalTrendDetector)
 from risk_manager import Direction
 
@@ -75,7 +75,7 @@ class ExitSignalDetector:
 
     async def analyze_exit_signal(self,
                                   data: Dict[Timeframe, pd.DataFrame],
-                                  position_direction: DirectionLiteral) -> Dict:
+                                  position_direction: Direction) -> Dict:
         """
         Анализ сигнала на выход с приоритетом каскадной логики
 
@@ -113,7 +113,7 @@ class ExitSignalDetector:
 
         return exit_decision
 
-    def _check_reversal(self, signal: DetectorSignal, position_direction: 'DirectionLiteral') -> Dict[str, Any]:
+    def _check_reversal(self, signal: DetectorSignal, position_direction: 'Direction') -> Dict[str, Any]:
         """
         Проверка полного разворота тренда
         Если мы в BUY, а сигнал показывает SELL - это разворот
@@ -130,7 +130,7 @@ class ExitSignalDetector:
         signal_confidence = signal.get("confidence", 0.0)
 
         # Нормализуем position_direction к int
-        pos_dir = normalize_direction(position_direction)  # 1/-1/0
+        pos_dir = normalize_direction_v2(position_direction)  # 1/-1/0
 
         # Разворот = противоположное направление
         from iqts_standards import Direction
@@ -143,7 +143,7 @@ class ExitSignalDetector:
             'signal_ok': True
         }
 
-    def _check_weakening(self, signal: DetectorSignal, position_direction: DirectionLiteral) -> Dict:
+    def _check_weakening(self, signal: DetectorSignal, position_direction: Direction) -> Dict:
         """
         Проверка ослабления тренда
         Тренд в нашу сторону, но уверенность падает
@@ -165,7 +165,7 @@ class ExitSignalDetector:
             'signal_ok': signal_ok
         }
 
-    def _check_cascading_reversal(self, signals: Dict, position_direction: DirectionLiteral) -> Dict:
+    def _check_cascading_reversal(self, signals: Dict, position_direction: Direction) -> Dict:
         """
         КЛЮЧЕВОЙ МЕТОД: Проверка каскадного разворота (2 уровня)
 
@@ -234,7 +234,7 @@ class ExitSignalDetector:
 
         return {'detected': False}
 
-    def _combine_exit_signals(self, signals: Dict, position_direction: DirectionLiteral) -> Dict:
+    def _combine_exit_signals(self, signals: Dict, position_direction: Direction) -> Dict:
         """
         Комбинируем сигналы с приоритетом каскадной логики
 
@@ -364,7 +364,7 @@ class AdaptiveExitManager:
     def _calculate_pnl_pct(self,
                            entry_price: float,
                            current_price: float,
-                           direction: DirectionLiteral) -> float:
+                           direction: Direction) -> float:
         """Расчет PnL в процентах"""
         if direction == Direction.BUY:
             return (current_price - entry_price) / entry_price
@@ -399,7 +399,7 @@ class AdaptiveExitManager:
                 details={"missing": missing}
             )
         opened_at = position['opened_at']
-        direction = normalize_direction(signal.get('direction'))
+        direction = normalize_direction_v2(signal.get('direction'))
         entry_price = signal.get('entry_price', 0.0)
         stop_loss = signal.get('stop_loss', 0.0)
         take_profit = signal.get('take_profit', 0.0)
@@ -482,7 +482,7 @@ class AdaptiveExitManager:
         })
 
     def _check_hard_exits(self,
-                          direction: DirectionLiteral,
+                          direction: Direction,
                           current_price: float,
                           stop_loss: float,
                           take_profit: float,
@@ -522,7 +522,7 @@ class AdaptiveExitManager:
         return {'should_exit': False, 'reason': 'no_hard_exit', 'type': 'hard'}
 
     def _check_profit_protection(self,
-                                 direction: DirectionLiteral,
+                                 direction: Direction,
                                  current_price: float,
                                  entry_price: float,
                                  pnl_pct: float,
@@ -591,7 +591,7 @@ class AdaptiveExitManager:
                               position: Dict,
                               current_price: float) -> Dict:
         signal = position['signal']
-        direction = normalize_direction(signal.get('direction', 0))
+        direction = normalize_direction_v2(signal.get('direction', 0))
         entry_price = signal.get('entry_price', 0.0)
         original_stop_loss = signal.get('stop_loss', 0.0)
 
@@ -840,7 +840,7 @@ class AdaptiveExitManager:
         if entry_price <= 0 or current_price <= 0:
             return {'changed': False, 'reason': 'invalid_price'}
 
-        direction = normalize_direction(direction_raw)
+        direction = normalize_direction_v2(direction_raw)
 
         tracking = position.get("exit_tracking")
         if tracking is None:
