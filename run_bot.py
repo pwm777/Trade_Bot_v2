@@ -1797,6 +1797,8 @@ class BotLifecycleManager:
         # ================================================================
 
         adapter = MainBotAdapter(core_bot, logger)
+        # Сохраняем ссылку на адаптер для доступа к _active_analysis_tasks
+        core_bot._adapter = adapter
         logger.info("✅ MainBotAdapter created")
 
         return cast(MainBotInterface, adapter)
