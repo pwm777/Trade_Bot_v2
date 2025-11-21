@@ -748,16 +748,6 @@ class BotLifecycleManager:
                         task = asyncio.ensure_future(analyze_and_trade())
                         logger.info(f"✅ Analysis task scheduled for {symbol}")
 
-                    # ✅ Получаем event loop и запускаем задачу
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(analyze_and_trade())
-                        logger.info(f"✅ Analysis task created for {symbol}")
-                    except RuntimeError:
-                        # Если нет активного loop, используем ensure_future
-                        asyncio.ensure_future(analyze_and_trade())
-                        logger.info(f"✅ Analysis task scheduled for {symbol}")
-
                 except Exception as err:
                     logger.error(f"Error in on_candle_ready for {symbol}: {err}", exc_info=True)
 
@@ -1797,7 +1787,11 @@ class BotLifecycleManager:
         # ================================================================
 
         adapter = MainBotAdapter(core_bot, logger)
+<<<<<<< HEAD
         # Сохраняем ссылку на адаптер для доступа к _active_analysis_tasks
+=======
+        # ✅ Сохраняем ссылку на адаптер для доступа к _active_analysis_tasks
+>>>>>>> ad343dca9d92fb273094cc5b359dc43105acb848
         core_bot._adapter = adapter
         logger.info("✅ MainBotAdapter created")
 

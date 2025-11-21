@@ -1,0 +1,322 @@
+{
+  "training_date": "2025-11-17T19:44:17.591485",
+  "symbol": "ETHUSDT",
+  "db_dsn": "sqlite:///data/market_data.sqlite",
+  "model_path": "models/ml_windowed_ETHUSDT_20251117_194416.joblib",
+  "lookback_window": 11,
+  "metrics": {
+    "decision_policy": {
+      "tau": 0.9059880336331745,
+      "delta": 0.08,
+      "cooldown_bars": 2,
+      "bars_per_day": 288,
+      "test_spd": 8.154148643334644,
+      "test_precision_macro_buy_sell": 1.0,
+      "test_recall_macro_buy_sell": 1.0,
+      "test_f1_macro_buy_sell": 1.0,
+      "target_spd_range": [
+        8.0,
+        20.0
+      ],
+      "hit_range": true,
+      "precision_min": 0.45
+    },
+    "precision_min_sweep": [
+      {
+        "precision_min": 0.45,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.5,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.55,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.6,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.65,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.7,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.75,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.8,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.85,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      },
+      {
+        "precision_min": 0.9,
+        "tau": 0.9059880336331745,
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "hit_range": true
+      }
+    ],
+    "val_accuracy": 0.6901297679905624,
+    "val_precision": {
+      "BUY": 0.6208695652173913,
+      "SELL": 0.5445682451253482,
+      "HOLD": 0.8056
+    },
+    "val_recall": {
+      "BUY": 0.702755905511811,
+      "SELL": 0.7696850393700787,
+      "HOLD": 0.6594629993451212
+    },
+    "val_f1_score": {
+      "BUY": 0.6592797783933518,
+      "SELL": 0.6378466557911908,
+      "HOLD": 0.7252430680590566
+    },
+    "val_confusion_matrix": [
+      [
+        357,
+        17,
+        134
+      ],
+      [
+        8,
+        391,
+        109
+      ],
+      [
+        210,
+        310,
+        1007
+      ]
+    ],
+    "test_accuracy": 0.6920959496657492,
+    "test_precision": {
+      "BUY": 0.639763779527559,
+      "SELL": 0.5643994211287988,
+      "HOLD": 0.7775297619047619
+    },
+    "test_recall": {
+      "BUY": 0.626204238921002,
+      "SELL": 0.75,
+      "HOLD": 0.694813829787234
+    },
+    "test_f1_score": {
+      "BUY": 0.6329113924050633,
+      "SELL": 0.6440957886044592,
+      "HOLD": 0.7338483146067416
+    },
+    "test_confusion_matrix": [
+      [
+        325,
+        17,
+        177
+      ],
+      [
+        8,
+        390,
+        122
+      ],
+      [
+        175,
+        284,
+        1045
+      ]
+    ],
+    "best_iteration": 1890,
+    "class_distribution": {
+      "train": {
+        "0": 6964,
+        "1": 2451,
+        "2": 2450
+      },
+      "val": {
+        "2": 508,
+        "0": 1527,
+        "1": 508
+      },
+      "test": {
+        "2": 520,
+        "0": 1504,
+        "1": 519
+      }
+    },
+    "tau_sensitivity": [
+      {
+        "spd": 21.40464018875344,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.8559880336331744,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 189
+      },
+      {
+        "spd": 16.19504522217853,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.8759880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 143
+      },
+      {
+        "spd": 13.93000393236335,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.8859880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 123
+      },
+      {
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9059880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 72
+      },
+      {
+        "spd": 4.190326386158081,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9259880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 37
+      },
+      {
+        "spd": 2.4915454187966968,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9359880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 22
+      },
+      {
+        "spd": 0.2265041289815179,
+        "precision_macro_buy_sell": 0.5,
+        "recall_macro_buy_sell": 0.5,
+        "f1_macro_buy_sell": 0.5,
+        "tau": 0.9559880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 2
+      }
+    ],
+    "delta_sensitivity": [
+      {
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9059880336331745,
+        "delta": 0.06,
+        "cooldown_bars": 2,
+        "_debug_active_count": 72
+      },
+      {
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9059880336331745,
+        "delta": 0.08,
+        "cooldown_bars": 2,
+        "_debug_active_count": 72
+      },
+      {
+        "spd": 8.154148643334644,
+        "precision_macro_buy_sell": 1.0,
+        "recall_macro_buy_sell": 1.0,
+        "f1_macro_buy_sell": 1.0,
+        "tau": 0.9059880336331745,
+        "delta": 0.1,
+        "cooldown_bars": 2,
+        "_debug_active_count": 72
+      }
+    ],
+    "lookback_window": 11,
+    "base_features_count": 21,
+    "total_features_count": 231
+  },
+  "base_feature_names": [
+    "cmo_14",
+    "volume",
+    "trend_acceleration_ema7",
+    "regime_volatility",
+    "bb_width",
+    "adx_14",
+    "plus_di_14",
+    "minus_di_14",
+    "atr_14_normalized",
+    "volume_ratio_ema3",
+    "candle_relative_body",
+    "upper_shadow_ratio",
+    "lower_shadow_ratio",
+    "price_vs_vwap",
+    "bb_position",
+    "cusum_1m_quality_score",
+    "cusum_1m_trend_aligned",
+    "cusum_1m_price_move",
+    "is_trend_pattern_1m",
+    "body_to_range_ratio_1m",
+    "close_position_in_range_1m"
+  ],
+  "total_feature_names_count": 231
+}
