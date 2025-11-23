@@ -1895,26 +1895,24 @@ class BotLifecycleManager:
         # ✅ CRITICAL FIX: Chain callbacks to include MainBotAdapter
         if hasattr(market_aggregator, 'on_candle_ready'):
             original_on_candle_ready = market_aggregator.on_candle_ready
-            
-            async def chained_on_candle_ready(symbol: str, candle: Candle1m, recent: List[Candle1m]) -> None:
-                """Chain callbacks: trade_log → MainBotAdapter"""
-                try:
-                    # Safely await the original callback
-                    result = original_on_candle_ready(symbol, candle, recent)
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as e:
-                    logger.error(f"Error in trade_log callback: {e}")
-                
+
+            async def chained_on_candle_ready(symbol, candle, recent):
+                # Логируем в trade_log
+                if trade_log and hasattr(trade_log, "on_candle_ready"):
+                    try:
+                        result = trade_log.on_candle_ready(symbol, candle, recent)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        logger.error(f"Error in trade_log callback: {e}")
+
+                # Передаём в адаптер
                 try:
                     await adapter.handle_candle_ready(symbol, candle, recent)
                 except Exception as e:
                     logger.error(f"Error in MainBotAdapter callback: {e}", exc_info=True)
-            
+
             market_aggregator.on_candle_ready = chained_on_candle_ready
-            logger.info("✅ MainBotAdapter subscribed to MarketAggregator candles")
-        else:
-            logger.error("❌ MarketAggregator missing on_candle_ready callback!")
 
         logger.info("✅ MainBotAdapter created and subscribed")
         return cast(MainBotInterface, adapter)

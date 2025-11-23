@@ -1068,6 +1068,16 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
         while self._is_running and not self._stats.get("backtest_completed", False):
             await asyncio.sleep(0.1)
 
+    def add_event_handler(self, handler: MarketEventHandler) -> None:
+        """
+        Заглушка для совместимости с MarketAggregatorInterface.
+        В бэктесте обработчики событий не используются.
+        """
+        # Можно просто ничего не делать
+        # Или логировать, если хочешь:
+        # self.logger.debug(f"Event handler registered (no-op in backtest): {handler}")
+        pass
+
     def fetch_recent(self, symbol: str, limit: int = 10) -> List[Candle1m]:
         buf = self._symbol_buffers.get(symbol, deque())
         return list(buf)[-limit:] if limit > 0 else list(buf)
@@ -1143,28 +1153,30 @@ class MarketAggregatorFactory:
 
     @staticmethod
     def _create_backtest_aggregator(
-        config: Dict[str, Any],
-        on_candle_ready: Callable,
-        on_connection_state_change: Optional[Callable],
-        event_handlers: Optional[List[MarketEventHandler]],
-        logger_instance: logging.Logger,
-        trading_logger: Optional[Any]
+            config: Dict[str, Any],
+            on_candle_ready: Callable,
+            on_connection_state_change: Optional[Callable],
+            event_handlers: Optional[List[MarketEventHandler]],
+            logger_instance: logging.Logger,
+            trading_logger: Optional[Any]
     ) -> MarketAggregatorInterface:
         symbols = config.get("symbols", [])
-        backtest_config = config.get("backtest", {})
+        backtest_cfg = config.get("backtest", {})
+        speed = float(backtest_cfg.get("speed", 1.0))
+
         aggr = BacktestMarketAggregatorFixed(
             trading_logger=trading_logger,
             on_candle_ready=on_candle_ready,
             symbols=symbols,
-            virtual_clock_start_ms=backtest_config.get("start_time_ms", 0),
-            virtual_clock_end_ms=backtest_config.get("end_time_ms", 0),
-            interval_ms=60_000,
+            virtual_clock_start_ms=backtest_cfg.get("start_time_ms", 0),
+            virtual_clock_end_ms=backtest_cfg.get("end_time_ms", 0),
+            speed=speed,  # ← вот он, нужный параметр
             logger=logger_instance
         )
         if event_handlers:
             for h in event_handlers:
                 aggr.add_event_handler(h)
-        logger_instance.info("Created BacktestMarketAggregatorFixed")
+        logger_instance.info("Created BacktestMarketAggregatorFixed (clean & safe)")
         return cast(MarketAggregatorInterface, aggr)
 
     @staticmethod
