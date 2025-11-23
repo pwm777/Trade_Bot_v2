@@ -684,8 +684,8 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                 return None
 
             # ATR уже рассчитан в свече
-            if 'atr_14' not in df_1m.columns:
-                self.logger.warning(f"No 'atr_14' column in 1m data")
+            if 'atr14' not in df_1m.columns:
+                self.logger.warning(f"No 'atr14' column in 1m data")
                 return None
 
             try:
