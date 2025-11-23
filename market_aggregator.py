@@ -18,7 +18,7 @@ from typing import (Dict, Any, List, Callable,
 from decimal import Decimal
 from collections import deque
 from datetime import datetime, UTC
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from iqts_standards import (
     MarketAggregatorInterface, NetConnState,
     MarketEventHandler, ExecutionMode, get_current_timestamp_ms,
@@ -931,196 +931,146 @@ class DemoMarketAggregatorPhased(BaseMarketAggregator):
         """Получение статистики"""
         with self._main_lock:
             return self._stats.copy()
-# ======================================================================
-# BACKTEST MARKET AGGREGATOR
-# ======================================================================
 
 class BacktestMarketAggregatorFixed(BaseMarketAggregator):
     """
-    Бэктест-агрегатор для симуляции рынка из данных SQLite.
-    Читает из candles_1m/candles_5m
+    Простой и надёжный бэктест-агрегатор:
+    • UNION-запрос 1m + 5m → ORDER BY ts, timeframe → правильный порядок
+    • Последовательная обработка → никаких гонок
+    • _timeframe добавляется в копию свечи → тип Candle1m не ломается
     """
 
-    def __init__(self,
-                 trading_logger: Optional[Any],
-                 on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], Awaitable[None]],
-                 symbols: List[str],
-                 virtual_clock_start_ms: int,
-                 virtual_clock_end_ms: int,
-                 interval_ms: int = 60_000,
-                 logger: Optional[logging.Logger] = None):
-
+    def __init__(
+        self,
+        trading_logger: Optional[Any],
+        on_candle_ready: Callable[[str, Candle1m, List[Candle1m]], Awaitable[None]],
+        symbols: List[str],
+        virtual_clock_start_ms: int,
+        virtual_clock_end_ms: int,
+        speed: float = 1.0,
+        logger: Optional[logging.Logger] = None,
+    ):
         super().__init__(logger)
-
         self.trading_logger = trading_logger
-        self.on_candle_ready = on_candle_ready
-        self.BASE_INTERVAL_MS = interval_ms
+        self._original_on_candle_ready = on_candle_ready
         self.symbols = symbols
-        self.virtual_clock_start_ms = virtual_clock_start_ms
-        self.virtual_clock_end_ms = virtual_clock_end_ms
-        self.interval_ms = interval_ms
+        self.start_ms = virtual_clock_start_ms
+        self.end_ms = virtual_clock_end_ms
+        self.speed = max(0.01, speed)  # защита от 0
 
-        self._symbol_buffers: Dict[str, deque] = {s: deque(maxlen=200) for s in symbols}
+        self._symbol_buffers: Dict[str, deque] = {s: deque(maxlen=500) for s in symbols}
 
-        # ✅ NEW: Synchronization Events for 5m candle processing
-        self._processing_5m_candle: Dict[str, asyncio.Event] = {
-            s: asyncio.Event() for s in symbols
-        }
-        for event in self._processing_5m_candle.values():
-            event.set()  # Initially ready
-
-        # SQLAlchemy engine
-        from sqlalchemy import create_engine
+        # Движок БД
         db_dsn = "sqlite:///data/market_data.sqlite"
-        if trading_logger and hasattr(trading_logger, 'config') and trading_logger.config:
+        if trading_logger and hasattr(trading_logger, "config"):
             db_dsn = trading_logger.config.get("market_db_dsn", db_dsn)
         self._engine = create_engine(db_dsn)
 
-        # Дополнительные поля для backtest
         self._stats.update({
             "backtest_start_ms": virtual_clock_start_ms,
             "backtest_end_ms": virtual_clock_end_ms,
             "backtest_completed": False,
-            "backtest_progress": 0.0,
+            "candles_processed": 0,
         })
 
     def _get_mode(self) -> str:
         return "backtest"
 
-    async def _replay_loop(self, symbols: List[str], from_ts: int, to_ts: int, speed: float = 1.0) -> None:
-        """Воспроизведение исторических данных"""
-        self.logger.info(f"Starting replay from {from_ts} to {to_ts} for {symbols}")
-
-        # ✅ Load BOTH 1m and 5m candles with UNION query
+    async def _replay_loop(self) -> None:
         sql = text("""
-            SELECT '1m' as timeframe, symbol, ts, ts_close, open, high, low, close, volume, count, quote, finalized, checksum, created_ts
+            SELECT '1m' as timeframe, symbol, ts, ts_close, open, high, low, close,
+                   volume, count, quote, finalized, checksum, created_ts
             FROM candles_1m
             WHERE symbol = :symbol AND ts >= :from_ts AND ts <= :to_ts
-            
+
             UNION ALL
-            
-            SELECT '5m' as timeframe, symbol, ts, ts_close, open, high, low, close, volume, count, quote, finalized, checksum, created_ts
+
+            SELECT '5m' as timeframe, symbol, ts, ts_close, open, high, low, close,
+                   volume, count, quote, finalized, checksum, created_ts
             FROM candles_5m
             WHERE symbol = :symbol AND ts >= :from_ts AND ts <= :to_ts
-            
+
             ORDER BY ts ASC, timeframe ASC
         """)
 
         try:
-            for s in symbols:
+            for symbol in self.symbols:
                 with self._engine.connect() as conn:
-                    rows = list(
-                        conn.execute(sql, {"symbol": s, "from_ts": int(from_ts), "to_ts": int(to_ts)}).mappings())
+                    result = conn.execute(sql, {
+                        "symbol": symbol,
+                        "from_ts": self.start_ms,
+                        "to_ts": self.end_ms
+                    })
 
-                for r in rows:
-                    if not self._is_running:
-                        break
+                    for row in result.mappings():
+                        if not self._is_running:
+                            return
 
-                    set_simulated_time(int(r["ts"]))
+                        ts = int(row["ts"])
+                        set_simulated_time(ts)
 
-                    # ✅ Extract timeframe metadata
-                    candle_dict = dict(r)
-                    timeframe = candle_dict.pop('timeframe', '1m')
-                    
-                    # Используем базовый метод преобразования
-                    candle = self._candle_dict_to_candle1m(candle_dict)
-                    candle['_timeframe'] = timeframe  # ✅ Add metadata for downstream processing
+                        # Подготовка свечи
+                        candle_dict = dict(row)
+                        timeframe = candle_dict.pop("timeframe", "1m")
+                        candle = self._candle_dict_to_candle1m(candle_dict)
 
-                    self._symbol_buffers[s].append(candle)
-                    recent = list(self._symbol_buffers[s])[-50:]
+                        # Добавляем в буфер
+                        self._symbol_buffers[symbol].append(candle)
+                        recent = list(self._symbol_buffers[symbol])[-50:]
 
-                    # ✅ NEW: For 5m candles, wait for previous processing to complete
-                    if timeframe == '5m':
-                        self.logger.debug(f"⏳ Waiting for previous 5m candle processing to complete for {s}")
-                        await self._processing_5m_candle[s].wait()
-                        self._processing_5m_candle[s].clear()  # Block next candle
-                        self.logger.debug(f"✅ Ready to process new 5m candle for {s}")
+                        # Передаём копию с _timeframe — безопасно
+                        candle_with_tf = dict(candle)
+                        candle_with_tf["_timeframe"] = timeframe
 
-                    try:
-                        # ✅ ИСПРАВЛЕНИЕ: Правильная обработка async/sync callback
-                        result = self.on_candle_ready(s, candle, recent)
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception as e:
-                        self.logger.error(f"on_candle_ready error: {e}", exc_info=True)
-                    finally:
-                        # ✅ NEW: Unblock next 5m candle after processing (success or error)
-                        if timeframe == '5m':
-                            self._processing_5m_candle[s].set()
-                            self.logger.debug(f"🔓 Released lock for next 5m candle for {s}")
+                        try:
+                            call = self._original_on_candle_ready(
+                                symbol,
+                                cast(Candle1m, candle_with_tf),
+                                recent
+                            )
+                            if asyncio.iscoroutine(call):
+                                await call
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error in on_candle_ready [{symbol} {timeframe} {ts}]",
+                                exc_info=True
+                            )
 
-                    with self._main_lock:
-                        self._stats["candles_processed"] += 1
-                        self._stats["last_candle_ts"] = int(r["ts"])
+                        # Статистика
+                        with self._main_lock:
+                            self._stats["candles_processed"] += 1
+                            self._stats["last_candle_ts"] = ts
 
-                    if speed > 0:
-                        await asyncio.sleep(0.001 / speed)
+                        # Скорость воспроизведения
+                        if self.speed > 0:
+                            await asyncio.sleep(0.001 / self.speed)
 
             with self._main_lock:
                 self._stats["backtest_completed"] = True
+                self.logger.info("Backtest replay completed successfully")
+
         except Exception as e:
-            self.logger.error(f"Replay error: {e}")
+            self.logger.error("Replay loop failed", exc_info=True)
         finally:
-            try:
-                clear_simulated_time()
-            except Exception:
-                pass
+            clear_simulated_time()
 
     async def start_async(self, symbols: List[str], *, history_window: int = 50) -> None:
-        """
-        Запускает бэктест-агрегатор.
-        В режиме BACKTEST сразу начинается воспроизведение истории.
-        """
-        self.logger.info(f"Starting BacktestMarketAggregatorFixed for {symbols}")
+        self._active_symbols = symbols
+        self._is_running = True
+        self._stats["is_running"] = True
+        self._stats["active_symbols"] = symbols
+        self._stats["connection_state"] = "connected"
 
-        with self._main_lock:
-            self._active_symbols = symbols
-            self._is_running = True
-            self._stats["is_running"] = True
-            self._stats["active_symbols"] = symbols
-            self._stats["symbols_active"] = len(symbols)
-            self._stats["connection_state"] = "connected"
-
-            # Инициализация буферов
-            for s in symbols:
-                if not hasattr(self, '_symbol_buffers'):
-                    self._symbol_buffers = {}
-                self._symbol_buffers[s] = deque(maxlen=400)
-
-        # Определение скорости из config или по умолчанию
-        speed = getattr(self, 'speed', 1.0)  # Убедитесь, что speed установлен при создании
-
-        # Запуск воспроизведения
-        self._running_tasks['replay'] = asyncio.create_task(
-            self._replay_loop(symbols, self.virtual_clock_start_ms, self.virtual_clock_end_ms, speed=speed)
-        )
-
-        self.logger.info(f"Backtest started from {self.virtual_clock_start_ms} to {self.virtual_clock_end_ms}")
+        self._create_or_cancel_task("replay", self._replay_loop())
+        self.logger.info(f"Backtest started: {symbols} from {self.start_ms} to {self.end_ms}")
 
     async def wait_for_completion(self) -> None:
-        """Ожидание завершения бэктеста"""
         while self._is_running and not self._stats.get("backtest_completed", False):
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
 
     def fetch_recent(self, symbol: str, limit: int = 10) -> List[Candle1m]:
-        """Получение последних свечей для символа"""
-        with self._main_lock:
-            data = list(self._symbol_buffers.get(symbol, []))
-            return data[-limit:] if limit > 0 else data
-
-    def get_buffer_history(self, symbol: str, count: int = 10, *, exclude_current: bool = False) -> List[Candle1m]:
-        """Получение истории из буфера"""
-        with self._main_lock:
-            buf = list(self._symbol_buffers.get(symbol, []))
-        if exclude_current and buf:
-            buf = buf[:-1]
-        return buf[-count:] if count > 0 else buf
-
-    def add_event_handler(self, handler: MarketEventHandler) -> None:
-        """Добавление обработчика событий (заглушка)"""
-        pass
-
-
+        buf = self._symbol_buffers.get(symbol, deque())
+        return list(buf)[-limit:] if limit > 0 else list(buf)
 
 # ======================================================================
 # FACTORY
