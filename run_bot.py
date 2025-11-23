@@ -1859,9 +1859,9 @@ class BotLifecycleManager:
                         f"(_timeframe={candle.get('_timeframe', 'unknown')})"
                     )
                     
-                    self._stats["candles_processed"] = self._stats.get("candles_processed", 0) + 1
+                    self._stats["candles_processed"] += 1
                     self._stats["last_candle_ts"] = candle.get('ts')
-                    self._stats["events_processed"] = int(self._stats.get("events_processed", 0)) + 1
+                    self._stats["events_processed"] += 1
 
                     # Определяем timeframe из интервала свечи
                     ts = candle.get('ts', 0)
@@ -1897,7 +1897,10 @@ class BotLifecycleManager:
             async def chained_on_candle_ready(symbol: str, candle: Candle1m, recent: List[Candle1m]) -> None:
                 """Chain callbacks: trade_log → MainBotAdapter"""
                 try:
-                    await original_on_candle_ready(symbol, candle, recent)
+                    # Safely await the original callback
+                    result = original_on_candle_ready(symbol, candle, recent)
+                    if asyncio.iscoroutine(result):
+                        await result
                 except Exception as e:
                     logger.error(f"Error in trade_log callback: {e}")
                 
