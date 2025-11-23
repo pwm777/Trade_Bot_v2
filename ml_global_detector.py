@@ -377,19 +377,6 @@ class MLGlobalDetector(Detector):
 
                 act = (maxp >= tau) and (margin >= delta)
 
-                # Применяем cooldown по барам (если есть исторический ts)
-                if act and cooldown_bars > 0 and last_ts is not None:
-                    if self._last_signal_ts is not None:
-                        # Сколько баров прошло с последнего сигнала
-                        try:
-                            ts_col = 'timestamp' if 'timestamp' in df.columns else 'ts'
-                            passed_bars = int((df[ts_col] > self._last_signal_ts).sum())
-                        except Exception:
-                            passed_bars = 0
-                        if passed_bars < cooldown_bars:
-                            act = False
-                            reason = "cooldown_active"
-
                 # ✅ ОПРЕДЕЛЯЕМ ok И reason НА ОСНОВЕ act
                 if predicted_direction == 0:
                     ok = True
