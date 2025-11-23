@@ -1782,7 +1782,6 @@ class BotLifecycleManager:
 
             async def bootstrap(self) -> None:
                 """Инициализация"""
-                await self.core.initialize()
                 # Start cleanup task
                 try:
                     self._cleanup_task = asyncio.create_task(self._cleanup_stale_tasks())
@@ -1815,7 +1814,11 @@ class BotLifecycleManager:
                     try:
                         await asyncio.sleep(self._task_cleanup_interval)
                         
-                        current_time = asyncio.get_running_loop().time()
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                        current_time = loop.time()
                         stale_tasks = []
                         
                         for symbol, task in list(self._active_analysis_tasks.items()):
