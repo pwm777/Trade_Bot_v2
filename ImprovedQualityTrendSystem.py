@@ -555,7 +555,7 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             total_pnl=float(self.performance_tracker["total_pnl"])
         )
 
-    async def generate_signal(self, market_data: Dict[str, pd.DataFrame]) -> Optional[Dict]:
+    async def generate_signal(self, market_data: Dict[Timeframe, pd.DataFrame]) -> Optional[Dict]:
         """Генерирует торговый сигнал на основе анализа рынка."""
         try:
             # ✅ ЗАЩИТА 1: Инициализация кэша если не существует
@@ -580,7 +580,7 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                     self.logger.info(f"    Has 'ts': {'ts' in df.columns}")
 
             # ✅ ШАГ 1: Вызываем анализ через confirmator
-            result = await self.three_level_confirmator.analyze(cast(Dict, market_data))
+            result = await self.three_level_confirmator.analyze(market_data)
 
             # ✅ ШАГ 3: Извлекаем данные из результата анализа
             metadata = result.get('metadata', {})
@@ -676,6 +676,57 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             if current_price <= 0:
                 self.logger.warning(f"Invalid current price: {current_price}")
                 return None
+
+            # ✅ ШАГ 8: Получаем ATR из 1m данных
+            df_1m = market_data.get('1m')
+            if df_1m is None or df_1m.empty:
+                self.logger.warning(f"No 1m data for ATR")
+                return None
+
+            # ATR уже рассчитан в свече
+            if 'atr_14' not in df_1m.columns:
+                self.logger.warning(f"No 'atr_14' column in 1m data")
+                return None
+
+            try:
+                atr = float(df_1m['atr_14'].iloc[-1])
+            except (IndexError, ValueError, TypeError) as e:
+                self.logger.warning(f"Cannot extract ATR from 1m data: {e}")
+                return None
+
+            if atr <= 0:
+                self.logger.warning(f"Invalid ATR: {atr}")
+                return None
+
+            # ✅ ШАГ 9: Обновляем режим рынка
+            await self._update_market_regime(market_data)
+
+            # ✅ ШАГ 10: Формируем сигнал
+            signal = {
+                'symbol': symbol,
+                'direction': direction,
+                'confidence': confidence,
+                'entry_price': current_price,
+                'atr': atr,
+                'regime': self.current_regime.regime if self.current_regime else 'uncertain',
+                'metadata': {
+                    **metadata,
+                    'signal_source': 'generate_signal_agreement',
+                    'cache_used': False,
+                    'global_direction': global_direction,
+                    'global_confidence': global_confidence,
+                    'trend_direction': trend_direction,
+                    'trend_confidence': trend_confidence
+                }
+            }
+
+            self.logger.info(
+                f"✅ Signal generated from agreement: {symbol} "
+                f"dir={direction}, conf={confidence:.3f}, "
+                f"entry={current_price:.2f}, atr={atr:.2f}"
+            )
+
+            return signal
 
         except Exception as e:
             self.logger.error(f"Error generating signal: {e}", exc_info=True)
