@@ -381,7 +381,7 @@ class BotLifecycleManager:
 
             # --- Exit Manager (DI) ---
             exit_manager = await self._create_exit_manager(logger)
-            
+
             # --- SignalValidator (DI) ---
             validator = SignalValidator(
                 strict_mode=self.config.get("validation", {}).get("strict_mode", False),
@@ -913,12 +913,12 @@ class BotLifecycleManager:
     ) -> PositionManagerInterface:
         """
         Create PositionManager with Dependency Injection.
-        
+
         Args:
             trade_log: TradingLogger instance
             logger: Logger instance
             signal_validator: Optional SignalValidator for DI
-            
+
         Returns:
             PositionManagerInterface instance
         """
@@ -1808,19 +1808,19 @@ class BotLifecycleManager:
                 """Регистрация обработчика событий"""
                 self._handler = handler
 
-            async def _cleanup_stale_tasks(self):
+            async def _cleanup_stale_tasks(self) -> None:
                 """Периодическая очистка зависших задач"""
                 while True:
                     try:
                         await asyncio.sleep(self._task_cleanup_interval)
-                        
+
                         try:
                             loop = asyncio.get_running_loop()
                         except RuntimeError:
                             loop = asyncio.get_event_loop()
                         current_time = loop.time()
                         stale_tasks = []
-                        
+
                         for symbol, task in list(self._active_analysis_tasks.items()):
                             if task.done():
                                 stale_tasks.append(symbol)
@@ -1831,17 +1831,17 @@ class BotLifecycleManager:
                                     self.logger.warning(f"⚠️ Cancelling stale task for {symbol} (age={age:.1f}s)")
                                     task.cancel()
                                     stale_tasks.append(symbol)
-                        
+
                         # Cleanup
                         for symbol in stale_tasks:
                             if symbol in self._active_analysis_tasks:
                                 del self._active_analysis_tasks[symbol]
                             if symbol in self._task_creation_times:
                                 del self._task_creation_times[symbol]
-                            
+
                         if stale_tasks:
                             self.logger.info(f"🧹 Cleaned up {len(stale_tasks)} stale tasks: {stale_tasks}")
-                            
+
                     except asyncio.CancelledError:
                         break
                     except Exception as e:
