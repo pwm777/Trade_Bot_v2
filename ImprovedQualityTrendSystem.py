@@ -13,7 +13,7 @@ from datetime import datetime
 import logging
 from dataclasses import dataclass
 from threading import Lock
-
+import numpy as np
 from iqts_standards import (Timeframe,
     DetectorSignal, TradingSystemInterface,
      normalize_trading_hours, SystemStatus,
@@ -493,8 +493,8 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             volatility = prices.pct_change().std()
 
             # ✅ ЗАЩИТА: Проверка на NaN/Inf
-            if pd.isna(volatility) or not pd.np.isfinite(volatility):
-                volatility = 0.02  # Fallback значение
+            if pd.isna(volatility) or not np.isfinite(volatility):
+                volatility = 0.02
 
             # Определение профиля объема
             volume_mean = df_5m['volume'].tail(20).mean()
@@ -689,7 +689,7 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                 return None
 
             try:
-                atr = float(df_1m['atr_14'].iloc[-1])
+                atr = float(df_1m['atr14'].iloc[-1])
             except (IndexError, ValueError, TypeError) as e:
                 self.logger.warning(f"Cannot extract ATR from 1m data: {e}")
                 return None
