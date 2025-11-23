@@ -516,272 +516,25 @@ class BotLifecycleManager:
             )
 
             async def on_candle_ready(symbol: str, candle: Dict[str, Any], recent: List[Dict[str, Any]]) -> None:
-                """Обработчик готовой свечи - сохраняет в БД и вызывает детекторы стратегии"""
-                timeframe_label = candle.get('_timeframe', '?')
-                logger.info(f"🎯 on_candle_ready received: {symbol} @ {candle['ts']} (_timeframe={timeframe_label})")
-
+                """
+                Обработчик готовой свечи - ТОЛЬКО логирование.
+                Вся торговая логика находится в EnhancedTradingBot.on_candle_ready()
+                """
                 try:
-                    # 1. Сохраняем свечу для истории
+                    # Сохраняем последнюю свечу для истории
                     if hasattr(trade_log, '_last_candle'):
                         trade_log._last_candle[symbol] = dict(candle)
-
+                    
+                    timeframe = candle.get('_timeframe', '?')
                     logger.debug(
-                        f"New candle for {symbol}: {candle['ts']} "
-                        f"O:{float(candle['open'])} H:{float(candle['high'])} "
-                        f"L:{float(candle['low'])} C:{float(candle['close'])}"
+                        f"Candle logged: {symbol} {timeframe} @ {candle['ts']} "
+                        f"O:{float(candle['open']):.2f} "
+                        f"H:{float(candle['high']):.2f} "
+                        f"L:{float(candle['low']):.2f} "
+                        f"C:{float(candle['close']):.2f}"
                     )
-
-                    # 2. Проверяем, что компоненты уже созданы
-                    if not self._components:
-                        logger.debug("Components not ready yet, skipping strategy analysis")
-                        return
-
-                    # 3. Определяем таймфрейм по интервалу свечи
-                    # ✅ Priority: use metadata from aggregator
-                    timeframe = candle.get('_timeframe')
-
-                    # Fallback: calculate from interval (backward compatibility)
-                    if not timeframe:
-                        interval_ms = candle.get('ts_close', 0) - candle.get('ts', 0) + 1
-                        if 59_000 <= interval_ms <= 61_000:  # ~60 секунд = 1m
-                            timeframe = '1m'
-                        elif 299_000 <= interval_ms <= 301_000:  # ~300 секунд = 5m
-                            timeframe = '5m'
-                        else:
-                            logger.debug(f"Skipping analysis for interval {interval_ms}ms (not 1m or 5m)")
-                            return
-
-                    # 5. Получаем компоненты
-                    main_bot = self._components.main_bot
-                    strategy = self._components.strategy
-
-                    if not main_bot or not strategy:
-                        logger.warning("main_bot or strategy not available")
-                        return
-
-                    # 6. Передаём свечу в main_bot для обновления буферов
-                    if hasattr(main_bot, 'handle_candle_ready'):
-                        try:
-                            await main_bot.handle_candle_ready(symbol, candle, recent)
-                        except Exception as handle_err:
-                            logger.error(f"Error in handle_candle_ready: {handle_err}")
-
-                    # ✅ НОВАЯ ЛОГИКА: Обработка 1m свечи с кэшированным 5m сигналом
-                    if timeframe == '1m':
-                        # Проверяем есть ли кэшированный 5m сигнал для этого символа
-                        strategy_impl = cast(ImprovedQualityTrendSystem, strategy)
-                        cached_signals = getattr(strategy_impl, '_cached_global_signal', {})
-
-                        # ✅ Проверяем кэш для конкретного символа
-                        if symbol in cached_signals:
-                            cached_signal = cached_signals[symbol]
-                            cache_age_ms = candle['ts'] - cached_signal.get('timestamp', 0)
-                            cache_status = cached_signal.get('status', 'unknown')
-                            was_used = cached_signal.get('used', False)
-
-                            # ✅ Проверяем только если disagreement и не использован
-                            if cache_age_ms < 300_000 and cache_status == 'disagreement' and not was_used:
-                                logger.info(
-                                    f"🔍 Rechecking 1m trend for cached 5m signal "
-                                    f"(age: {cache_age_ms / 1000:.0f}s, "
-                                    f"global_dir={cached_signal.get('global_direction')}, "
-                                    f"global_conf={cached_signal.get('global_confidence', 0):.2f}, "
-                                    f"status={cache_status})"
-                                )
-
-                                # Получаем data_provider
-                                core_bot = getattr(main_bot, 'core', None)
-                                if core_bot and hasattr(core_bot, 'data_provider'):
-                                    data_provider = core_bot.data_provider
-
-                                    try:
-                                        market_data_full = await data_provider.get_market_data(symbol, ['1m', '5m'])
-                                        if market_data_full and '1m' in market_data_full and '5m' in market_data_full:
-                                            # ✅ ВЫЗОВ МЕТОДА check_cached_global_signal с ПОЛНЫМИ данными
-                                            delayed_signal = await strategy_impl.check_cached_global_signal(
-                                                symbol,
-                                                market_data_full
-                                            )
-
-                                            if delayed_signal:
-                                                logger.info(
-                                                    f"🎯 DELAYED SIGNAL GENERATED: {symbol} "
-                                                    f"dir={delayed_signal.get('direction')} "
-                                                    f"conf={delayed_signal.get('confidence', 0):.2f} "
-                                                    f"entry={delayed_signal.get('entry_price', 0):.5f}"
-                                                )
-
-                                                # Обрабатываем сигнал
-                                                if hasattr(core_bot, '_process_trade_signal'):
-                                                    await core_bot._process_trade_signal(delayed_signal)
-                                                    logger.info(f"✅ Delayed signal processed for {symbol}")
-                                            else:
-                                                logger.debug(f"⏳ Still waiting for agreement on {symbol}")
-
-                                    except Exception as recheck_err:
-                                        logger.error(f"Error rechecking cached signal: {recheck_err}", exc_info=True)
-                            else:
-                                logger.debug(
-                                    f"Skipping cache check: age={cache_age_ms/1000:.0f}s, "
-                                    f"status={cache_status}, used={was_used}"
-                                )
-                        else:
-                            logger.debug(f"No cached 5m signal for {symbol} on 1m candle")
-
-                        # Для 1m свечи без кэша или с использованным кэшем - пропускаем анализ
-                        return
-
-                    # ✅ СУЩЕСТВУЮЩАЯ ЛОГИКА для 5m свечи
-                    if timeframe != '5m':
-                        logger.debug(f"Skipping analysis for {timeframe} candle (waiting for 5m)")
-                        return
-
-                    logger.info(f"🔍 Detected {timeframe} candle for {symbol}, triggering strategy analysis")
-
-                    # Запускаем анализ в фоновой задаче с дедупликацией
-                    async def analyze_and_trade():
-                        """Фоновая задача для анализа и торговли"""
-                        try:
-                            logger.info(f"🔧 Starting analysis task for {symbol}")
-
-                            # 7. ЗАПУСКАЕМ АНАЛИЗ ДЕТЕКТОРАМИ
-                            if not hasattr(strategy, 'generate_signal'):
-                                logger.error("❌ Strategy missing generate_signal method")
-                                return
-
-                            # Получаем data_provider из main_bot
-                            core_bot = getattr(main_bot, 'core', None)
-                            if not core_bot or not hasattr(core_bot, 'data_provider'):
-                                logger.error("❌ Cannot access data_provider")
-                                return
-
-                            data_provider = core_bot.data_provider
-
-                            # 8. Получаем market_data для анализа
-                            required_timeframes = ['1m', '5m']
-                            logger.info(f"🔧 Requesting market_data for {symbol}: {required_timeframes}")
-
-                            market_data = await data_provider.get_market_data(
-                                symbol,
-                                required_timeframes
-                            )
-
-                            logger.info(f"🔧 market_data received for {symbol}")
-
-                            if not market_data:
-                                logger.warning(f"⚠️ market_data is None for {symbol}")
-                                return
-
-                            missing_tfs = [tf for tf in required_timeframes if
-                                           tf not in market_data or market_data[tf].empty]
-                            if missing_tfs:
-                                logger.warning(f"⚠️ Missing or empty timeframes for {symbol}: {missing_tfs}")
-                                return
-
-                            data_info = {tf: len(df) for tf, df in market_data.items()}
-                            logger.info(f"📊 market_data ready for {symbol}: {data_info}")
-
-                            # 9. ВЫЗЫВАЕМ ДЕТЕКТОРЫ СТРАТЕГИИ
-                            logger.info(f"🚀 Calling strategy.generate_signal for {symbol}")
-
-                            strategy_impl = cast(ImprovedQualityTrendSystem, strategy)
-                            signal = await strategy_impl.generate_signal(market_data)
-
-                            if signal:
-                                logger.info(
-                                    f"✅ SIGNAL GENERATED: {symbol} "
-                                    f"dir={signal.get('direction')} "
-                                    f"conf={signal.get('confidence', 0):.2f} "
-                                    f"entry={signal.get('entry_price', 0):.5f} "
-                                    f"sl={signal.get('stop_loss', 0):.5f} "
-                                    f"tp={signal.get('take_profit', 0):.5f}"
-                                )
-
-                                # 10. Обрабатываем сигнал через EnhancedTradingBot
-                                if hasattr(core_bot, '_process_trade_signal'):
-                                    try:
-                                        await core_bot._process_trade_signal(signal)
-                                        logger.info(f"✅ Signal processed successfully for {symbol}")
-                                    except Exception as process_err:
-                                        logger.error(f"❌ Error processing signal: {process_err}", exc_info=True)
-                                else:
-                                    logger.warning("⚠️ core_bot missing _process_trade_signal method")
-                            else:
-                                logger.debug(f"ℹ️ No signal generated for {symbol} (strategy returned None)")
-
-                        except Exception as analysis_err:
-                            logger.error(f"❌ CRITICAL ERROR during strategy analysis: {analysis_err}", exc_info=True)
-                        finally:
-                            # ✅ ДОБАВИТЬ: Очистка активной задачи после завершения
-                            adapter = getattr(main_bot, '_adapter', None)
-                            if adapter and hasattr(adapter, '_active_analysis_tasks'):
-                                if symbol in adapter._active_analysis_tasks:
-                                    del adapter._active_analysis_tasks[symbol]
-                                    logger.debug(f"✅ Removed active analysis task for {symbol}")
-                                # Also cleanup creation time tracking
-                                if hasattr(adapter, '_task_creation_times') and symbol in adapter._task_creation_times:
-                                    del adapter._task_creation_times[symbol]
-
-                    # ✅ НОВАЯ ЛОГИКА: Проверка активной задачи перед созданием новой
-                    try:
-                        # Получаем адаптер
-                        adapter = getattr(main_bot, '_adapter', None)
-
-                        # ✅ DIAGNOSTIC: Log what we found
-                        virtual_ts = get_current_timestamp_ms()
-                        virtual_time_str = datetime.fromtimestamp(virtual_ts / 1000, UTC).strftime('%Y-%m-%d %H:%M:%S')
-                        candle_time_str = datetime.fromtimestamp(candle.get('ts', 0) / 1000, UTC).strftime('%Y-%m-%d %H:%M:%S')
-
-                        logger.debug(f"🔍 Adapter found: {adapter is not None}, symbol={symbol}")
-                        if adapter:
-                            logger.debug(f"🔍 Has _active_analysis_tasks: {hasattr(adapter, '_active_analysis_tasks')}")
-
-                        if adapter and hasattr(adapter, '_active_analysis_tasks'):
-                            # Проверяем, есть ли активная задача для этого символа
-                            if symbol in adapter._active_analysis_tasks:
-                                task = adapter._active_analysis_tasks[symbol]
-                                if not task.done():
-                                    logger.debug(
-                                        f"⏩ Skipping analysis for {symbol}: previous task still running"
-                                    )
-                                    return
-                                else:
-                                    # Задача завершена, удаляем из трекера
-                                    del adapter._active_analysis_tasks[symbol]
-                                    if hasattr(adapter, '_task_creation_times') and symbol in adapter._task_creation_times:
-                                        del adapter._task_creation_times[symbol]
-
-                        # Создаём новую задачу
-                        try:
-                            loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            loop = asyncio.get_event_loop()
-                        task = loop.create_task(analyze_and_trade())
-
-                        # Сохраняем ссылку на задачу
-                        if adapter and hasattr(adapter, '_active_analysis_tasks'):
-                            adapter._active_analysis_tasks[symbol] = task
-                            # Track task creation time
-                            if hasattr(adapter, '_task_creation_times'):
-                                adapter._task_creation_times[symbol] = loop.time()
-                            logger.info(
-                                f"✅ Analysis task created for {symbol} (tracked) | "
-                                f"virtual_time={virtual_time_str} | candle_ts={candle_time_str}"
-                            )
-                        else:
-                            logger.info(
-                                f"✅ Analysis task created for {symbol} (not tracked) | "
-                                f"virtual_time={virtual_time_str} | candle_ts={candle_time_str} | "
-                                f"adapter_found={adapter is not None}"
-                            )
-
-                    except RuntimeError:
-                        # Если нет активного loop, используем ensure_future
-                        task = asyncio.ensure_future(analyze_and_trade())
-                        logger.info(f"✅ Analysis task scheduled for {symbol}")
-
                 except Exception as err:
-                    logger.error(f"Error in on_candle_ready for {symbol}: {err}", exc_info=True)
+                    logger.error(f"Error logging candle for {symbol}: {err}")
 
             async def on_market_event(event: Dict[str, Any]) -> None:
                 """Обработчик рыночных событий"""
@@ -1850,38 +1603,24 @@ class BotLifecycleManager:
 
             async def handle_candle_ready(self, symbol: str, candle: Candle1m, recent_stack: List[Candle1m]) -> None:
                 """
-                ✅ УПРОЩЕНО: Обработка готовой свечи.
-                Свеча уже сохранена в БД агрегатором с индикаторами.
+                Обработка готовой свечи - делегирование в EnhancedTradingBot.
+                
+                MainBotAdapter - это только адаптер интерфейса, вся логика в core bot.
                 """
                 try:
-                    # ✅ DIAGNOSTIC: Confirm callback is working
-                    self.logger.info(
-                        f"🎯 MainBotAdapter.handle_candle_ready called: {symbol} @ {candle.get('ts')} "
+                    self.logger.debug(
+                        f"🎯 MainBotAdapter.handle_candle_ready: {symbol} @ {candle.get('ts')} "
                         f"(_timeframe={candle.get('_timeframe', 'unknown')})"
                     )
                     
-                    # Update stats: candles_processed for specific tracking, events_processed for general monitoring
+                    # Обновление статистики
                     self._stats["candles_processed"] += 1
                     self._stats["last_candle_ts"] = candle.get('ts')
                     self._stats["events_processed"] += 1
-
-                    # Определяем timeframe из интервала свечи
-                    ts = candle.get('ts', 0)
-                    ts_close = candle.get('ts_close', ts + 60_000)
-                    interval_ms = ts_close - ts
-
-                    if 59_000 <= interval_ms <= 61_000:  # ~60 секунд = 1m
-                        timeframe = '1m'
-                    elif 299_000 <= interval_ms <= 301_000:  # ~300 секунд = 5m
-                        timeframe = '5m'
-                    else:
-                        self.logger.debug(f"Unknown timeframe for interval {interval_ms}ms")
-                        timeframe = '1m'  # Fallback
-
-                    self.logger.debug(
-                        f"✅ Candle {symbol} {timeframe} already persisted by market_aggregator with indicators"
-                    )
-
+                    
+                    # ✅ Делегирование в EnhancedTradingBot
+                    await self.core.on_candle_ready(symbol, candle, recent_stack)
+                    
                 except Exception as e:
                     self.logger.error(f"Error in handle_candle_ready: {e}", exc_info=True)
         # ================================================================
@@ -1897,7 +1636,7 @@ class BotLifecycleManager:
             original_on_candle_ready = market_aggregator.on_candle_ready
 
             async def chained_on_candle_ready(symbol, candle, recent):
-                # Логируем в trade_log
+                # 1. Логируем в trade_log (только сохранение данных)
                 if trade_log and hasattr(trade_log, "on_candle_ready"):
                     try:
                         result = trade_log.on_candle_ready(symbol, candle, recent)
@@ -1906,13 +1645,14 @@ class BotLifecycleManager:
                     except Exception as e:
                         logger.error(f"Error in trade_log callback: {e}")
 
-                # Передаём в адаптер
+                # 2. Передаём в адаптер (который вызовет EnhancedTradingBot.on_candle_ready)
                 try:
                     await adapter.handle_candle_ready(symbol, candle, recent)
                 except Exception as e:
                     logger.error(f"Error in MainBotAdapter callback: {e}", exc_info=True)
 
             market_aggregator.on_candle_ready = chained_on_candle_ready
+            logger.info("✅ Chained callbacks: trade_log → MainBotAdapter → EnhancedTradingBot")
 
         logger.info("✅ MainBotAdapter created and subscribed")
         return cast(MainBotInterface, adapter)
