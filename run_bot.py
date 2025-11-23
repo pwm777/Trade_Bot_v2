@@ -450,39 +450,44 @@ class BotLifecycleManager:
             raise ComponentInitializationError(f"Failed to create components: {e}") from e
 
     def _create_logger(self) -> logging.Logger:
-        """Create and configure logger — idempotent, no duplicate handlers."""
-        logger = logging.getLogger("TradingBot")
+        """
+        Централизованная настройка логирования для всей системы.
+        Настраивает корневой логгер - все дочерние логгеры автоматически унаследуют конфигурацию.
+        """
+        # ✅ Настраиваем КОРНЕВОЙ логгер (root logger)
+        root_logger = logging.getLogger()
 
-        # === 1. Удаляем ВСЕ существующие handler'ы (гарантируем чистое состояние) ===
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
+        # Очищаем существующие handlers (идемпотентность)
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
 
-        # === 2. Устанавливаем уровень и отключаем propagate ===
-        logger.setLevel(self.config.get("log_level", "INFO"))
-        logger.propagate = False
+        # Устанавливаем уровень
+        root_logger.setLevel(self.config.get("log_level", "INFO"))
 
-        # === 3. Добавляем console handler ===
-        console_handler = logging.StreamHandler()
-        console_formatter = logging.Formatter(
+        # Формат сообщений
+        formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        console_handler.setFormatter(console_formatter)
-        logger.addHandler(console_handler)
 
-        # === 4. Опционально: файловый handler ===
+        # ✅ Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+        # ✅ File handler (если включен)
         try:
-            log_file = cfg.LOGGING_CONFIG.get("file_path")
+            log_file = cfg.LOGGING_CONFIG.get("file_path", "trading_bot.log")
             if log_file:
-                log_dir = os.path.dirname(log_file)
-                if log_dir:
-                    os.makedirs(log_dir, exist_ok=True)
-
                 file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-                file_handler.setFormatter(console_formatter)
-                logger.addHandler(file_handler)
-                logger.info(f"Logging to file: {log_file}")
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+                self.logger.info(f"✅ File logging enabled: {log_file}")
         except Exception as e:
-            logger.warning(f"Failed to setup file logging: {e}")
+            print(f"⚠️ Failed to setup file logging: {e}")
+
+        # ✅ Возвращаем именованный логгер для BotLifecycleManager
+        logger = logging.getLogger("TradingBot")
+        logger.info("Logging system initialized (centralized configuration)")
 
         return logger
 

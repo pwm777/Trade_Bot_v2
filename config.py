@@ -25,7 +25,6 @@ DATA_DIR.mkdir(exist_ok=True)
 MARKET_DB_DSN: str = f"sqlite:///{DATA_DIR}/market_data.sqlite"
 TRADING_DB_DSN: str = f"sqlite:///{DATA_DIR}/trading_data.sqlite"
 
-
 # Таблицы БД
 TABLES: Dict[str, str] = {
     "candles_1m":  "candles_1m",    # 1мин свечи + индикаторы 1m
