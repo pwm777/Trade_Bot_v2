@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 import asyncio
 import logging
-from typing import Dict, List, Optional, cast, Literal
+from typing import Dict, List, Optional, cast, Literal, Any
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -227,6 +227,93 @@ class EnhancedTradingBot:
             # не забываем сбросить флаг
             self.is_running = False
             raise
+
+    async def on_candle_ready(self, symbol: str, candle: Dict[str, Any], recent_candles: List[Dict[str, Any]]) -> None:
+        """
+        Главная точка входа для событий рынка.
+        Вызывается MarketAggregator при закрытии каждой свечи.
+        
+        Flow:
+            1. Проверка валидности (is_running, symbol, price)
+            2. Определение таймфрейма (из metadata или по длительности)
+            3. Сборка market_data через data_provider
+            4. Генерация сигналов (только на 5m свечах)
+            5. Управление позициями (на каждой свече)
+        
+        Args:
+            symbol: Торговый символ (ETHUSDT)
+            candle: Словарь с данными свечи (ts, open, high, low, close, volume, _timeframe)
+            recent_candles: Список последних N свечей того же таймфрейма
+        """
+        if not self.is_running:
+            return
+        
+        # Фильтр по символу (если бот работает только с одним)
+        if symbol != self.symbol:
+            return
+        
+        # 1. Определение таймфрейма
+        timeframe = candle.get('_timeframe')
+        if not timeframe:
+            # Fallback: определяем по длительности
+            if len(recent_candles) >= 2:
+                prev_ts = recent_candles[-2]['ts']
+                curr_ts = candle['ts']
+                duration_ms = curr_ts - prev_ts
+                if 59_000 <= duration_ms <= 61_000:
+                    timeframe = '1m'
+                elif 299_000 <= duration_ms <= 301_000:
+                    timeframe = '5m'
+                else:
+                    timeframe = '1m'  # default
+            else:
+                timeframe = '1m'
+        
+        # 2. Валидация цены
+        close_price = float(candle.get('close', 0))
+        if close_price <= 0:
+            self.logger.warning(f"Invalid close price in candle: {candle}")
+            return
+        
+        self.logger.info(
+            f"📊 New candle: {symbol} {timeframe} "
+            f"close={close_price:.2f} ts={candle['ts']}"
+        )
+        
+        # 3. Сборка актуальных market_data
+        try:
+            market_data = await self._get_market_data()
+            if not market_data or not _basic_validate_market_data(market_data):
+                self.logger.warning("Invalid or incomplete market_data, skipping analysis")
+                return
+        except Exception as e:
+            self.logger.error(f"Failed to get market_data: {e}")
+            return
+        
+        # 4. Генерация сигналов — ТОЛЬКО на 5m свечах
+        if timeframe == '5m':
+            try:
+                self.logger.info(f"🚀 Triggering signal generation for {symbol}")
+                signal = await self.trading_system.generate_signal(market_data)
+                
+                if signal:
+                    self.logger.info(
+                        f"✅ Signal generated: {symbol} "
+                        f"dir={signal.get('direction')} "
+                        f"conf={signal.get('confidence', 0):.2f} "
+                        f"entry={signal.get('entry_price', 0):.5f}"
+                    )
+                    await self._process_trade_signal(signal)
+                else:
+                    self.logger.debug(f"No signal generated for {symbol}")
+            except Exception as e:
+                self.logger.error(f"Error generating signal: {e}", exc_info=True)
+        
+        # 5. Управление позициями — на КАЖДОЙ свече (1m и 5m)
+        try:
+            await self._manage_existing_positions(market_data)
+        except Exception as e:
+            self.logger.error(f"Error managing positions: {e}", exc_info=True)
 
     async def _validate_connections(self):
         """Проверка подключений к данным и исполнению"""
