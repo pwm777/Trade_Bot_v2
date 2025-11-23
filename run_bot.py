@@ -1752,6 +1752,7 @@ class BotLifecycleManager:
                 self._stats = {
                     "signals_processed": 0,
                     "candles_processed": 0,
+                    "events_processed": 0,
                     "last_candle_ts": None
                 }
                 self._active_analysis_tasks: Dict[str, asyncio.Task] = {}
