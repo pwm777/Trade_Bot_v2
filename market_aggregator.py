@@ -977,6 +977,12 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
         return "backtest"
 
     async def _replay_loop(self) -> None:
+        # ✅ ДИАГНОСТИКА: Проверяем состояние при старте
+        self.logger.info(
+            f"🔍 _replay_loop STARTED: _is_running={self._is_running}, "
+            f"symbols={self.symbols}, start_ms={self.start_ms}, end_ms={self.end_ms}"
+        )
+
         sql = text("""
             SELECT '1m' as timeframe, symbol, ts, ts_close, open, high, low, close,
                    volume, count, quote, finalized, checksum, created_ts
@@ -995,6 +1001,8 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
 
         try:
             for symbol in self.symbols:
+                self.logger.info(f"📂 Processing symbol: {symbol}")
+
                 with self._engine.connect() as conn:
                     result = conn.execute(sql, {
                         "symbol": symbol,
@@ -1002,8 +1010,24 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                         "to_ts": self.end_ms
                     })
 
-                    for row in result.mappings():
+                    # ✅ ДИАГНОСТИКА: Предзагрузка и подсчёт свечей
+                    rows = list(result.mappings())
+                    self.logger.info(f"📊 Loaded {len(rows)} candles from DB for {symbol}")
+
+                    if len(rows) == 0:
+                        self.logger.warning(
+                            f"⚠️ No candles found in DB for {symbol} "
+                            f"in range [{self.start_ms}, {self.end_ms}]"
+                        )
+                        continue
+
+                    # ✅ Обрабатываем предзагруженные свечи
+                    for idx, row in enumerate(rows):
                         if not self._is_running:
+                            self.logger.warning(
+                                f"⚠️ _replay_loop stopped: _is_running=False "
+                                f"after processing {self._stats['candles_processed']} candles"
+                            )
                             return
 
                         ts = int(row["ts"])
@@ -1019,6 +1043,13 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                         candle_with_tf = dict(candle)
                         candle_with_tf["_timeframe"] = timeframe
 
+                        # ✅ ДИАГНОСТИКА: Логируем первую свечу
+                        if idx == 0:
+                            self.logger.info(
+                                f"🎯 Processing first candle: {symbol} {timeframe} @ {ts} "
+                                f"(total: {len(rows)} candles)"
+                            )
+
                         try:
                             call = self._original_on_candle_ready(
                                 symbol,
@@ -1028,7 +1059,10 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                             if asyncio.iscoroutine(call):
                                 await call
                         except Exception as e:
-                            self.logger.error(f"Error in on_candle_ready [{symbol} {timeframe} {ts}]", exc_info=True)
+                            self.logger.error(
+                                f"❌ Error in on_candle_ready [{symbol} {timeframe} {ts}]: {e}",
+                                exc_info=True
+                            )
 
                         with self._main_lock:
                             self._stats["candles_processed"] += 1
@@ -1037,18 +1071,29 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                         if self.speed > 0:
                             await asyncio.sleep(0.001 / self.speed)
 
-            # УСПЕШНОЕ ЗАВЕРШЕНИЕ — ВОТ ЗДЕСЬ!
+                    # ✅ ДИАГНОСТИКА: Логируем завершение обработки символа
+                    self.logger.info(
+                        f"✅ Completed processing {symbol}: "
+                        f"{self._stats['candles_processed']} total candles processed"
+                    )
+
+            # ✅ УСПЕШНОЕ ЗАВЕРШЕНИЕ
             with self._main_lock:
                 self._stats["backtest_completed"] = True
                 self._stats["is_running"] = False
-            self.logger.info("Backtest replay completed successfully — backtest_completed = True")
+
+            self.logger.info(
+                f"🏁 Backtest replay completed successfully: "
+                f"{self._stats['candles_processed']} candles processed"
+            )
 
         except Exception as e:
-            self.logger.error("Replay loop failed", exc_info=True)
+            self.logger.error(f"❌ Replay loop failed: {e}", exc_info=True)
             with self._main_lock:
                 self._stats["backtest_completed"] = False
         finally:
             clear_simulated_time()
+            self.logger.info("🔄 Simulated time cleared")
 
     async def start_async(self, symbols: List[str], *, history_window: int = 50) -> None:
         self._active_symbols = symbols
