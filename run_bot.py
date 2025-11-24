@@ -1364,9 +1364,9 @@ class BotLifecycleManager:
                         'correlation_id': trade_signal.get('client_order_id') or create_correlation_id(),
                         'confidence': trade_signal.get('confidence', 0.0),
                         'metadata': trade_signal.get('metadata', {}),
-                        'risk_context': {
-                            'decision_price': entry_price
-                        }
+                        'risk_context': trade_signal.get('risk_context') or {'decision_price': entry_price},
+                        'direction': direction_int,
+                        'dir': direction_int,
                     }
 
                     self.logger.info(

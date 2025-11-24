@@ -555,25 +555,31 @@ class EnhancedTradingBot:
                     f"side={order_req['side']}"
                 )
 
-                # ✅ ШАГ 3: Отправляем OrderReq на биржу через ExchangeManager
-                exchange_method = getattr(self.execution_engine, 'place_order', None)
+                # ✅ ШАГ 3: Отправляем OrderReq напрямую в ExchangeManager
+                exchange_manager = getattr(self.execution_engine, 'exchange_manager', None)
+                if exchange_manager is None:
+                    # fallback: try `em` (common alias)
+                    exchange_manager = getattr(self.execution_engine, 'em', None)
 
-                if not exchange_method:
+                if not exchange_manager or not hasattr(exchange_manager, 'place_order'):
+                    self.logger.error("❌ ExchangeManager.place_order not available for direct execution")
                     execution_result = {
                         'success': False,
-                        'error': 'ExchangeManager.place_order not available',
+                        'error': 'ExchangeManager not available',
                         'position_id': None
                     }
                 else:
-                    # Отправляем на биржу
-                    exchange_result = exchange_method(order_req)
+                    place_order_method = exchange_manager.place_order
+                    # ✅ Теперь передаём order_req в правильный метод
+                    exchange_result = place_order_method(order_req)
+
                     if asyncio.iscoroutine(exchange_result):
                         exchange_result = await exchange_result
 
+                    # Продолжаем как раньше...
                     if not isinstance(exchange_result, dict):
                         exchange_result = {"success": bool(exchange_result)}
 
-                    # ✅ Проверяем статус от биржи
                     status = exchange_result.get("status", "")
                     success = status in ["NEW", "FILLED", "WORKING"] or exchange_result.get("success", False)
 
@@ -587,9 +593,11 @@ class EnhancedTradingBot:
                     }
 
                     if not success:
-                        execution_result['error'] = exchange_result.get("error_message") or exchange_result.get(
-                            "error") or "Unknown error"
-
+                        execution_result['error'] = (
+                            exchange_result.get("error_message") or
+                            exchange_result.get("error") or
+                            "Unknown error"
+                        )
             # ✅ ШАГ 4: Логирование с risk_context и slippage
             if trade_signal.get('stops_precomputed', False) and order_req:
                 risk_ctx = trade_signal['risk_context']
