@@ -970,32 +970,28 @@ class BotLifecycleManager:
             EXECUTION_MODE = self.config.get("execution_mode", "DEMO")
             history_window = self.config.get("history_window", 50)
 
-            # ✅ ИСПРАВЛЕНИЕ: Разделяем BACKTEST и LIVE/DEMO режимы
+            # ✅ КРИТИЧНОЕ ИСПРАВЛЕНИЕ: Разделяем BACKTEST и LIVE/DEMO режимы
             if EXECUTION_MODE == "BACKTEST":
                 self.logger.info(f"🚀 Starting BACKTEST mode for {symbols}")
 
-                # Запускаем market aggregator
+                # ✅ ШАГ 1: Инициализируем торговый бот (БЕЗ polling loop)
+                start_method = getattr(self._components.main_bot, "start", None)
+                if callable(start_method):
+                    result = start_method()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    self.logger.info("✅ EnhancedTradingBot initialized and ready for backtest")
+                else:
+                    self.logger.error("❌ Main bot does not implement start(); backtest will fail")
+                    raise BotLifecycleError("Main bot missing start() method")
+
+                # ✅ ШАГ 2: Запускаем воспроизведение свечей (блокирующий вызов)
+                self.logger.info("⏳ Starting backtest replay (blocking mode)...")
                 await self._components.market_aggregator.start_async(symbols, history_window=history_window)
 
-                # ✅ ЖДЁМ завершения replay задачи
-                self.logger.info("⏳ Waiting for backtest replay to complete...")
-                replay_task = self._components.market_aggregator._running_tasks.get("replay")
-
-                if replay_task:
-                    self.logger.info(f"🔍 Replay task found: {id(replay_task)}, done={replay_task.done()}")
-                    try:
-                        # Ждём выполнения всех свечей
-                        await replay_task
-                        self.logger.info("✅ Backtest replay completed successfully!")
-                    except asyncio.CancelledError:
-                        self.logger.warning("⚠️ Replay task was cancelled")
-                    except Exception as e:
-                        self.logger.error(f"❌ Replay task failed: {e}", exc_info=True)
-                else:
-                    self.logger.error("❌ Replay task not found in _running_tasks!")
-
-                # ✅ После завершения бэктеста НЕ запускаем main_bot.start() и мониторинг
-                self.logger.info("🏁 Backtest finished, skipping main_bot.start() and monitoring")
+                # ✅ ШАГ 3: Бэктест завершён (start_async уже завершился = все свечи обработаны)
+                self.logger.info("✅ Backtest replay completed (blocking mode)")
+                self.logger.info("🏁 Backtest finished, skipping main_bot monitoring")
                 self._emit_event("BACKTEST_COMPLETED", {"execution_mode": EXECUTION_MODE})
 
                 # Завершаем метод start() для BACKTEST

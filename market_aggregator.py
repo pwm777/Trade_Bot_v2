@@ -1057,7 +1057,23 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                                 recent
                             )
                             if asyncio.iscoroutine(call):
-                                await call
+                                # ✅ КРИТИЧНО: Добавляем таймаут 10 секунд
+                                try:
+                                    await asyncio.wait_for(call, timeout=10.0)
+                                except asyncio.TimeoutError:
+                                    self.logger.error(
+                                        f"⏱️ TIMEOUT in on_candle_ready [{symbol} {timeframe} {ts}] "
+                                        f"after 10s - skipping candle"
+                                    )
+                                    continue  # Пропускаем зависшую свечу
+
+                            # ✅ ДИАГНОСТИКА: Логируем прогресс каждые 100 свечей
+                            if idx > 0 and idx % 100 == 0:
+                                self.logger.info(
+                                    f"📊 Progress: {idx}/{len(rows)} candles processed "
+                                    f"({(idx / len(rows) * 100):.1f}%)"
+                                )
+
                         except Exception as e:
                             self.logger.error(
                                 f"❌ Error in on_candle_ready [{symbol} {timeframe} {ts}]: {e}",
