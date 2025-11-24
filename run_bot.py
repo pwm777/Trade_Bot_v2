@@ -836,6 +836,7 @@ class BotLifecycleManager:
 
             self._components = await self._create_components()
             self._emit_event("COMPONENTS_CREATED", {"components": list(self._components.__dict__.keys())})
+
             # Загрузка исторических данных перед разогревом бота
             if self._components.history_manager:
                 symbols = self.config.get("symbols", [])
@@ -887,9 +888,9 @@ class BotLifecycleManager:
                         self._components.market_aggregator.set_history_ready()
 
                 except asyncio.TimeoutError:
-                    error_msg = "History loading timeout exceeded (300s)"
+                    error_msg = "History loading timeout exceeded (120s)"
                     self.logger.error(error_msg)
-                    self._emit_event("HISTORY_LOAD_TIMEOUT", {"timeout": 300.0})
+                    self._emit_event("HISTORY_LOAD_TIMEOUT", {"timeout": 120.0})
                     raise BotLifecycleError(error_msg)
                 except Exception as e:
                     error_msg = f"Failed to load history: {e}"
@@ -967,42 +968,53 @@ class BotLifecycleManager:
 
             symbols = self.config.get("symbols", [])
             EXECUTION_MODE = self.config.get("execution_mode", "DEMO")
+            history_window = self.config.get("history_window", 50)
 
-            # ✅ ОБЯЗАТЕЛЬНО: объявляем history_window
-            history_window = self.config.get("history_window", 50)  # Значение по умолчанию — 50 свечей
-
+            # ✅ ИСПРАВЛЕНИЕ: Разделяем BACKTEST и LIVE/DEMO режимы
             if EXECUTION_MODE == "BACKTEST":
-                self.logger.info(f"Starting MarketAggregator in BACKTEST mode for symbols: {symbols}")
-                backtest_cfg = self.config.get("backtest", {})
-                from_ts = backtest_cfg.get("start_time_ms")
-                to_ts = backtest_cfg.get("end_time_ms")
-                speed = backtest_cfg.get("speed", 1.0)
+                self.logger.info(f"🚀 Starting BACKTEST mode for {symbols}")
 
-
-                # ✅ Вместо этого — обычный start_async
+                # Запускаем market aggregator
                 await self._components.market_aggregator.start_async(symbols, history_window=history_window)
 
+                # ✅ ЖДЁМ завершения replay задачи
+                self.logger.info("⏳ Waiting for backtest replay to complete...")
+                replay_task = self._components.market_aggregator._running_tasks.get("replay")
+
+                if replay_task:
+                    self.logger.info(f"🔍 Replay task found: {id(replay_task)}, done={replay_task.done()}")
+                    try:
+                        # Ждём выполнения всех свечей
+                        await replay_task
+                        self.logger.info("✅ Backtest replay completed successfully!")
+                    except asyncio.CancelledError:
+                        self.logger.warning("⚠️ Replay task was cancelled")
+                    except Exception as e:
+                        self.logger.error(f"❌ Replay task failed: {e}", exc_info=True)
+                else:
+                    self.logger.error("❌ Replay task not found in _running_tasks!")
+
+                # ✅ После завершения бэктеста НЕ запускаем main_bot.start() и мониторинг
+                self.logger.info("🏁 Backtest finished, skipping main_bot.start() and monitoring")
+                self._emit_event("BACKTEST_COMPLETED", {"execution_mode": EXECUTION_MODE})
+
+                # Завершаем метод start() для BACKTEST
+                return
+
+            # ✅ Для LIVE/DEMO режимов — обычный запуск
             else:
                 self.logger.info(f"Starting MarketAggregator in {EXECUTION_MODE} mode for symbols: {symbols}")
                 await self._components.market_aggregator.start_async(symbols, history_window=history_window)
 
-            start_method = getattr(self._components.main_bot, "start", None)
-            if callable(start_method):
-                result = start_method()
-                if asyncio.iscoroutine(result):
-                    await result
-                self.logger.info("Main bot started")
-            else:
-                self.logger.error("Main bot does not implement start(); trading loop will not run")
-
-                # Запуск компонентов main_bot (если есть метод start)
-                if hasattr(self._components.main_bot, "start"):
-                    # Запускаем торговую петлю как фоновую задачу
-                    #self._trading_task = asyncio.create_task(self._components.main_bot.start())
-                    self.logger.info("Main trading bot task started")
+                # Запускаем main_bot.start()
+                start_method = getattr(self._components.main_bot, "start", None)
+                if callable(start_method):
+                    result = start_method()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    self.logger.info("Main bot started")
                 else:
                     self.logger.error("Main bot does not implement start(); trading loop will not run")
-                    self._trading_task = None
 
                 # Устанавливаем обработчики сигналов для graceful shutdown
                 self._setup_signal_handlers()
