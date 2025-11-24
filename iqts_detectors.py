@@ -293,7 +293,7 @@ class RoleBasedOnlineTrendDetector(Detector):
         }
 
         self.min_confidence = role_thresholds.get(role, 0.55)
-        self.required_warmup = 50
+        self.required_warmup = 1
 
         self.logger.info(
             f"Initialized {role}_{timeframe} detector:\n"

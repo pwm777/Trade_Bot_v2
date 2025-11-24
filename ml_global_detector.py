@@ -70,7 +70,7 @@ class MLGlobalDetector(Detector):
         # Порог и warmup — будут заменены при загрузке модельного пакета
         self.min_confidence = 0.53
         self.scaler = None
-        self.required_warmup = 60  # общий тёплый старт (может быть больше, чем lookback)
+        self.required_warmup = 20  # общий тёплый старт (может быть больше, чем lookback)
 
         # Decision policy (из trainer): tau/delta/cooldown/bars_per_day
         self.decision_policy: Optional[Dict[str, Any]] = None

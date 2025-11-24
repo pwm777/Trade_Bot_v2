@@ -910,7 +910,7 @@ class ModelTrainer:
             'lookback': self.lookback,
             'timeframe': '5m',
             'min_confidence': 0.65,
-            'required_warmup': 60
+            'required_warmup': 20
         }
 
         joblib.dump(model_package, model_filename)
