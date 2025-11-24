@@ -1009,16 +1009,13 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                         ts = int(row["ts"])
                         set_simulated_time(ts)
 
-                        # Подготовка свечи
                         candle_dict = dict(row)
                         timeframe = candle_dict.pop("timeframe", "1m")
                         candle = self._candle_dict_to_candle1m(candle_dict)
 
-                        # Добавляем в буфер
                         self._symbol_buffers[symbol].append(candle)
                         recent = list(self._symbol_buffers[symbol])[-50:]
 
-                        # Передаём копию с _timeframe — безопасно
                         candle_with_tf = dict(candle)
                         candle_with_tf["_timeframe"] = timeframe
 
@@ -1031,26 +1028,25 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
                             if asyncio.iscoroutine(call):
                                 await call
                         except Exception as e:
-                            self.logger.error(
-                                f"Error in on_candle_ready [{symbol} {timeframe} {ts}]",
-                                exc_info=True
-                            )
+                            self.logger.error(f"Error in on_candle_ready [{symbol} {timeframe} {ts}]", exc_info=True)
 
-                        # Статистика
                         with self._main_lock:
                             self._stats["candles_processed"] += 1
                             self._stats["last_candle_ts"] = ts
 
-                        # Скорость воспроизведения
                         if self.speed > 0:
                             await asyncio.sleep(0.001 / self.speed)
 
+            # УСПЕШНОЕ ЗАВЕРШЕНИЕ — ВОТ ЗДЕСЬ!
             with self._main_lock:
                 self._stats["backtest_completed"] = True
-                self.logger.info("Backtest replay completed successfully")
+                self._stats["is_running"] = False
+            self.logger.info("Backtest replay completed successfully — backtest_completed = True")
 
         except Exception as e:
             self.logger.error("Replay loop failed", exc_info=True)
+            with self._main_lock:
+                self._stats["backtest_completed"] = False
         finally:
             clear_simulated_time()
 
