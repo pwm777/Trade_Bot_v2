@@ -974,18 +974,43 @@ class BotLifecycleManager:
             if EXECUTION_MODE == "BACKTEST":
                 self.logger.info(f"🚀 Starting BACKTEST mode for {symbols}")
 
-                # ✅ ШАГ 1: Инициализируем торговый бот (БЕЗ polling loop)
+                # ✅ ШАГ 1: Инициализируем торговый бот
                 start_method = getattr(self._components.main_bot, "start", None)
                 if callable(start_method):
                     result = start_method()
                     if asyncio.iscoroutine(result):
                         await result
                     self.logger.info("✅ EnhancedTradingBot initialized and ready for backtest")
-                else:
-                    self.logger.error("❌ Main bot does not implement start(); backtest will fail")
-                    raise BotLifecycleError("Main bot missing start() method")
 
-                # ✅ ШАГ 2: Запускаем воспроизведение свечей (блокирующий вызов)
+                # Обновить _original_on_candle_ready в BacktestMarketAggregatorFixed
+                if hasattr(self._components.market_aggregator, '_original_on_candle_ready'):
+                    # Получаем правильный chained callback из main_bot
+                    if hasattr(self._components.main_bot, 'core'):
+                        core_adapter = self._components.main_bot  # MainBotAdapter
+
+                        # Создаём правильный callback
+                        async def backtest_chained_callback(symbol, candle, recent):
+                            # 1. trade_log
+                            if self._components.trade_log and hasattr(self._components.trade_log, "on_candle_ready"):
+                                try:
+                                    result = self._components.trade_log.on_candle_ready(symbol, candle, recent)
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                                except Exception as e:
+                                    self.logger.error(f"Error in trade_log callback: {e}")
+
+                            # 2. main_bot adapter
+                            try:
+                                await core_adapter.handle_candle_ready(symbol, candle, recent)
+                            except Exception as e:
+                                self.logger.error(f"Error in MainBotAdapter callback: {e}", exc_info=True)
+
+                        # ✅ ЗАМЕНЯЕМ callback ДО start_async()
+                        self._components.market_aggregator._original_on_candle_ready = backtest_chained_callback
+                        self.logger.info(
+                            "✅ Backtest callback chain updated: trade_log → MainBotAdapter → EnhancedTradingBot")
+
+                # ✅ ШАГ 2: Запускаем воспроизведение свечей
                 self.logger.info("⏳ Starting backtest replay (blocking mode)...")
                 await self._components.market_aggregator.start_async(symbols, history_window=history_window)
 
