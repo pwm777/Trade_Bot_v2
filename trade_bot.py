@@ -410,16 +410,24 @@ class EnhancedTradingBot:
 
             from iqts_standards import create_correlation_id
 
+            # ✅ ИСПРАВЛЕНО: Берём полный risk_context из входящего сигнала
+            risk_context = trade_signal.get('risk_context', {})
+
+            # Если risk_context пустой - добавляем хотя бы decision_price
+            if not risk_context:
+                risk_context = {'decision_price': entry_price}
+            elif 'decision_price' not in risk_context:
+                risk_context['decision_price'] = entry_price
+
             pm_signal = {
                 'symbol': symbol,
-                'intent': intent,  # ✅ Intent-based
-                'decision_price': entry_price,  # ✅ Для PositionManager
+                'intent': intent,
+                'decision_price': entry_price,
                 'correlation_id': trade_signal.get('client_order_id') or create_correlation_id(),
                 'confidence': confidence,
                 'metadata': trade_signal.get('metadata', {}),
-                'risk_context': {
-                    'decision_price': entry_price  # ✅ Для расчета размера
-                }
+                # ✅ ИСПРАВЛЕНО: Используем полный risk_context из сигнала
+                'risk_context': risk_context
             }
 
             self.logger.info(
@@ -427,6 +435,17 @@ class EnhancedTradingBot:
                 f"intent={intent}, decision_price={entry_price:.2f}, "
                 f"correlation_id={pm_signal['correlation_id'][:16]}..."
             )
+
+            # ✅ ДОБАВЛЕНО: Логируем наличие risk_context
+            if 'position_size' in risk_context:
+                self.logger.info(
+                    f"  risk_context included: "
+                    f"position_size={risk_context.get('position_size', 0):.4f}, "
+                    f"SL={risk_context.get('initial_stop_loss', 0):.2f}, "
+                    f"TP={risk_context.get('take_profit', 0):.2f}"
+                )
+            else:
+                self.logger.warning("  risk_context missing position_size - will be calculated later")
 
             return pm_signal
 

@@ -592,9 +592,6 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             trend_confidence = metadata.get('trend_confidence', 0.0)
 
             # ✅ ШАГ 4: Принимаем решение о кэшировании
-            # КЭШИРУЕМ если:
-            # 1. Глобальный сигнал НЕ FLAT (direction != 0)
-            # 2. Уверенность достаточная
             should_cache = (
                     global_direction is not None and
                     global_direction != 0 and
@@ -635,13 +632,12 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                 )
             else:
                 print(f"   ⏭️ NOT caching (should_cache=False)")
-                # Очищаем кэш если сигнал слабый или FLAT
                 if symbol in self._cached_global_signal:
                     print(f"   🗑️ Clearing existing cache for {symbol}")
                     self.logger.info(f"🗑️ Clearing cache for {symbol} (weak or FLAT signal)")
                     del self._cached_global_signal[symbol]
 
-            print()  # Пустая строка для читаемости
+            print()
 
             # ✅ ШАГ 5: Если нет подтверждения - возвращаем None
             if not result['ok']:
@@ -657,7 +653,7 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             direction = int(result['direction'])
             confidence = result['confidence']
 
-            # Получаем текущую цену для entry_price (БЕЗОПАСНО)
+            # Получаем текущую цену для entry_price
             df_5m = market_data.get('5m')
             if df_5m is None or df_5m.empty:
                 self.logger.warning(f"No 5m data available for {symbol}")
@@ -683,7 +679,6 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                 self.logger.warning(f"No 1m data for ATR")
                 return None
 
-            # ATR уже рассчитан в свече
             if 'atr14' not in df_1m.columns:
                 self.logger.warning(f"No 'atr14' column in 1m data")
                 return None
@@ -701,14 +696,54 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             # ✅ ШАГ 9: Обновляем режим рынка
             await self._update_market_regime(market_data)
 
-            # ✅ ШАГ 10: Формируем сигнал
+            # ✅ ШАГ 10: ВЫЗЫВАЕМ RISK_MANAGER ДЛЯ РАСЧЁТА POSITION_SIZE, SL, TP
+            if not self.risk_manager:
+                self.logger.error("❌ RiskManager not initialized! Cannot calculate risk_context")
+                return None
+
+            # Формируем DetectorSignal для RiskManager
+            detector_signal = {
+                'ok': True,
+                'direction': direction,
+                'confidence': confidence,
+                'reason': result.get('reason', 'unknown')
+            }
+
+            # Получаем regime
+            current_regime = self.current_regime.regime if self.current_regime else 'uncertain'
+
+            # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Вызываем RiskManager.calculate_risk_context()
+            risk_context = self.risk_manager.calculate_risk_context(
+                signal=detector_signal,
+                current_price=current_price,
+                atr=atr,
+                account_balance=self.account_balance,
+                regime=current_regime
+            )
+
+            # Проверяем что risk_context корректен
+            if risk_context.get('position_size', 0) <= 0:
+                self.logger.warning(f"RiskManager returned zero position_size, skipping signal")
+                return None
+
+            self.logger.info(
+                f"✅ RiskManager calculated: "
+                f"position_size={risk_context.get('position_size', 0):.4f}, "
+                f"SL={risk_context.get('initial_stop_loss', 0):.2f}, "
+                f"TP={risk_context.get('take_profit', 0):.2f}"
+            )
+
+            # ✅ ШАГ 11: Формируем сигнал с risk_context
             signal = {
                 'symbol': symbol,
                 'direction': direction,
                 'confidence': confidence,
                 'entry_price': current_price,
                 'atr': atr,
-                'regime': self.current_regime.regime if self.current_regime else 'uncertain',
+                'regime': current_regime,
+                # ✅ ДОБАВЛЕНО: Полный risk_context
+                'risk_context': risk_context,
+                'stops_precomputed': True,
                 'metadata': {
                     **metadata,
                     'signal_source': 'generate_signal_agreement',
