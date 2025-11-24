@@ -843,22 +843,43 @@ class BotLifecycleManager:
 
                 self.logger.info(f"Loading {days_back} days of history for {symbols}...")
                 try:
-                    history_results = await asyncio.wait_for(
-                        self._components.history_manager.load_history(
-                            symbols=symbols,
-                            days_back=days_back,
-                            check_existing=True
-                        ),
-                        timeout=300.0  # 5 минут на загрузку истории
-                    )
-
-                    # Логируем результаты загрузки
-                    for symbol, counts in history_results.items():
-                        self.logger.info(
-                            f"History loaded for {symbol}: "
-                            f"1m={counts.get('1m', 0)}, "
-                            f"5m={counts.get('5m', 0)} candles"
+                    if self.config.get("execution_mode") == "BACKTEST":
+                        self.logger.info("BACKTEST: пропускаем загрузку истории с Binance")
+                        history_results = {
+                            "loaded": True,
+                            "backtest_skip": True,
+                            "symbols": symbols,
+                            "source": "local_database"
+                        }
+                        self._emit_event("HISTORY_LOADED", {"results": history_results})
+                    else:
+                        self.logger.info("LIVE/DEMO mode → loading recent history from Binance")
+                        history_results = await asyncio.wait_for(
+                            self._components.history_manager.load_history(
+                                symbols=self.config["symbols"],
+                                days=1
+                            ),
+                            timeout=120.0
                         )
+
+                    # === Правильная обработка результата загрузки истории ===
+                    if isinstance(history_results, dict):
+                        if history_results.get("backtest_skip") or history_results.get("source") == "local_db_skip":
+                            self.logger.info(
+                                "BACKTEST: загрузка истории с Binance пропущена — используются данные из локальной БД")
+                        elif "loaded" in history_results and not history_results.get("loaded", True):
+                            self.logger.warning(
+                                f"Загрузка истории не удалась: {history_results.get('error', 'unknown error')}")
+                        else:
+                            # Это нормальный результат от Binance — можно логировать по символам
+                            for symbol, counts in history_results.items():
+                                if isinstance(counts, dict):
+                                    self.logger.info(
+                                        f"History loaded for {symbol}: "
+                                        f"1m={counts.get('1m', 0)}, 5m={counts.get('5m', 0)} candles"
+                                    )
+                    else:
+                        self.logger.warning(f"Неожиданный формат history_results: {type(history_results)}")
 
                     self._emit_event("HISTORY_LOADED", {"results": history_results})
                     # ✅ Устанавливаем флаг готовности истории в агрегаторе
