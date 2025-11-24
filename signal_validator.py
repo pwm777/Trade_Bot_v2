@@ -41,14 +41,14 @@ class SignalValidator:
     Централизованный валидатор сигналов
     Проверяет DetectorSignal, TradeSignal, TradeSignalIQTS на корректность
     """
-    
-    def __init__(self, strict_mode: bool = False):
+
+    def __init__(self, strict_mode: bool = False, logger: Optional[logging.Logger] = None):
         """
         Args:
             strict_mode: Если True, warnings считаются ошибками
         """
         self.strict_mode = strict_mode
-        self.logger = logger
+        self.logger = logger or logging.getLogger(__name__)
     
     # === DetectorSignal валидация ===
 

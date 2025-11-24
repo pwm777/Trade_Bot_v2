@@ -427,7 +427,9 @@ class EnhancedTradingBot:
                 'confidence': confidence,
                 'metadata': trade_signal.get('metadata', {}),
                 # ✅ ИСПРАВЛЕНО: Используем полный risk_context из сигнала
-                'risk_context': risk_context
+                'risk_context': risk_context,
+                'direction': direction_int,  # -1, 0, 1 → для совместимости
+                'dir': direction_int,
             }
 
             self.logger.info(
@@ -453,7 +455,7 @@ class EnhancedTradingBot:
             self.logger.error(f"Error converting IQTS signal to TradeSignal: {e}", exc_info=True)
             return None
 
-    @validate_signal(signal_type="trade_iqts", layer="bot_process", strict=False)
+    @validate_signal(signal_type="trade_iqts")
     async def _process_trade_signal(self, trade_signal: TradeSignalIQTS):
         """
         ✅ ОБНОВЛЕНО: Обработка через PositionManager с поддержкой risk_context.
