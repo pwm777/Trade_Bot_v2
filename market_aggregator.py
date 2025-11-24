@@ -1056,9 +1056,20 @@ class BacktestMarketAggregatorFixed(BaseMarketAggregator):
         self._stats["is_running"] = True
         self._stats["active_symbols"] = symbols
         self._stats["connection_state"] = "connected"
+        self._stats["backtest_completed"] = False
 
-        self._create_or_cancel_task("replay", self._replay_loop())
-        self.logger.info(f"Backtest started: {symbols} from {self.start_ms} to {self.end_ms}")
+        for s in symbols:
+            self._symbol_buffers[s] = deque(maxlen=500)
+
+        self.logger.info(f"🚀 Backtest starting: {symbols} from {self.start_ms} to {self.end_ms}")
+
+        #  Запускаем replay как фоновую задачу И сразу даём ей выполниться
+        replay_task = self._create_or_cancel_task("replay", self._replay_loop())
+
+        # ✅ Даём event loop возможность запустить задачу
+        await asyncio.sleep(0)  # Передаём управление event loop
+
+        self.logger.info(f"✅ Replay task created and scheduled: task_id={id(replay_task)}")
 
     async def wait_for_completion(self) -> None:
         while self._is_running and not self._stats.get("backtest_completed", False):
