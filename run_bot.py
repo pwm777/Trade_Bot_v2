@@ -392,6 +392,39 @@ class BotLifecycleManager:
             # --- Exchange Manager (нужен до PositionManager для связки) ---
             exchange_manager = await self._create_exchange_manager(trade_log, logger)
 
+            # 🔗 NEW: подключаем price_feed к ExchangeManager из TradingLogger._last_candle
+            try:
+                if hasattr(exchange_manager, "set_price_feed_callback"):
+                    def price_feed(symbol: str) -> Optional[float]:
+                        """
+                        Возвращает последнюю цену закрытия для symbol из TradingLogger._last_candle.
+                        Используется ExchangeManager для исполнения MARKET-ордеров и стопов.
+                        """
+                        try:
+                            last_candles = getattr(trade_log, "_last_candle", None)
+                            if not last_candles:
+                                return None
+
+                            candle = last_candles.get(symbol)
+                            if not candle:
+                                return None
+
+                            close_val = candle.get("close")
+                            if close_val is None:
+                                return None
+
+                            return float(close_val)
+                        except Exception as e:
+                            logger.error(f"Price feed error for {symbol}: {e}")
+                            return None
+
+                    exchange_manager.set_price_feed_callback(price_feed)
+                    logger.info("🔗 Price feed connected: ExchangeManager ⇐ TradingLogger._last_candle")
+                else:
+                    logger.warning("⚠️ ExchangeManager has no set_price_feed_callback, price feed not connected")
+            except Exception as e:
+                logger.error(f"Failed to connect price feed to ExchangeManager: {e}")
+
             # --- PositionManager with DI ---
             position_manager = await self._create_position_manager(
                 trade_log=trade_log,
@@ -1486,17 +1519,181 @@ class BotLifecycleManager:
                     }
 
             async def close_position(self, position_id: str) -> Dict:
-                """Закрыть позицию через ExchangeManager"""
+                """
+                Закрыть позицию через PositionManager + ExchangeManager.
+
+                position_id = f"{symbol}_{client_order_id}" (как в place_order)
+                """
                 try:
-                    meth = getattr(self.em, "close_position", None)
-                    if callable(meth):
-                        res = meth(position_id)
-                        if asyncio.iscoroutine(res):
-                            res = await res
-                        if isinstance(res, dict):
-                            return res
-                        return {"success": bool(res)}
-                    return {"success": False, "error": "no close_position method"}
+                    # ─────────────────────────────
+                    # 1. Парсим symbol из position_id
+                    # ─────────────────────────────
+                    if "_" not in position_id:
+                        return {
+                            "success": False,
+                            "error": f"Invalid position_id format: {position_id}"
+                        }
+
+                    symbol, _ = position_id.split("_", 1)
+
+                    if not self.position_manager:
+                        return {
+                            "success": False,
+                            "error": "PositionManager not available"
+                        }
+
+                    # ─────────────────────────────
+                    # 2. Берём снапшот позиции из PositionManager
+                    # ─────────────────────────────
+                    pm_pos = self.position_manager.get_position(symbol)
+                    side = pm_pos.get("side")
+                    status = pm_pos.get("status")
+
+                    if not side or status == "FLAT":
+                        return {
+                            "success": False,
+                            "error": f"No open position for {symbol}"
+                        }
+
+                    # Определяем intent для закрытия
+                    if side == "LONG":
+                        intent = "LONG_CLOSE"
+                        direction_int = -1
+                    elif side == "SHORT":
+                        intent = "SHORT_CLOSE"
+                        direction_int = 1
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"Unknown side in PositionManager: {side}"
+                        }
+
+                    # ─────────────────────────────
+                    # 3. Определяем decision_price (минимум для валидации сигнала)
+                    # ─────────────────────────────
+                    decision_price = None
+
+                    # Попробуем взять из price_feed ExchangeManager
+                    pf = getattr(self.em, "_price_feed", None)
+                    if callable(pf):
+                        try:
+                            p = pf(symbol)
+                            if p:
+                                decision_price = float(p)
+                        except Exception as e:
+                            self.logger.warning(f"Price feed error in close_position: {e}")
+
+                    # Fallback: средняя цена входа
+                    if not decision_price:
+                        avg_entry = pm_pos.get("avg_entry_price")
+                        if avg_entry:
+                            decision_price = float(avg_entry)
+
+                    if not decision_price or decision_price <= 0:
+                        return {
+                            "success": False,
+                            "error": "Cannot determine decision_price for close"
+                        }
+
+                    # ─────────────────────────────
+                    # 4. Собираем сигнал для PositionManager.handle_signal
+                    # ─────────────────────────────
+                    from iqts_standards import create_correlation_id
+
+                    pm_signal = {
+                        "symbol": symbol,
+                        "intent": intent,
+                        "decision_price": decision_price,
+                        "correlation_id": create_correlation_id(),
+                        "confidence": 1.0,
+                        "metadata": {},
+                        "risk_context": {"decision_price": decision_price},
+                        "direction": direction_int,
+                        "dir": direction_int,
+                    }
+
+                    self.logger.info(
+                        f"📊 Closing via PositionManager: {symbol} intent={intent} "
+                        f"@ {decision_price:.2f} (position_id={position_id})"
+                    )
+
+                    # ─────────────────────────────
+                    # 5. PositionManager строит exit-ордер
+                    # ─────────────────────────────
+                    order_req = self.position_manager.handle_signal(pm_signal)
+
+                    if not order_req:
+                        return {
+                            "success": False,
+                            "error": "PositionManager rejected close signal"
+                        }
+
+                    self.logger.info(
+                        f"✅ Exit OrderReq: client_order_id={order_req['client_order_id']}, "
+                        f"side={order_req['side']}, type={order_req['type']}, "
+                        f"qty={float(order_req['qty']):.4f}"
+                    )
+
+                    # ─────────────────────────────
+                    # 6. Отправляем exit-ордер в ExchangeManager.place_order
+                    # ─────────────────────────────
+                    meth = getattr(self.em, "place_order", None)
+                    if not callable(meth):
+                        return {
+                            "success": False,
+                            "error": "ExchangeManager.place_order not available"
+                        }
+
+                    exchange_result = meth(order_req)
+                    if asyncio.iscoroutine(exchange_result):
+                        exchange_result = await exchange_result
+
+                    if not isinstance(exchange_result, dict):
+                        exchange_result = {"success": bool(exchange_result)}
+
+                    # ─────────────────────────────
+                    # 7. Формируем ответ ExecutionEngine
+                    # ─────────────────────────────
+                    success = (
+                        exchange_result.get("status") in ["NEW", "FILLED", "WORKING"]
+                        or exchange_result.get("success", False)
+                    )
+
+                    close_price = (
+                        exchange_result.get("avg_price")
+                        or exchange_result.get("price")
+                        or decision_price
+                    )
+
+                    result = {
+                        "success": success,
+                        "position_id": position_id,
+                        "order_id": order_req["client_order_id"],
+                        "close_price": float(close_price),
+                        "status": exchange_result.get(
+                            "status",
+                            "FILLED" if success else "REJECTED"
+                        ),
+                    }
+
+                    if not success:
+                        result["error"] = (
+                            exchange_result.get("error_message")
+                            or exchange_result.get("error")
+                            or "Unknown error"
+                        )
+                        self.logger.error(
+                            f"❌ Exit order rejected: {result['error']} "
+                            f"(status={result['status']})"
+                        )
+                    else:
+                        self.logger.info(
+                            f"✅ Exit order accepted: {order_req['client_order_id']} "
+                            f"(status={result['status']})"
+                        )
+
+                    return result
+
                 except Exception as err:
                     self.logger.error(f"close_position failed: {err}", exc_info=True)
                     return {"success": False, "error": str(err)}

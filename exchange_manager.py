@@ -273,31 +273,24 @@ class ExchangeManager:
     def place_order(self, order_req: OrderReq) -> Dict[str, Any]:
         """
         Размещение ордера с полной валидацией инвариантов.
-
-        ✅ ИСПРАВЛЕНИЯ v3.0 (2025-11-20):
         1. Валидация SL/TP ценового инварианта для LONG/SHORT
         2. Проверка min_notional в BACKTEST
         3. Добавление validation_hash в OrderUpd
         4. Добавление correlation_id в OrderUpd
         5. Округление commission до биржевой точности
-
         BACKTEST режим:
           - MARKET/LIMIT: мгновенное исполнение с валидацией
           - STOP/TAKE_PROFIT: регистрация через _place_order_demo()
-
         LIVE/DEMO режим:
           - Отправка на биржу через API
-
         Args:
             order_req: Запрос на размещение ордера (OrderReq)
-
         Returns:
             Dict с полями:
             - status: "NEW" | "FILLED" | "REJECTED"
             - client_order_id: ID ордера
             - exchange_order_id: ID биржи (если исполнен)
             - error: сообщение об ошибке (если REJECTED)
-
         Raises:
             ValueError: Если order_req невалиден
         """
@@ -371,6 +364,43 @@ class ExchangeManager:
                     fill_price = Decimal(str(price))
 
             if not fill_price:
+                # --- Fallback #1: взять цену из risk_context ---
+                metadata = order_req.get("metadata") or {}
+                risk_ctx = metadata.get("risk_context") or {}
+
+                rc_price = (
+                        risk_ctx.get("entry_price")
+                        or risk_ctx.get("decision_price")
+                        or None
+                )
+
+                if rc_price:
+                    try:
+                        fill_price = Decimal(str(rc_price))
+                        self.logger.warning(
+                            f"💡 Fallback price used for {client_order_id}: "
+                            f"{fill_price} (from risk_context)"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error parsing fallback risk_context price: {e}"
+                        )
+
+            # Если всё ещё нет → пробуем взять последнюю цену из trade_log
+            if not fill_price and self.trade_log:
+                try:
+                    last_candle = getattr(self.trade_log, "_last_candle", {}).get(symbol)
+                    if last_candle and last_candle.get("close"):
+                        fill_price = Decimal(str(last_candle["close"]))
+                        self.logger.warning(
+                            f"💡 Fallback price from trade_log (last_candle) "
+                            f"used for {client_order_id}: {fill_price}"
+                        )
+                except Exception as e:
+                    self.logger.error(f"trade_log fallback error: {e}")
+
+            # ===== КОНЕЧНАЯ ПРОВЕРКА =====
+            if not fill_price:
                 self._stats["orders_rejected"] += 1
                 self.logger.error(
                     f"❌ No price available for order execution: {client_order_id}"
@@ -381,7 +411,6 @@ class ExchangeManager:
                     "error_message": "Cannot determine execution price",
                     "client_order_id": client_order_id
                 }
-
             # ═══════════════════════════════════════════════════════════
             # ✅ ИСПРАВЛЕНИЕ #1: ВАЛИДАЦИЯ SL/TP ЦЕНОВОГО ИНВАРИАНТА
             # ═══════════════════════════════════════════════════════════

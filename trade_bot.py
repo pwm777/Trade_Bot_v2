@@ -497,6 +497,25 @@ class EnhancedTradingBot:
                     f"TP={risk_ctx['take_profit']:.2f}"
                 )
 
+                # 🔗 Прокидываем SL/TP из risk_context в сам сигнал,
+                # чтобы AdaptiveExitManager видел правильные поля
+                try:
+                    # RiskContext строго определён: initial_stop_loss + take_profit
+                    trade_signal["stop_loss"] = float(risk_ctx["initial_stop_loss"])
+                    trade_signal["take_profit"] = float(risk_ctx["take_profit"])
+
+                    self.logger.debug(
+                        f"🔗 SL/TP propagated to trade_signal: "
+                        f"stop_loss={trade_signal['stop_loss']}, "
+                        f"take_profit={trade_signal['take_profit']}"
+                    )
+
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Failed to propagate SL/TP from risk_context into signal: {e}"
+                    )
+                    return
+
             # ✅ ШАГ 1: Конвертация сигнала
             pm_signal = self._convert_iqts_signal_to_trade_signal(trade_signal)
 
