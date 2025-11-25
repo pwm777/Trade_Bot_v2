@@ -113,6 +113,7 @@ class EnhancedTradingBot:
         self.logger = self._setup_logging()
         self.risk_manager = risk_manager
         self.validator = validator or SignalValidator(strict_mode=False)
+        self.position_tracker = PositionTracker()
         # ⭐ ИСПРАВЛЕНО: Используем переданную стратегию или создаем новую
         if trading_system is not None:
             self.trading_system = trading_system
@@ -232,26 +233,22 @@ class EnhancedTradingBot:
         """
         Главная точка входа для событий рынка.
         Вызывается MarketAggregator при закрытии каждой свечи.
-        
-        Flow:
+
+        Новый flow:
             1. Проверка валидности (is_running, symbol, price)
             2. Определение таймфрейма (из metadata или по длительности)
             3. Сборка market_data через data_provider
-            4. Генерация сигналов (только на 5m свечах)
-            5. Управление позициями (на каждой свече)
-        
-        Args:
-            symbol: Торговый символ (ETHUSDT)
-            candle: Словарь с данными свечи (ts, open, high, low, close, volume, _timeframe)
-            recent_candles: Список последних N свечей того же таймфрейма
+            4. Определение: есть ли реально открытая позиция (PositionTracker)
+            5a. Если позиция есть → только управление (_manage_existing_positions)
+            5b. Если позиции нет → только генерация сигналов входа на 5m
         """
         if not self.is_running:
             return
-        
+
         # Фильтр по символу (если бот работает только с одним)
         if symbol != self.symbol:
             return
-        
+
         # 1. Определение таймфрейма
         timeframe = candle.get('_timeframe')
         if not timeframe:
@@ -268,18 +265,18 @@ class EnhancedTradingBot:
                     timeframe = '1m'  # default
             else:
                 timeframe = '1m'
-        
+
         # 2. Валидация цены
         close_price = float(candle.get('close', 0))
         if close_price <= 0:
             self.logger.warning(f"Invalid close price in candle: {candle}")
             return
-        
+
         self.logger.info(
             f"📊 New candle: {symbol} {timeframe} "
             f"close={close_price:.2f} ts={candle['ts']}"
         )
-        
+
         # 3. Сборка актуальных market_data
         try:
             market_data = await self._get_market_data()
@@ -289,13 +286,37 @@ class EnhancedTradingBot:
         except Exception as e:
             self.logger.error(f"Failed to get market_data: {e}")
             return
-        
-        # 4. Генерация сигналов — ТОЛЬКО на 5m свечах
+
+        # 4. Определяем, есть ли РЕАЛЬНО открытая позиция
+        has_executed_position = False
+        try:
+            if hasattr(self, "position_tracker") and self.position_tracker is not None:
+                has_executed_position = self.position_tracker.has_active_position(symbol)
+        except Exception as e:
+            self.logger.error(f"Error checking active position for {symbol}: {e}")
+            has_executed_position = False
+
+        # =================================================================
+        # РЕЖИМ 1: Позиция есть → УПРАВЛЕНИЕ, БЕЗ входов
+        # =================================================================
+        if has_executed_position:
+            self.logger.debug(
+                f"Position detected for {symbol} → managing existing position on {timeframe} candle"
+            )
+            try:
+                await self._manage_existing_positions(market_data)
+            except Exception as e:
+                self.logger.error(f"Error managing positions: {e}", exc_info=True)
+            return  # ← НИКАКИХ сигналов входа на этой свече
+
+        # =================================================================
+        # РЕЖИМ 2: Позиции нет → ИЩЕМ ВХОД только на 5m
+        # =================================================================
         if timeframe == '5m':
             try:
-                self.logger.info(f"🚀 Triggering signal generation for {symbol}")
+                self.logger.info(f"🚀 Triggering signal generation for {symbol} (no active position)")
                 signal = await self.trading_system.generate_signal(market_data)
-                
+
                 if signal:
                     self.logger.info(
                         f"✅ Signal generated: {symbol} "
@@ -308,12 +329,12 @@ class EnhancedTradingBot:
                     self.logger.debug(f"No signal generated for {symbol}")
             except Exception as e:
                 self.logger.error(f"Error generating signal: {e}", exc_info=True)
-        
-        # 5. Управление позициями — на КАЖДОЙ свече (1m и 5m)
-        try:
-            await self._manage_existing_positions(market_data)
-        except Exception as e:
-            self.logger.error(f"Error managing positions: {e}", exc_info=True)
+        else:
+            # Нет позиции и это не 5m — просто логируем
+            self.logger.debug(
+                f"No active position for {symbol} and timeframe={timeframe} → "
+                f"entry signals only generated on 5m candles"
+            )
 
     async def _validate_connections(self):
         """Проверка подключений к данным и исполнению"""
@@ -1050,6 +1071,20 @@ class EnhancedTradingBot:
 
         for position_id, position in list(self.active_positions.items()):
             try:
+                # 0) Проверка стоп-ордеров по текущей цене (DEMO/BACKTEST)
+                try:
+                    exchange_manager = getattr(self.execution_engine, "exchange_manager", None) \
+                                       or getattr(self.execution_engine, "em", None)
+
+                    if exchange_manager and hasattr(exchange_manager, "check_stops_on_price_update"):
+                        symbol = position['signal'].get('symbol', self.symbol)
+                        exchange_manager.check_stops_on_price_update(symbol, current_price)
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to check stop orders for existing position {position_id}: {e}",
+                        exc_info=True
+                    )
+
                 # 1) Обновляем PnL трекера
                 self.position_tracker.update_position_pnl(position_id, current_price)
 
@@ -1092,6 +1127,38 @@ class EnhancedTradingBot:
                             f"Trailing SL updated for {position_id}: {new_sl:.5f} "
                             f"({upd.get('reason', 'trailing_adjust')})"
                         )
+                        # Попробуем также выставить реальный STOP-ордер через PositionManager
+                        try:
+                            pm = getattr(self.execution_engine, "position_manager", None)
+                            em = getattr(self.execution_engine, "exchange_manager", None) \
+                                 or getattr(self.execution_engine, "em", None)
+
+                            if pm and em:
+                                from decimal import Decimal
+
+                                symbol = position['signal']['symbol']
+                                pos_snapshot = pm.get_position(symbol)
+
+                                if pos_snapshot and pos_snapshot.get("status") != "FLAT":
+                                    stop_req = pm.build_stop_order(
+                                        signal=position['signal'],  # pm_signal из _process_trade_signal
+                                        position=pos_snapshot,  # актуальная позиция из PM
+                                        new_stop_price=Decimal(str(new_sl)),
+                                        is_trailing=True
+                                    )
+                                    if stop_req:
+                                        em.place_order(stop_req)
+                                        self.logger.info(
+                                            f"✅ Trailing STOP order sent to ExchangeManager for {symbol} "
+                                            f"@ {new_sl:.5f}"
+                                        )
+                                else:
+                                    self.logger.warning(
+                                        f"Cannot create trailing stop: position FLAT or missing in PositionManager "
+                                        f"(symbol={symbol})"
+                                    )
+                        except Exception as e:
+                            self.logger.error(f"Failed to send trailing stop via PositionManager: {e}", exc_info=True)
                         await self._update_position_stop_loss(position_id, new_sl)
 
                 else:
@@ -1375,11 +1442,15 @@ class PositionTracker:
 
     def add_position(self, position_id: str, position_data: Dict):
         """Добавление новой позиции"""
+        signal = position_data.get('signal', {})
+        symbol = signal.get('symbol')
+
         self.positions[position_id] = {
             **position_data,
+            'symbol': symbol,
             'unrealized_pnl': 0.0,
             'last_update': datetime.now(),
-            'last_price': position_data['signal'].get('entry_price', 0.0)
+            'last_price': signal.get('entry_price', 0.0)
         }
 
     def update_position_pnl(self, position_id: str, current_price: float):
@@ -1444,7 +1515,7 @@ class PositionTracker:
 
     def close_position(self, position_id: str, close_price: float, realized_pnl: float):
         """
-        ✅ ИСПРАВЛЕНО: Закрытие позиции с сохранением только метаданных.
+        Закрытие позиции с сохранением только метаданных.
         """
         if position_id not in self.positions:
             return
@@ -1500,3 +1571,16 @@ class PositionTracker:
     def get_total_unrealized_pnl(self) -> float:
         """Общий нереализованный PnL по всем позициям"""
         return sum(pos.get('unrealized_pnl', 0.0) for pos in self.positions.values())
+
+    def has_active_position(self, symbol: str) -> bool:
+        try:
+            for pos in self.positions.values():
+                pos_symbol = pos.get("symbol")
+                if not pos_symbol and 'signal' in pos:
+                    pos_symbol = pos['signal'].get('symbol')
+
+                if pos_symbol == symbol and pos.get("status") not in ("CLOSED", "closed", "FLAT"):
+                    return True
+        except Exception as e:
+            self._logger.error(f"has_active_position failed: {e}")
+        return False

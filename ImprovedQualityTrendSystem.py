@@ -598,12 +598,6 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
                     global_confidence >= 0.6
             )
 
-            # ✅ ВРЕМЕННАЯ ДИАГНОСТИКА
-            print(f"\n💾 [CACHE DEBUG] symbol={symbol}, should_cache={should_cache}")
-            print(f"   global_dir={global_direction}, global_conf={global_confidence:.2f}")
-            print(f"   trend_dir={trend_direction}, trend_conf={trend_confidence:.2f}")
-            print(f"   result['ok']={result.get('ok')}, reason={result.get('reason')}")
-
             if should_cache:
                 cache_ts = get_current_timestamp_ms()
                 cache_status = 'agreement' if result['ok'] else 'disagreement'

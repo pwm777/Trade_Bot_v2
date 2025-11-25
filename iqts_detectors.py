@@ -116,14 +116,6 @@ class MLGlobalTrendDetector(Detector):
     async def analyze(self, data: Dict[Timeframe, pd.DataFrame]) -> DetectorSignal:
         """Анализ с ML или fallback"""
 
-        # ✅ ДОБАВИТЬ ДИАГНОСТИКУ В НАЧАЛО
-        self.logger.info("=" * 80)
-        self.logger.info("🚀 MLGlobalTrendDetector.analyze() called")
-        self.logger.info(f"   ml_detector exists: {self.ml_detector is not None}")
-        self.logger.info(f"   fallback_detector exists: {self.fallback_detector is not None}")
-        self.logger.info(f"   using_fallback flag: {self.using_fallback}")
-        self.logger.info(f"   Input data keys: {list(data.keys()) if isinstance(data, dict) else 'NOT A DICT'}")
-
         if self.ml_detector and not self.using_fallback:
             self.logger.info("🔄 Attempting ML detector analysis...")
             try:

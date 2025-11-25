@@ -969,10 +969,18 @@ class PositionEvent(TypedDict, total=False):
 
 
 class PriceFeed(Protocol):
-    """Источник текущих цен"""
-
-    def __call__(self, symbol: str) -> Optional[float]: ...
-
+    """Единый источник цен: LIVE, DEMO, BACKTEST"""
+    def __call__(self, symbol: str) -> Optional[Dict[str, float]]:
+        """
+        Возвращает свечу:
+        {
+          "high": float,
+          "low": float,
+          "close": float,
+          # опционально: "open", "volume", ...
+        }
+        """
+        ...
 
 # === CORE EVENT HANDLERS ===
 EventHandler = Callable[[PositionEvent], None]

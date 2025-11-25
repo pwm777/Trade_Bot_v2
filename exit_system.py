@@ -56,9 +56,9 @@ class ExitSignalDetector:
         # Пороги для каскадного анализа
         # Строки 50-55
         self.cascading_thresholds = {
-            'both_levels_sum': 0.65,  # ✅ Снижено с 0.7 (для 2 уровней)
-            'global_hint': 0.3,  # ✅ Без изменений
-            'trend_min': 0.25,  # ✅ Минимум для 1m
+            'both_levels_sum': 0.8,  # ✅ Снижено с 0.7 (для 2 уровней)
+            'global_hint': 0.5,  # ✅ Без изменений
+            'trend_min': 0.4,  # ✅ Минимум для 1m
         }
 
         # Классические пороги (запасной вариант)
@@ -422,8 +422,14 @@ class AdaptiveExitManager:
         # LAYER 2: СИГНАЛЫ НА ВЫХОД (Каскадный анализ тренда)
         # ═══════════════════════════════════════════════════════════════
 
-        signal_exit = await self.exit_detector.analyze_exit_signal(
-            market_data, direction
+        signal_exit = await self.exit_detector.analyze_exit_signal(market_data, direction)
+        self.logger.info(
+            f"🔍 SIGNAL_EXIT CHECK: "
+            f"should_exit={signal_exit.get('should_exit', False)}, "
+            f"urgency={signal_exit.get('urgency', 'none')}, "
+            f"reason={signal_exit.get('reason', 'none')}, "
+            f"confidence={signal_exit.get('confidence', 0):.3f}, "
+            f"details={signal_exit.get('details', {})}"
         )
 
         # Логика выхода по сигналам с учетом urgency и PnL

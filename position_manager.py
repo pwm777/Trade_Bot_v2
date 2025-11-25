@@ -267,7 +267,7 @@ class PositionManager:
                             self._stats.orders_created += 1
                             self.logger.info(
                                 f"Created and persisted order: {intent} for {symbol} "
-                                f"(position_id={position_id})"  # ✅ Логируем для проверки
+                                f"(position_id={position_id})"
                             )
                         else:
                             self.logger.error(f"Failed to persist order: {order_req['client_order_id']}")
@@ -348,12 +348,13 @@ class PositionManager:
     ) -> Optional[OrderReq]:
         """
         Обработка WAIT сигнала с вычислением trailing stop.
-
         ✅ UPDATED: Uses AdaptiveExitManager.calculate_trailing_stop() (v2.1+)
         """
-        # ✅ ИСПРАВЛЕНИЕ: Инициализируем symbol ДО try блока
+        # ✅ ИНИЦИАЛИЗИРУЕМ symbol ДО try-блока
         symbol = signal.get("symbol", "UNKNOWN")
-
+        if current_position["status"] == "FLAT":
+            self.logger.debug(f"WAIT ignored for {symbol}: no open position")
+            return None
         try:
             # ✅ Теперь symbol всегда определён
             if not symbol or symbol == "UNKNOWN":
@@ -443,6 +444,7 @@ class PositionManager:
                 return None
 
             # Квантуем цену
+            # Квантуем цену
             new_stop_price = self.quantize_price(symbol, Decimal(str(new_stop_price_float)))
 
             # Проверяем что цена изменилась
@@ -452,32 +454,27 @@ class PositionManager:
                 )
                 return None
 
-            # Генерируем ID для нового стоп-ордера
-            client_order_id = self._generate_unique_order_id(symbol, "trail_stop")
+            # Берём актуальный снимок позиции
+            pos_snapshot = self.get_position(symbol)
+            if not pos_snapshot or pos_snapshot.get("status") == "FLAT":
+                self.logger.error(
+                    f"❌ Cannot build trailing stop: no OPEN position snapshot for {symbol}"
+                )
+                return None
 
-            # Определяем сторону стопа
-            stop_side: Literal["BUY", "SELL"] = "SELL" if position_side == "LONG" else "BUY"
-
-            # Создаём OrderReq
-            order_req = OrderReq(
-                client_order_id=client_order_id,
-                symbol=symbol,
-                side=stop_side,
-                type="STOP_MARKET",
-                qty=current_position["qty"],
-                price=None,
-                stop_price=new_stop_price,
-                time_in_force="GTC",
-                reduce_only=True,
-                correlation_id=signal.get("correlation_id", create_correlation_id()),
-                metadata={
-                    "reason": "trailing_stop_update",
-                    "previous_stop": current_stop,
-                    "new_stop": float(new_stop_price),
-                    "max_pnl_percent": max_pnl_percent,
-                    "entry_price": entry_price
-                }
+            # ✅ СЮДА ВСТАВЛЯЕМ ВЫЗОВ build_stop_order
+            order_req = self.build_stop_order(
+                signal=signal,
+                position=pos_snapshot,
+                new_stop_price=new_stop_price,
+                is_trailing=True
             )
+
+            if not order_req:
+                self.logger.error(
+                    f"❌ build_stop_order returned None for {symbol} (trailing)"
+                )
+                return None
 
             self.logger.info(
                 f"✅ Trailing stop update for {symbol}: "
@@ -488,7 +485,6 @@ class PositionManager:
             return order_req
 
         except KeyError as e:
-            # ✅ symbol теперь всегда определён
             self.logger.error(
                 f"❌ Missing required field in signal for {symbol}: {e}",
                 exc_info=True
@@ -496,7 +492,6 @@ class PositionManager:
             return None
 
         except Exception as e:
-            # ✅ symbol теперь всегда определён
             self.logger.error(
                 f"❌ Error handling WAIT signal for {symbol}: {e}",
                 exc_info=True
@@ -524,7 +519,7 @@ class PositionManager:
 
                     # ✅ Проверяем async/sync
                     if asyncio.iscoroutinefunction(cancel_method):
-                        result =  cancel_method(order_id)
+                        result = cancel_method(order_id)
                     else:
                         result = cancel_method(order_id)
 
@@ -555,6 +550,7 @@ class PositionManager:
                 f"❌ Error in _cancel_stops_for_symbol for {symbol}: {e}",
                 exc_info=True
             )
+
 
     def update_on_fill(self, fill: OrderUpd) -> None:
         """
@@ -648,7 +644,7 @@ class PositionManager:
                     symbol,
                     fill,
                     current_position,
-                    order_type=order_type,  # Передаём тип ордера
+                    order_type=order_type,          # Передаём тип ордера
                     is_trailing_stop=is_trailing_stop  # Передаём флаг trailing stop
                 )
             else:
@@ -698,6 +694,7 @@ class PositionManager:
 
         except Exception as e:
             self.logger.error(f"Error processing fill: {e}")
+
 
     def _get_or_create_state(self, symbol: str) -> Dict[str, Any]:
         """
@@ -758,8 +755,7 @@ class PositionManager:
             # ✅ ДОБАВЛЕНО: Конвертируем в Decimal для внутреннего использования
             filled_qty_decimal = Decimal(str(filled_qty)) if not isinstance(filled_qty, Decimal) else filled_qty
             avg_price_decimal = Decimal(str(avg_price_raw)) if not isinstance(avg_price_raw, Decimal) else avg_price_raw
-            commission_decimal = Decimal(str(commission_raw)) if not isinstance(commission_raw,
-                                                                                Decimal) else commission_raw
+            commission_decimal = Decimal(str(commission_raw)) if not isinstance(commission_raw, Decimal) else commission_raw
 
             self.logger.warning(
                 f"🟢 _process_entry_fill CALLED:\n"
@@ -775,15 +771,15 @@ class PositionManager:
                 symbol=symbol,
                 status="OPEN",
                 side=cast(Literal["LONG", "SHORT"], side),  # ← Явное приведение типа
-                qty=filled_qty_decimal,  # ← Decimal
-                avg_entry_price=avg_price_decimal,  # ← Decimal
+                qty=filled_qty_decimal,                     # ← Decimal
+                avg_entry_price=avg_price_decimal,          # ← Decimal
                 market_price=avg_price_float,
                 realized_pnl_usdt=Decimal('0'),
                 unrealized_pnl_usdt=Decimal('0'),
                 created_ts=get_current_timestamp_ms(),
                 updated_ts=get_current_timestamp_ms(),
                 correlation_id=fill.get("client_order_id"),
-                fee_total_usdt=commission_decimal  # ← ИСПРАВЛЕНО: Decimal вместо float
+                fee_total_usdt=commission_decimal           # ← Decimal вместо float
             )
 
             # Сохраняем в памяти
@@ -816,6 +812,8 @@ class PositionManager:
 
         except Exception as e:
             self.logger.error(f"Error processing entry fill for {symbol}: {e}")
+
+
 
     def _process_exit_fill(
             self,
@@ -906,9 +904,7 @@ class PositionManager:
                 f"❌ Unknown position direction for {symbol}: {position_direction} "
                 f"(position_side={position_side})"
             )
-            pnl_decimal = Decimal('0')  # ✅ Безопасное значение по умолчанию
-            # Можно также вернуться досрочно:
-            # return
+            pnl_decimal = Decimal('0')
 
         # Ensure both fees are Decimal
         existing_entry_fee_raw = current_position.get("fee_total_usdt")
@@ -1001,10 +997,13 @@ class PositionManager:
                     try:
                         open_positions = self.trade_log.get_open_positions_db(symbol)
                         if open_positions:
-                            position_id = open_positions[0].id
-                            self.logger.warning(
-                                f"position_id not in cache for {symbol}, loaded from DB: {position_id}"
-                            )
+                            # если это ORM-объект, там может быть .id; если dict — .get("id")
+                            pos0 = open_positions[0]
+                            position_id = getattr(pos0, "id", None) if not isinstance(pos0, dict) else pos0.get("id")
+                            if position_id:
+                                self.logger.warning(
+                                    f"position_id not in cache for {symbol}, loaded from DB: {position_id}"
+                                )
                     except Exception as e:
                         self.logger.error(f"Failed to load position_id from DB for {symbol}: {e}")
 
@@ -1020,10 +1019,8 @@ class PositionManager:
                     # ✅ ИСПРАВЛЕНИЕ: Проверяем async/sync
                     cancel_method = self._cancel_stops_for_symbol
                     if asyncio.iscoroutinefunction(cancel_method):
-                        # Создаём задачу для async метода
                         asyncio.create_task(cancel_method(symbol))
                     else:
-                        # Синхронный вызов
                         cancel_method(symbol)
                 else:
                     self.logger.error(
@@ -1094,6 +1091,7 @@ class PositionManager:
             )
 
             self._positions[symbol] = updated_position
+
 
     # === Вспомогательные методы ===
 
@@ -1200,7 +1198,8 @@ class PositionManager:
                     # Загружаем из БД
                     open_positions = self.trade_log.get_open_positions_db(symbol)
                     if open_positions:
-                        position_id = open_positions[0].get("id")
+                        pos0 = open_positions[0]
+                        position_id = getattr(pos0, "id", None) if not isinstance(pos0, dict) else pos0.get("id")
                         if not hasattr(self, '_position_ids'):
                             self._position_ids: Dict[str, int] = {}
                         if position_id:
@@ -1220,19 +1219,19 @@ class PositionManager:
                 # Добавляем только изменённые поля
                 status = position.get("status")
                 if status:
-                    updates["status"] = str(status)  # ✅ Явное приведение к str
+                    updates["status"] = str(status)
 
                 qty = position.get("qty")
                 if qty is not None:
-                    updates["qty"] = qty  # ✅ Decimal остаётся Decimal
+                    updates["qty"] = qty
 
                 realized_pnl = position.get("realized_pnl_usdt")
                 if realized_pnl is not None:
-                    updates["realized_pnl_usdt"] = realized_pnl  # ✅ Decimal
+                    updates["realized_pnl_usdt"] = realized_pnl
 
                 fee_total = position.get("fee_total_usdt")
                 if fee_total is not None:
-                    updates["fee_total_usdt"] = fee_total  # ✅ Decimal
+                    updates["fee_total_usdt"] = fee_total
 
                 # Нормализуем параметры для SQLAlchemy
                 normalized_updates = self.trade_log._normalize_params(updates)
@@ -1268,6 +1267,7 @@ class PositionManager:
                         f"Failed to record error to trade_log: {log_error}"
                     )
 
+
     def _init_position_ids_cache(self) -> None:
         """Инициализирует кеш ID позиций из существующих открытых позиций."""
         try:
@@ -1278,8 +1278,8 @@ class PositionManager:
             open_positions = self.trade_log.get_open_positions_db()
 
             for pos in open_positions:
-                symbol = pos.get("symbol")
-                position_id = pos.get("id")
+                symbol = pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", None)
+                position_id = pos.get("id") if isinstance(pos, dict) else getattr(pos, "id", None)
                 if symbol and position_id:
                     self._position_ids[symbol] = position_id
 
@@ -1288,6 +1288,7 @@ class PositionManager:
 
         except Exception as e:
             self.logger.error(f"Error initializing position IDs cache: {e}")
+
 
     # === Публичные методы ===
 
@@ -1442,7 +1443,7 @@ class PositionManager:
                         )
                         qty = None
 
-            # ✅ ИСПРАВЛЕНИЕ: Если position_size не найден - отклоняем сигнал
+            # ✅ Если position_size не найден - отклоняем сигнал
             if qty is None or qty <= 0:
                 self.logger.error(
                     f"❌ position_size not provided or invalid for {symbol}!\n"
@@ -1495,7 +1496,6 @@ class PositionManager:
             # Генерируем correlation_id если отсутствует
             correlation_id = signal.get("correlation_id")
             if not correlation_id:
-                from iqts_standards import create_correlation_id
                 correlation_id = create_correlation_id()
 
             order_req = OrderReq(
@@ -1543,11 +1543,9 @@ class PositionManager:
             return order_req
 
         except InvalidOrderSizeError:
-            # Пробрасываем как есть
             raise
 
         except InvalidSignalError:
-            # Пробрасываем как есть
             raise
 
         except KeyError as e:
@@ -1582,7 +1580,6 @@ class PositionManager:
             # Определяем сторону выхода (противоположную позиции)
             position_side = position["side"]
 
-            # ✅ ИСПРАВЛЕНО: Явное приведение к Literal типу
             exit_side: Literal["BUY", "SELL"] = cast(
                 Literal["BUY", "SELL"],
                 "SELL" if position_side == "LONG" else "BUY"
@@ -1591,13 +1588,12 @@ class PositionManager:
             # Количество - вся позиция
             qty = position["qty"]
 
-            # Явное приведение типа ордера
+            # Тип ордера выхода
             order_type: Literal["MARKET", "LIMIT", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"] = cast(
                 Literal["MARKET", "LIMIT", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"],
                 "MARKET"
             )
 
-            # Создаем OrderReq
             client_order_id = self._generate_unique_order_id(symbol, "exit")
 
             order_req = OrderReq(
@@ -1612,7 +1608,6 @@ class PositionManager:
                 correlation_id=signal.get("correlation_id", create_correlation_id())
             )
 
-            # Сохраняем в pending orders
             pending_order = PendingOrder(
                 client_order_id=client_order_id,
                 symbol=symbol,
@@ -1622,14 +1617,15 @@ class PositionManager:
                 price=None,
                 correlation_id=order_req["correlation_id"],
                 reduce_only=True,
-                metadata=None # для exit ордеров metadata не нужен
+                metadata=None
             )
             self._pending_orders[client_order_id] = pending_order
 
             return order_req
 
         except Exception as e:
-            raise InvalidSignalError(f"Error building exit order: {e}")
+            self.logger.error(f"Error building exit order for {symbol}: {e}", exc_info=True)
+            raise InvalidSignalError(f"Error building exit order: {e}") from e
 
 
     def build_stop_order(self, signal: TradeSignalIQTS, position: PositionSnapshot,

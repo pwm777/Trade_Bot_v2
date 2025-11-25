@@ -359,9 +359,13 @@ class ExchangeManager:
 
             # Приоритет 2: Текущая рыночная цена (MARKET)
             elif self._price_feed:
-                price = self._price_feed(symbol)
-                if price:
-                    fill_price = Decimal(str(price))
+                candle = self._price_feed(symbol)
+                if candle and isinstance(candle, dict):
+                    fill_price = Decimal(str(candle["close"]))
+                elif candle:  # fallback на старый float
+                    fill_price = Decimal(str(candle))
+                else:
+                    fill_price = None
 
             if not fill_price:
                 # --- Fallback #1: взять цену из risk_context ---
@@ -1147,39 +1151,49 @@ class ExchangeManager:
                 break
 
     def _check_stop_trigger_with_price(self, order: ActiveOrder, current_price: float) -> bool:
-        """Проверка триггера STOP с явно переданной ценой."""
+        """
+        Проверка триггера STOP по цене (high/low/close).
+        Используется в check_stops_on_price_update (бэктест).
+        Возвращает True, если стоп сработал.
+        """
         if not order.stop_price:
             return False
 
         stop_price = float(order.stop_price)
-        tolerance = 0.0001
+        tolerance = 0.0001  # 0.01 %
+
+        # Получаем свечу (в бэктесте она уже пришла)
+        candle = self._price_feed(order.symbol) if self._price_feed else None
+        if not candle or not isinstance(candle, dict):
+            # fallback на старое поведение (close)
+            low = high = current_price
+        else:
+            low = candle["low"]
+            high = candle["high"]
 
         is_closing_long = (order.side == "SELL" and order.reduce_only)
         is_closing_short = (order.side == "BUY" and order.reduce_only)
 
         triggered = False
 
-        if order.type in ["STOP", "STOP_MARKET"]:
+        if order.type in ("STOP", "STOP_MARKET"):
             if is_closing_long:
-                triggered = current_price <= stop_price * (1 + tolerance)
+                triggered = low <= stop_price * (1 + tolerance)
             elif is_closing_short:
-                triggered = current_price >= stop_price * (1 - tolerance)
+                triggered = high >= stop_price * (1 - tolerance)
             else:
+                # открывающий стоп
                 if order.side == "BUY":
-                    triggered = current_price >= stop_price * (1 - tolerance)
+                    triggered = high >= stop_price * (1 - tolerance)
                 else:
-                    triggered = current_price <= stop_price * (1 + tolerance)
+                    triggered = low <= stop_price * (1 + tolerance)
 
-        elif order.type in ["TAKE_PROFIT", "TAKE_PROFIT_MARKET"]:
-            if is_closing_long:
-                triggered = current_price >= stop_price * (1 - tolerance)
-            elif is_closing_short:
-                triggered = current_price <= stop_price * (1 + tolerance)
-            else:
-                if order.side == "BUY":
-                    triggered = current_price <= stop_price * (1 + tolerance)
-                else:
-                    triggered = current_price >= stop_price * (1 - tolerance)
+        if triggered:
+            self.logger.info(
+                f"STOP TRIGGERED: {order.symbol} {order.type} "
+                f"side={order.side} reduce_only={order.reduce_only} "
+                f"low={low:.8f} high={high:.8f} stop={stop_price:.8f}"
+            )
 
         return triggered
 
@@ -1481,8 +1495,6 @@ class ExchangeManager:
     def set_price_feed_callback(self, cb: PriceFeed) -> None:
         """Источник цен для DEMO/STOP мониторинга."""
         self._price_feed = cb
-
-    from typing import Literal
 
     OrderTypeLiteral = Literal["MARKET", "LIMIT", "STOP_MARKET", "STOP", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"]
 

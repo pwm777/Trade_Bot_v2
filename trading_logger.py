@@ -1156,36 +1156,67 @@ class TradingLogger:
         return self._stats.copy()
 
     def get_trading_stats(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """Получить статистику торгов."""
+        """
+        Получить агрегированную статистику по сделкам из таблицы trades.
+
+        Считаем:
+        - только закрытые сделки (exit_ts IS NOT NULL)
+        - PnL: по колонке net_pnl_usdt
+        """
         try:
-            where_clause = ""
-            params = {}
+            where_parts = ["exit_ts IS NOT NULL"]
+            params: Dict[str, Any] = {}
 
             if symbol:
-                where_clause = "WHERE symbol = :symbol"
+                where_parts.append("symbol = :symbol")
                 params["symbol"] = symbol
+
+            where_clause = ""
+            if where_parts:
+                where_clause = " WHERE " + " AND ".join(where_parts)
 
             with self.trades_engine.connect() as conn:
                 stats = conn.execute(text(f"""
-                    SELECT 
-                        COUNT(*) as total_trades,
-                        COUNT(CASE WHEN net_pnl_usdt > 0 THEN 1 END) as winning_trades,
-                        SUM(net_pnl_usdt) as total_pnl_usdt
-                    FROM trades {where_clause} WHERE exit_ts IS NOT NULL
+                    SELECT
+                        COUNT(*) AS total_trades,
+                        SUM(CASE WHEN net_pnl_usdt > 0 THEN 1 ELSE 0 END) AS winning_trades,
+                        SUM(COALESCE(net_pnl_usdt, 0)) AS total_pnl_usdt
+                    FROM trades
+                    {where_clause}
                 """), params).mappings().first()
 
-                if stats and stats["total_trades"] > 0:
-                    win_rate = (stats["winning_trades"] / stats["total_trades"]) * 100
-                    return {
-                        "total_trades": stats["total_trades"],
-                        "winning_trades": stats["winning_trades"],
-                        "win_rate_percent": round(win_rate, 2),
-                        "total_pnl_usdt": float(stats["total_pnl_usdt"] or 0)
-                    }
-        except Exception as e:
-            self.record_error({"error_type": "trading_stats", "error": str(e)})
+            # Если есть хоть одна сделка — считаем метрики
+            if stats and (stats["total_trades"] or 0) > 0:
+                total_trades = int(stats["total_trades"] or 0)
+                winning_trades = int(stats["winning_trades"] or 0)
+                total_pnl = float(stats["total_pnl_usdt"] or 0.0)
 
-        return {"total_trades": 0, "win_rate_percent": 0, "total_pnl_usdt": 0}
+                win_rate = (winning_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+                avg_pnl = (total_pnl / total_trades) if total_trades > 0 else 0.0
+
+                return {
+                    "total_trades": total_trades,
+                    "winning_trades": winning_trades,
+                    "win_rate_percent": round(win_rate, 2),
+                    "total_pnl_usdt": total_pnl,
+                    "avg_pnl_usdt": avg_pnl,
+                }
+
+        except Exception as e:
+            # Логируем ошибку в отдельную таблицу ошибок
+            try:
+                self.record_error({"error_type": "trading_stats", "error": str(e)})
+            except Exception:
+                pass
+
+        # Фоллбек, если что-то пошло не так
+        return {
+            "total_trades": 0,
+            "winning_trades": 0,
+            "win_rate_percent": 0.0,
+            "total_pnl_usdt": 0.0,
+            "avg_pnl_usdt": 0.0,
+        }
 
     # === Lifecycle Management ===
 
