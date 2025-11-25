@@ -70,7 +70,6 @@ BASE_FEATURE_NAMES = [
     'lower_shadow_ratio',
     'price_vs_vwap',
     'bb_position',
-    # 'cusum_1m_recent',  # при необходимости можно вернуть
     'cusum_1m_quality_score',
     'cusum_1m_trend_aligned',
     'cusum_1m_price_move',

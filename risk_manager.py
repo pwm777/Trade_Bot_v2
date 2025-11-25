@@ -145,7 +145,7 @@ class RiskLimits:
     max_daily_loss: float = 0.05  # 5% дневной лимит
     max_position_value_pct: float = 0.30  # 30% капитала в одной позиции
 
-    stop_loss_atr_multiplier: float = 2.5
+    stop_loss_atr_multiplier: float = 1.1
     take_profit_atr_multiplier: float = 3.0
 
     atr_periods: int = 14

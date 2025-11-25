@@ -58,6 +58,7 @@ class ExitSignalDetector:
         self.cascading_thresholds = {
             'both_levels_sum': 0.8,  # ✅ Снижено с 0.7 (для 2 уровней)
             'global_hint': 0.5,  # ✅ Без изменений
+            "lower_tf_min": 0.55,
             'trend_min': 0.4,  # ✅ Минимум для 1m
         }
 
@@ -512,7 +513,7 @@ class AdaptiveExitManager:
         max_hold_time = self.max_hold_time_base
         if pnl_pct > 0.02:  # 2%+ прибыли → держим дольше
             max_hold_time = self.max_hold_time_base * 1.5
-        elif pnl_pct < -0.01:  # 1%+ убытка → закрываем быстрее
+        elif pnl_pct < -0.005:  # 05%+ убытка → закрываем быстрее
             max_hold_time = self.max_hold_time_base * 0.7
 
         hold_time = datetime.now() - opened_at

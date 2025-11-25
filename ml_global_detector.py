@@ -154,22 +154,41 @@ class MLGlobalDetector(Detector):
         if len(df) < min_bars:
             raise ValueError(f"Insufficient bars for window: need {min_bars}, got {len(df)}")
 
+        # ✅ NEW: привести DataFrame к хронологическому ASC-порядку по времени,
+        #        чтобы окно формировалось так же, как в trainer (ml_train_global_v2.py)
+        try:
+            if "ts" in df.columns:
+                df = df.sort_values("ts", ascending=True).reset_index(drop=True)
+            elif "ts_close" in df.columns:
+                df = df.sort_values("ts_close", ascending=True).reset_index(drop=True)
+            else:
+                # если нет явной колонки времени — оставляем как есть, но логируем
+                self.logger.warning(
+                    "extract_features: no 'ts' / 'ts_close' column found; "
+                    "cannot enforce ASC time order"
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to sort DF by time for ML features: {e}", exc_info=True)
+
         # Проверка наличия всех базовых признаков (по колонкам df)
         missing_features = [col for col in self.base_feature_names if col not in df.columns]
         available_features = [col for col in self.base_feature_names if col in df.columns]
         if missing_features:
             self.logger.error(f"❌ MISSING FEATURES ({len(missing_features)}): {missing_features}")
             self.logger.info(f"✅ AVAILABLE FEATURES ({len(available_features)}): {available_features}")
-            # Показать несколько последних значений доступных фич
-            for feature in available_features[:5]:
-                sample_value = df[feature].iloc[-1] if len(df) > 0 else "N/A"
+            sample_row = df.iloc[-1]
+            self.logger.info("🔍 Sample values for available features (last row):")
+            for feature in available_features[:30]:
+                sample_value = sample_row.get(feature, None)
                 self.logger.info(f"   {feature}: {sample_value}")
             raise ValueError(f"Missing ML features: {missing_features}")
 
         # Оконный режим (lookback > 1) — формируем (lookback, n_features) → разворачиваем в [t0, t-1, ...]
         if self.lookback > 1:
-            # Берём последние lookback строк в хронологическом порядке
+            # ✅ ВАЖНО: теперь df уже в ASC-порядке, поэтому iloc[-lookback:]
+            #          даёт [t-(lookback-1), ..., t-1, t0], как в trainer
             tail = df.iloc[-self.lookback:]
+
             # Матрица признаков: строки — бары по времени (от старого к новому), столбцы — base_features
             window = tail[self.base_feature_names].to_numpy(dtype=float)  # shape: (lookback, n_features)
             # На всякий случай заменим NaN/Inf
@@ -177,6 +196,7 @@ class MLGlobalDetector(Detector):
 
             # Переупорядочиваем строки, чтобы первым шёл t0 (последний бар окна), затем t-1, ... — как в trainer
             window_ordered = window[::-1, :]  # shape: (lookback, n_features), первый ряд — t0
+
             # Разворачиваем в вектор: [t0_feat1..featN, t-1_feat1..featN, ...]
             features_array = window_ordered.reshape(1, -1).astype(np.float32)
 
@@ -185,8 +205,10 @@ class MLGlobalDetector(Detector):
                 self.logger.warning("Features contain NaN/Inf, cleaning...")
                 features_array = np.nan_to_num(features_array, nan=0.0, posinf=0.0, neginf=0.0)
 
-            self.logger.info(f"✅ ML FEATURE DIAGNOSTIC (windowed) - OK | "
-                             f"window_shape={window.shape}, vector_dim={features_array.shape[1]}")
+            self.logger.info(
+                f"✅ ML FEATURE DIAGNOSTIC (windowed) - OK | "
+                f"window_shape={window.shape}, vector_dim={features_array.shape[1]}"
+            )
             return features_array
 
         # Иначе — legacy режим (один бар)
@@ -197,13 +219,15 @@ class MLGlobalDetector(Detector):
                 self.logger.warning(f"Feature '{feature_name}' is NaN, replacing with 0.0")
                 value = 0.0
             features.append(float(value))
-        features_array = np.array(features, dtype=float).reshape(1, -1)
 
+        features_array = np.array(features, dtype=np.float32).reshape(1, -1)
         if not self._validate_features(features_array):
-            self.logger.warning("Features contain NaN/Inf, cleaning...")
+            self.logger.warning("Features contain NaN/Inf, cleaning (legacy)...")
             features_array = np.nan_to_num(features_array, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.logger.info("✅ ML FEATURE DIAGNOSTIC (legacy) - OK")
+        self.logger.info(
+            f"✅ ML FEATURE DIAGNOSTIC (legacy) - OK | vector_dim={features_array.shape[1]}"
+        )
         return features_array
 
     # ═══════════════════════════════════════════════════════════════

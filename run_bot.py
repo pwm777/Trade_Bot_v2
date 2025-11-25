@@ -1735,8 +1735,8 @@ class BotLifecycleManager:
             execution_engine=execution_engine,
             trading_system=cast(ImprovedQualityTrendSystem, strategy),
             risk_manager=risk_manager,
-            validator=validator,
-        )
+            exit_manager=exit_manager,
+            validator=validator)
         logger.info("✅ EnhancedTradingBot created with RiskManager DI")
         # END REPLACE
         logger.info("✅ EnhancedTradingBot created")

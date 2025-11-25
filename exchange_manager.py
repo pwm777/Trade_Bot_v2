@@ -1492,6 +1492,33 @@ class ExchangeManager:
 
     # === Вспомогательные методы ===
 
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Унифицированный источник цены.
+        Возвращает текущий close из price_feed.
+        """
+        try:
+            if not hasattr(self, "_price_feed") or self._price_feed is None:
+                return None
+
+            candle = self._price_feed(symbol)
+
+            # Поддерживаем два формата: dict и float
+            if isinstance(candle, dict):
+                value = candle.get("close")
+            else:
+                value = candle
+
+            if value is None:
+                return None
+
+            return float(value)
+
+        except Exception as e:
+            self.logger.error(f"get_current_price failed for {symbol}: {e}", exc_info=True)
+            return None
+
+
     def set_price_feed_callback(self, cb: PriceFeed) -> None:
         """Источник цен для DEMO/STOP мониторинга."""
         self._price_feed = cb

@@ -102,9 +102,12 @@ class EnhancedTradingBot:
     Интегрирует стратегию, исполнение, риск-менеджмент и мониторинг.
     Обеспечивает основной торговый цикл и управление позициями.
     """
-    def __init__(self, config: Dict, data_provider: DataProvider,
-                 execution_engine: ExecutionEngine, trading_system: Optional[ImprovedQualityTrendSystem] = None,
+    def __init__(self, config: Dict,
+                 data_provider: DataProvider,
+                 execution_engine: ExecutionEngine,
+                 trading_system: Optional[ImprovedQualityTrendSystem] = None,
                  risk_manager: Optional[EnhancedRiskManager] = None,
+                 exit_manager: Optional[AdaptiveExitManager] = None,
                  validator: Optional["SignalValidator"] = None,
                  ):
         self.config = config
@@ -114,6 +117,7 @@ class EnhancedTradingBot:
         self.risk_manager = risk_manager
         self.validator = validator or SignalValidator(strict_mode=False)
         self.position_tracker = PositionTracker()
+
         # ⭐ ИСПРАВЛЕНО: Используем переданную стратегию или создаем новую
         if trading_system is not None:
             self.trading_system = trading_system
@@ -122,23 +126,40 @@ class EnhancedTradingBot:
             self.trading_system = ImprovedQualityTrendSystem(config.get('trading_system', {}))
             self.logger.info("🔄 Created new trading system instance")
 
-        # ✅ ДОБАВЛЕНО: Адаптивный менеджер выхода с явным приведением типов
+        # ✅ ДОБАВЛЕНО: Адаптивный менеджер выхода с DI-поддержкой
         trading_config = config.get('trading_system', {})
         quality_config = trading_config.get('quality_detector', {})
 
-        global_tf = cast(Literal[ "1m", "5m", "15m", "1h"],
-                         quality_config.get('global_timeframe', '5m'))
-        trend_tf = cast(Literal[ "1m", "5m", "15m", "1h"],
-                        quality_config.get('trend_timeframe', '1m'))
-        entry_tf = cast(Literal[ "1m", "5m", "15m", "1h"],
-                        quality_config.get('entry_timeframe', '1m'))
-
-        self.exit_manager = AdaptiveExitManager(
-            global_timeframe=global_tf,
-            trend_timeframe=trend_tf,
+        global_tf = cast(
+            Literal["1m", "5m", "15m", "1h"],
+            quality_config.get('global_timeframe', '5m')
+        )
+        trend_tf = cast(
+            Literal["1m", "5m", "15m", "1h"],
+            quality_config.get('trend_timeframe', '1m')
+        )
+        entry_tf = cast(
+            Literal["1m", "5m", "15m", "1h"],
+            quality_config.get('entry_timeframe', '1m')
         )
 
-        self.logger.info(f"✅ AdaptiveExitManager created: global={global_tf}, trend={trend_tf}, entry={entry_tf}")
+        if exit_manager is not None:
+            # Используем ExitManager, переданный через DI из run_bot.py
+            self.exit_manager = exit_manager
+            self.logger.info(
+                f"✅ AdaptiveExitManager injected via DI: "
+                f"global={global_tf}, trend={trend_tf}, entry={entry_tf}"
+            )
+        else:
+            # Старое поведение: создаём свой экземпляр
+            self.exit_manager = AdaptiveExitManager(
+                global_timeframe=global_tf,
+                trend_timeframe=trend_tf,
+            )
+            self.logger.info(
+                f"✅ AdaptiveExitManager created: "
+                f"global={global_tf}, trend={trend_tf}, entry={entry_tf}"
+            )
 
         # Система мониторинга
         self.monitoring_system = EnhancedMonitoringSystem()
@@ -163,12 +184,15 @@ class EnhancedTradingBot:
         # Безопасное получение статуса
         try:
             st = self.trading_system.get_system_status()
-            self.logger.info(f"Status: regime={st.get('current_regime', 'unknown')} "
-                             f"conf={st.get('regime_confidence', 0):.2f} "
-                             f"trades_today={st.get('trades_today', 0)}/{st.get('max_daily_trades', 0)} "
-                             f"win_rate={st.get('win_rate', 0):.1%} pnl={st.get('total_pnl', 0):.2f}")
+            self.logger.info(
+                f"Status: regime={st.get('current_regime', 'unknown')} "
+                f"conf={st.get('regime_confidence', 0):.2f} "
+                f"trades_today={st.get('trades_today', 0)}/{st.get('max_daily_trades', 0)} "
+                f"win_rate={st.get('win_rate', 0):.1%} pnl={st.get('total_pnl', 0):.2f}"
+            )
         except Exception as e:
             self.logger.warning(f"Could not get initial system status: {e}")
+
 
     def _setup_logging(self) -> logging.Logger:
         """Настройка системы логирования"""
@@ -1042,13 +1066,12 @@ class EnhancedTradingBot:
         - Централизация трейлинга в ExitManager: используем update_trailing_state() при наличии
         - Безопасное определение primary_timeframe
         - Корректная обработка закрытия и обновления SL
-        - Fallback на старый update_position_stops(), если нет нового метода
+        - Используем единый источник текущей цены через ExchangeManager.get_current_price()
         """
         if not self.active_positions:
             return
 
         # Определяем основной таймфрейм для текущих данных
-        from typing import cast, Literal
         try:
             primary_timeframe_str = min(self.timeframes, key=self._parse_timeframe)
             primary_timeframe = cast(Literal["1m", "5m", "15m", "1h"], primary_timeframe_str)
@@ -1062,22 +1085,43 @@ class EnhancedTradingBot:
             # Совсем безопасный fallback
             primary_timeframe = cast(Literal["1m", "5m", "15m", "1h"], "1m")
 
-        # Текущая цена по основному ТФ
-        try:
-            current_price = float(market_data[primary_timeframe]['close'].iloc[-1])
-        except Exception:
-            self.logger.warning("Cannot get current_price from market_data; skip manage positions")
-            return
-
         for position_id, position in list(self.active_positions.items()):
             try:
-                # 0) Проверка стоп-ордеров по текущей цене (DEMO/BACKTEST)
-                try:
-                    exchange_manager = getattr(self.execution_engine, "exchange_manager", None) \
-                                       or getattr(self.execution_engine, "em", None)
+                # 0) Определяем символ позиции
+                symbol = position['signal'].get('symbol', self.symbol)
 
+                # 1) Определяем текущую цену через ExchangeManager (единый источник истины)
+                current_price = None
+                exchange_manager = None
+
+                try:
+                    exchange_manager = (
+                        getattr(self.execution_engine, "exchange_manager", None)
+                        or getattr(self.execution_engine, "em", None)
+                    )
+
+                    if exchange_manager and hasattr(exchange_manager, "get_current_price"):
+                        cp = exchange_manager.get_current_price(symbol)
+                        if cp is not None:
+                            current_price = float(cp)
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to resolve current_price for position {position_id}: {e}",
+                        exc_info=True
+                    )
+                    continue
+
+                # Если цену получить не удалось → пропускаем управление позицией
+                if current_price is None:
+                    self.logger.warning(
+                        f"current_price is None for position {position_id}, skip"
+                    )
+                    continue
+
+                # 2) Проверка стоп-ордеров по текущей цене (DEMO/BACKTEST)
+                try:
                     if exchange_manager and hasattr(exchange_manager, "check_stops_on_price_update"):
-                        symbol = position['signal'].get('symbol', self.symbol)
                         exchange_manager.check_stops_on_price_update(symbol, current_price)
                 except Exception as e:
                     self.logger.error(
@@ -1085,10 +1129,10 @@ class EnhancedTradingBot:
                         exc_info=True
                     )
 
-                # 1) Обновляем PnL трекера
+                # 3) Обновляем PnL трекера
                 self.position_tracker.update_position_pnl(position_id, current_price)
 
-                # 2) Решение о выходе (каскад/жёсткие условия/сигналы)
+                # 4) Решение о выходе (каскад/жёсткие условия/сигналы)
                 should_exit, reason, details = await self.exit_manager.should_exit_position(
                     position=position,
                     market_data=market_data,
@@ -1097,8 +1141,7 @@ class EnhancedTradingBot:
 
                 if should_exit:
                     self.logger.info(
-                        f"Closing position {position_id}: {reason} "
-                        f"(PnL: {details.get('pnl_pct', 0):.2%})"
+                        f"Closing position {position_id}: {reason}"
                     )
                     close_result = await self.execution_engine.close_position(position_id)
 
@@ -1112,7 +1155,7 @@ class EnhancedTradingBot:
                         )
                     continue  # позиция закрыта/попытка закрытия выполнена
 
-                # 3) Управление трейлингом/безубытком — централизовано в ExitManager
+                # 5) Управление трейлингом/безубытком — централизовано в ExitManager
                 if hasattr(self.exit_manager, "update_trailing_state"):
                     upd = self.exit_manager.update_trailing_state(position, current_price)
                     if upd.get("changed") and upd.get("new_stop_loss"):
@@ -1130,19 +1173,20 @@ class EnhancedTradingBot:
                         # Попробуем также выставить реальный STOP-ордер через PositionManager
                         try:
                             pm = getattr(self.execution_engine, "position_manager", None)
-                            em = getattr(self.execution_engine, "exchange_manager", None) \
-                                 or getattr(self.execution_engine, "em", None)
+                            em = (
+                                getattr(self.execution_engine, "exchange_manager", None)
+                                or getattr(self.execution_engine, "em", None)
+                            )
 
                             if pm and em:
                                 from decimal import Decimal
 
-                                symbol = position['signal']['symbol']
                                 pos_snapshot = pm.get_position(symbol)
 
                                 if pos_snapshot and pos_snapshot.get("status") != "FLAT":
                                     stop_req = pm.build_stop_order(
                                         signal=position['signal'],  # pm_signal из _process_trade_signal
-                                        position=pos_snapshot,  # актуальная позиция из PM
+                                        position=pos_snapshot,      # актуальная позиция из PM
                                         new_stop_price=Decimal(str(new_sl)),
                                         is_trailing=True
                                     )
@@ -1158,7 +1202,10 @@ class EnhancedTradingBot:
                                         f"(symbol={symbol})"
                                     )
                         except Exception as e:
-                            self.logger.error(f"Failed to send trailing stop via PositionManager: {e}", exc_info=True)
+                            self.logger.error(
+                                f"Failed to send trailing stop via PositionManager: {e}",
+                                exc_info=True
+                            )
                         await self._update_position_stop_loss(position_id, new_sl)
 
                 else:
