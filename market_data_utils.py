@@ -789,7 +789,6 @@ class MarketDataUtils:
 
             if preloaded_candles_1m_map is not None:
                 candles_1m_map = preloaded_candles_1m_map
-                self.logger.debug(f"✅ Using preloaded 1m mappings: {len(candles_1m_map)}")
             else:
                 candles_1m_map = await self._get_last_1m_candles(symbol, min_ts_1m, max_ts_1m)
                 self.logger.debug(f"📡 Loaded 1m mappings: {len(candles_1m_map)}")
@@ -871,15 +870,11 @@ class MarketDataUtils:
                 if indicators["price_change_5"] is not None:
                     metrics.indicators_count += 1
 
-                # ✅ ЛОГИРОВАНИЕ ПОСЛЕ КАЖДОГО ИНДИКАТОРА
-                self.logger.debug(f"price_change_5: {indicators['price_change_5']}")
-
                 # CMO-14
                 try:
                     cmo = self._cmo_series(window_data['closes'], 14)
                     indicators["cmo_14"] = cmo[-1] if cmo else None
                     metrics.indicators_count += 1
-                    self.logger.debug(f"cmo_14: {indicators['cmo_14']} (from {len(cmo)} values)")
                 except Exception as e:
                     self.logger.error(f"❌ CMO calculation failed: {e}")
                     indicators["cmo_14"] = None
@@ -889,7 +884,6 @@ class MarketDataUtils:
                     macd_data = self._macd_series(window_data['closes'], 12, 26, 9)
                     indicators["macd_histogram"] = macd_data[2][-1] if macd_data[2] else None
                     metrics.indicators_count += 1
-                    self.logger.debug(f"macd_histogram: {indicators['macd_histogram']}")
                 except Exception as e:
                     self.logger.error(f"❌ MACD calculation failed: {e}")
                     indicators["macd_histogram"] = None
@@ -906,11 +900,7 @@ class MarketDataUtils:
                     indicators["plus_di_14"] = dmi_data[0][-1] if dmi_data[0] else None
                     indicators["minus_di_14"] = dmi_data[1][-1] if dmi_data[1] else None
                     metrics.indicators_count += 3
-                    self.logger.debug(
-                        f"adx_14: {indicators['adx_14']}, "
-                        f"plus_di: {indicators['plus_di_14']}, "
-                        f"minus_di: {indicators['minus_di_14']}"
-                    )
+
                 except Exception as e:
                     self.logger.error(f"❌ DMI/ADX calculation failed: {e}")
                     indicators["adx_14"] = None
@@ -923,7 +913,6 @@ class MarketDataUtils:
                     indicators["atr_14_normalized"] = (atr_val / closes[i]) * 100 if atr_val and closes[
                         i] != 0 else None
                     metrics.indicators_count += 1
-                    self.logger.debug(f"atr_14_normalized: {indicators['atr_14_normalized']}")
                 except Exception as e:
                     self.logger.error(f"❌ ATR calculation failed: {e}")
                     indicators["atr_14_normalized"] = None
@@ -936,7 +925,6 @@ class MarketDataUtils:
                     indicators["bb_width"] = bb_width
                     indicators["bb_position"] = bb_position
                     metrics.indicators_count += 2
-                    self.logger.debug(f"bb_width: {bb_width}, bb_position: {bb_position}")
                 except Exception as e:
                     self.logger.error(f"❌ Bollinger Bands calculation failed: {e}")
                     indicators["bb_width"] = None
@@ -965,7 +953,6 @@ class MarketDataUtils:
                     indicators["close_position_in_range_1m"] = close_pos
                     metrics.indicators_count += 17
 
-                    self.logger.debug(f"ML features calculated: trend_momentum_z={indicators['trend_momentum_z']}")
                 except Exception as e:
                     self.logger.error(f"❌ ML features calculation failed: {e}")
                     # Установка значений по умолчанию
@@ -1075,11 +1062,6 @@ class MarketDataUtils:
 
             # СОХРАНЕНИЕ ТОЛЬКО ПОСЛЕДНЕЙ СВЕЧИ
             saved = await self.upsert_candles_5m(symbol, [out_row])
-
-            self.logger.debug(
-                f"Incremental 5m: {symbol}@{base_bar['ts']} - "
-                f"{metrics.indicators_count} indicators in {metrics.duration_ms:.1f}ms"
-            )
 
             return saved
 
