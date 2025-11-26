@@ -852,7 +852,6 @@ class MarketDataUtils:
             # СОХРАНЕНИЕ ТОЛЬКО ПОСЛЕДНЕЙ СВЕЧИ
             saved = await self.upsert_candles_5m(symbol, [out_row])
 
-
             return saved
 
         except Exception as e:
