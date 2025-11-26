@@ -516,10 +516,6 @@ class MarketHistoryManager:
                         self.logger.warning(f"No {interval} data received for {symbol}")
                         continue
 
-                    if not candles:
-                        self.logger.warning(f"No {interval} data received for {symbol}")
-                        continue
-
                     if interval == '1m':
                         candles_1m = candles
 
@@ -568,37 +564,27 @@ class MarketHistoryManager:
             interval: str,
             start_time: int,
             end_time: int,
-            interval_ms: int,
-            limit: int = 1000,
+            interval_ms: int,  # ← обязательно передавать (60_000 / 300_000)
+            limit: int = 1000,  # ← оставляем 1000 (стабильно на практике)
             max_period_retries: int = 2,
     ) -> List[Dict]:
         """
-        Жёсткая загрузка истории с Binance для одного интервала (1m/5m).
-
-        - Пагинация только тут.
-        - После КАЖДОЙ страницы проверяем непрерывность внутри страницы.
-        - После склейки страниц непрерывность по границам обеспечивается тем,
-          что next_start = last_ts_close + 1, и каждая страница валидна.
-
-        При обнаружении дыры:
-        - RuntimeError
-        - Период перекачивается с нуля (max_period_retries раз).
+        Строгая загрузка с обнаружением gap’ов и повтором.
+        Ключевые принципы:
+        - Пустая страница → не пропуск, а сигнал к retry текущего фрагмента.
+        - Валидация непрерывности каждой страницы.
+        - Проверка непрерывности между страницами (через ts).
+        - При gap → ошибка → перезагрузка всего периода (до max_period_retries).
         """
-        attempt = 0
-
-        while attempt < max_period_retries:
-            attempt += 1
+        for attempt in range(1, max_period_retries + 1):
             self.logger.info(
-                f"[STRICT] Download attempt {attempt}/{max_period_retries} "
-                f"for {symbol} {interval} from "
-                f"{datetime.fromtimestamp(start_time / 1000, UTC)} "
-                f"to {datetime.fromtimestamp(end_time / 1000, UTC)}"
+                f"[STRICT] Attempt {attempt}/{max_period_retries} for {symbol} {interval} "
+                f"({datetime.fromtimestamp(start_time / 1000, UTC)} → {datetime.fromtimestamp(end_time / 1000, UTC)})"
             )
-
-            candles: List[Dict] = []
-            current_start = start_time
-
             try:
+                all_candles: List[Dict] = []
+                current_start = start_time
+
                 while current_start < end_time:
                     page = await self.binance_fetcher.fetch_candles(
                         symbol=symbol,
@@ -607,80 +593,62 @@ class MarketHistoryManager:
                         end_time=end_time,
                         limit=limit,
                     )
-
                     if not page:
-                        # Биржа ничего не отдала — дальше смысла нет
-                        self.logger.warning(
-                            f"[STRICT] Empty page received for {symbol} {interval} "
-                            f"from ts={current_start}, stopping pagination."
-                        )
-                        break
-
-                    # Жёсткая проверка внутри страницы
-                    self._validate_candle_sequence_strict(
-                        symbol=symbol,
-                        interval=interval,
-                        candles=page,
-                        interval_ms=interval_ms,
-                    )
-
-                    candles.extend(page)
-
-                    last_ts_close = int(page[-1]["ts_close"])
-                    last_ts_open = int(page[-1]["ts"])
-
-                    # Если дошли/перешли конец периода — выходим
-                    if last_ts_close >= end_time:
-                        self.logger.debug(
-                            f"[STRICT] Reached end_time for {symbol} {interval}: "
-                            f"last_ts_close={last_ts_close} >= end_time={end_time}"
-                        )
-                        break
-
-                    # Защита от зацикливания
-                    if last_ts_open < current_start:
+                        # ❗ Пустой ответ — критично. Мы не можем просто "прыгать".
+                        # Это либо временная ошибка, либо gap. Но gap выявляется ВАЛИДАЦИЕЙ, не предположением.
                         raise RuntimeError(
-                            f"[STRICT] Pagination stalled for {symbol} {interval}: "
-                            f"last_ts_open={last_ts_open} < current_start={current_start}"
+                            f"Empty page from Binance at ts={current_start} "
+                            f"for {symbol} {interval}. Cannot assume gap — data may exist."
                         )
 
-                    # Следующую страницу начинаем после ts_close
+                    # ✅ Валидация внутри страницы (уже есть в fetch_candles? нет — делаем здесь)
+                    # (либо вызвать self._validate_candle_sequence_strict, но только на page)
+                    if len(page) > 1:
+                        for i in range(len(page) - 1):
+                            ts_curr = page[i]['ts']
+                            ts_next = page[i + 1]['ts']
+                            if ts_next - ts_curr != interval_ms:
+                                raise RuntimeError(
+                                    f"Internal gap in page: {ts_curr} → {ts_next} "
+                                    f"({(ts_next - ts_curr) / 60_000:.1f} min) for {symbol} {interval}"
+                                )
+
+                    # ✅ Проверка непрерывности между страницами
+                    if all_candles:
+                        prev_last_ts_close = all_candles[-1]['ts_close']
+                        first_new_ts = page[0]['ts']
+                        if first_new_ts != prev_last_ts_close + 1:
+                            gap_ms = first_new_ts - (prev_last_ts_close + 1)
+                            gap_min = gap_ms / 60_000
+                            raise RuntimeError(
+                                f"Gap between pages: expected {prev_last_ts_close + 1}, got {first_new_ts} "
+                                f"(gap = {gap_min:.1f} min) for {symbol} {interval}"
+                            )
+
+                    all_candles.extend(page)
+
+                    # Расчёт следующего start — строго по факту
+                    last_ts_close = page[-1]['ts_close']
+                    if last_ts_close >= end_time:
+                        break
                     current_start = last_ts_close + 1
 
-                    # Немного бережём API
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.07)  # rate-friendly
 
-                # Если дошли сюда без ошибок — успех
-                if not candles:
-                    self.logger.warning(
-                        f"[STRICT] No candles downloaded for {symbol} {interval} "
-                        f"on attempt {attempt}"
-                    )
+                if not all_candles:
+                    self.logger.warning(f"[STRICT] No candles returned for {symbol} {interval} on attempt {attempt}")
                 else:
-                    self.logger.info(
-                        f"[STRICT] Successfully downloaded {len(candles)} {interval} "
-                        f"candles for {symbol} on attempt {attempt}"
-                    )
-                return candles
+                    self.logger.info(f"[STRICT] Success: {len(all_candles)} {interval} candles for {symbol}")
+                return all_candles
 
-            except RuntimeError as strict_err:
-                self.logger.error(
-                    f"[STRICT] Validation error on attempt {attempt} "
-                    f"for {symbol} {interval}: {strict_err}"
-                )
-                if attempt >= max_period_retries:
-                    # Дальше не пытаемся — отдадим ошибку наверх
+            except RuntimeError as e:
+                self.logger.error(f"[STRICT] Failed on attempt {attempt}: {e}")
+                if attempt == max_period_retries:
+                    self.logger.critical(f"[STRICT] All retries exhausted for {symbol} {interval}")
                     raise
+                await asyncio.sleep(1.5 * attempt)
 
-                self.logger.warning(
-                    f"[STRICT] Retrying full period download for {symbol} {interval}..."
-                )
-                # Маленькая пауза перед повтором
-                await asyncio.sleep(1.0)
-
-        # Теоретически сюда не дойдём (raise выше), но на всякий случай:
         return []
-
 
     def _validate_candle_sequence_strict(
             self,
