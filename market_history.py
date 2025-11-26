@@ -730,8 +730,31 @@ class MarketHistoryManager:
         buffer = self._buffers.get(timeframe, {}).get(symbol)
         return list(buffer) if buffer else None
 
+    async def _interactive_recalc_menu(self) -> None:
+        print("\n" + "=" * 60)
+        print("INDICATOR RE-CALCULATION MODE")
+        print("=" * 60)
+
+        symbol = input("Enter symbol [ETHUSDT]: ").strip().upper() or "ETHUSDT"
+        days_back = 90
+        while True:
+            days_input = input(f"Re-calculate last N days [{days_back}]: ").strip()
+            try:
+                days_back = int(days_input) if days_input else days_back
+                break
+            except ValueError:
+                print("Please enter a valid number.")
+
+        print(f"\n🔥 Starting re-calc for {symbol} ({days_back} days) ...")
+        try:
+            await self._warmup_existing_data(symbol, days_back)
+            print(f"\n✅ Re-calculation completed for {symbol}")
+        except Exception as e:
+            print(f"\n❌ Error during re-calc: {e}")
+            sys.exit(1)
+
     async def interactive_load(self):
-        """Интерактивная загрузка истории с консоли с проверкой существующих данных и прогресс-баром."""
+        """Переработанное меню с выбором режима"""
         import sys
         from tqdm import tqdm
 
@@ -739,6 +762,19 @@ class MarketHistoryManager:
         print("HISTORICAL DATA LOADER")
         print("=" * 60)
 
+        # --- выбор режима ---
+        print("\nВыберите режим:")
+        print(" 1  Загрузить историю с Binance")
+        print(" 2  Пересчитать индикаторы по локальным данным")
+        while True:
+            choice = input(">>> [1/2]: ").strip()
+            if choice in {"1", "2"}:
+                break
+            print("Введите 1 или 2")
+
+        if choice == "2":
+            await self._interactive_recalc_menu()
+            return
         # Ввод символа
         symbol = input(f"\nEnter symbol [ETHUSDT]: ").strip().upper()
         if not symbol:
