@@ -6,18 +6,18 @@ market_data_utils.py - Утилиты для расчета индикаторо
 from __future__ import annotations
 import asyncio
 from sqlalchemy.engine import Engine
+from typing import Dict, Set, Optional
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import  create_async_engine
 import logging
-from typing import  List, Tuple, Any
+from typing import  List, Tuple
 import pandas as pd
 import numpy as np
 from config import TABLES
 from dataclasses import dataclass
-from typing import Optional
-import statistics
-from dataclasses import asdict,field
+from dataclasses import field
 from iqts_standards import FEATURE_NAME_MAP
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import datetime, UTC
 from tqdm import tqdm
 
 @dataclass
@@ -63,8 +63,6 @@ class IndicatorConfig:
 #  СХЕМА БД
 # =============================================================================
 # --- helpers for schema migrations -----------------------------------
-from typing import Dict, Set
-from sqlalchemy import text
 
 def _table_columns(conn, table_name: str) -> Set[str]:
     """
@@ -222,60 +220,6 @@ def ensure_market_schema(engine: Engine, logger: Optional[logging.Logger] = None
         _add_missing_columns(conn, t5m, required_cols_5m)
 
 
-# =============================================================================
-#  ОСНОВНОЙ КЛАСС УТИЛИТ
-# =============================================================================
-def _cusum_online_delta_closes_with_z(
-    closes: pd.Series,
-    normalize_window: int = 50,
-    eps: float = 0.5,     # порог для z → BUY/SELL/HOLD
-    h: float = 0.5,       # чувствительность: k_t = h * rolling_sigma(Δclose)
-    z_to_conf: float = 1.0
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    CUSUM по Δclose с анти-look-ahead нормализацией:
-      - динамический порог k_t = h * σ_t(Δclose), где σ_t посчитана на прошлом окне
-      - z-score также нормализуется по прошлому окну (shift(1))
-    Возвращает:
-      s     : накопитель CUSUM (Series[float])
-      z     : z-score CUSUM (Series[float])
-      state : 1=BUY, -1=SELL, 0=HOLD (Series[int])
-      conf  : |z| * z_to_conf (Series[float])
-    """
-    closes = closes.astype(float)
-    diffs = closes.diff().fillna(0.0)
-
-    # Динамический порог по прошлому окну (без подсмотра вперёд)
-    roll_sigma = diffs.rolling(normalize_window, min_periods=normalize_window).std(ddof=0).shift(1)
-    k = (h * roll_sigma).fillna(0.0).to_numpy()
-
-    s_up = 0.0
-    s_dn = 0.0
-    vals = []
-
-    diffs_np = diffs.to_numpy()
-    for x, k_i in zip(diffs_np, k):
-        # односторонние накопители с порогом k_i
-        s_up = max(0.0, s_up + x - k_i)
-        s_dn = min(0.0, s_dn + x + k_i)
-        vals.append(s_up if abs(s_up) >= abs(s_dn) else s_dn)
-
-    s = pd.Series(vals, index=closes.index, dtype=float)
-
-    # Анти-look-ahead нормализация CUSUM по прошлому окну
-    roll = s.rolling(normalize_window, min_periods=normalize_window)
-    mean = roll.mean().shift(1)
-    std = roll.std(ddof=0).shift(1).replace(0.0, np.nan)
-
-    z = (s - mean) / std
-    z = z.fillna(0.0)
-
-    state_arr = np.where(z > eps, 1, np.where(z < -eps, -1, 0)).astype(np.int8)
-    state = pd.Series(state_arr, index=s.index)
-    conf = z.abs() * float(z_to_conf)
-
-    return s, z, state, conf
-
 class MarketDataUtils:
     """
     Вычисления индикаторов и операции чтения/записи для candles_1m и candles_5m.
@@ -425,134 +369,6 @@ class MarketDataUtils:
         """
         return ((ts - phase_ms) // interval_ms) * interval_ms + phase_ms
 
-    def set_indicator_config(self, config: IndicatorConfig) -> None:
-        """Обновление конфигурации индикаторов"""
-        self.indicator_config = config
-        self.logger.info(f"Updated indicator configuration: {config}")
-
-    def get_metrics(self, symbol: str) -> Optional[CalculationMetrics]:
-        """Получение метрик расчета для символа"""
-        return self._metrics.get(symbol)
-    # ======================================================================
-    # 5m FEATURES (ML)
-    # ======================================================================
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Получение общей статистики работы"""
-        stats = {
-            "version": self.version,
-            "created_at": self.created_at.isoformat(),
-            "created_by": self.created_by,
-            "uptime_seconds": (datetime.now(UTC) - self.created_at).total_seconds(),
-            "total_calculations": len(self._metrics),
-            "active_symbols": len(set(m.symbol for m in self._metrics.values())),
-            "total_errors": sum(m.errors_count for m in self._metrics.values()),
-            "avg_duration_ms": statistics.mean(
-                m.duration_ms for m in self._metrics.values()
-                if m.duration_ms > 0
-            ) if self._metrics else 0,
-            "indicator_config": asdict(self.indicator_config),
-        }
-        return stats
-
-    def backfill_5m_cusum(
-            self,
-            symbol: str = "ETHUSDT",
-            days: int = 5,
-            normalize_window: int = 150,
-            z_to_conf: float = 1.0,
-            batch_size: int = 1440
-    ) -> dict:
-        """
-        Бэкфилл CUSUM полей для 5m-таблицы за последние `days` дней.
-        """
-        if not hasattr(self, "engine") or self.engine is None:
-            raise RuntimeError("MarketDataUtils.backfill_5m_cusum: self.engine is not set")
-
-        try:
-            t5m = TABLES.get("candles_5m")
-        except Exception:
-            t5m = None
-        t5m = t5m or "candles_5m"
-
-        since_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
-
-        with self.engine.begin() as conn:
-            df = pd.read_sql(
-                text(f"""
-                    SELECT ts, close
-                      FROM {t5m}
-                     WHERE symbol = :sym
-                       AND finalized = 1
-                       AND ts >= :since
-                     ORDER BY ts ASC
-                """),
-                conn,
-                params={"sym": symbol, "since": since_ts}
-            )
-
-            if df.empty:
-                return {"symbol": symbol, "rows": 0, "updated": 0, "since_ts": since_ts}
-
-            cusum_results = self.calculate_cusum(df["close"], self.cusum_config_5m)
-
-            payload = pd.DataFrame({
-                "cusum": cusum_results['cusum'],
-                "cusum_state": cusum_results['cusum_state'],
-                "cusum_zscore": cusum_results['cusum_zscore'],
-                "cusum_conf": cusum_results['cusum_conf'],
-                "cusum_pos": cusum_results['cusum_pos'],
-                "cusum_neg": cusum_results['cusum_neg'],
-                "cusum_reason": pd.Series([None] * len(df), index=df.index, dtype=object),
-                "ts": df["ts"].astype(int),
-            })
-
-            # ✅ Восстановлено: расчёт mean/std с shift(1) – анти-lookahead
-            win = normalize_window
-            payload["cusum_price_mean"] = (
-                df["close"]
-                .rolling(win, min_periods=win)
-                .mean()
-                .shift(1)
-            )
-            payload["cusum_price_std"] = (
-                df["close"]
-                .rolling(win, min_periods=win)
-                .std(ddof=0)
-                .shift(1)
-            )
-
-            sql_upd = text(f"""
-                UPDATE {t5m}
-                   SET cusum = :cusum,
-                       cusum_state = :cusum_state,
-                       cusum_zscore = :cusum_zscore,
-                       cusum_conf = :cusum_conf,
-                       cusum_price_mean = :cusum_price_mean,
-                       cusum_price_std = :cusum_price_std,
-                       cusum_pos = :cusum_pos,
-                       cusum_neg = :cusum_neg,
-                       cusum_reason = :cusum_reason
-                 WHERE symbol = :symbol
-                   AND ts = :ts
-            """)
-
-            updated = 0
-            for start in range(0, len(payload), batch_size):
-                chunk = payload.iloc[start:start + batch_size].copy()
-                chunk["symbol"] = symbol
-                conn.execute(sql_upd, chunk.to_dict(orient="records"))
-                updated += len(chunk)
-
-        return {
-            "symbol": symbol,
-            "rows": int(len(df)),
-            "updated": int(updated),
-            "since_ts": since_ts,
-            "normalize_window": normalize_window,
-            "z_to_conf": z_to_conf
-        }
-
     async def compute_5m_features_bulk(self, symbol: str, bars_5m: List[dict]) -> int:
         """Оптимизированная версия с предзагрузкой 15-минутных окон CUSUM и прогресс-баром"""
         self.logger.info(f"🚀 START compute_5m_features_bulk for {symbol} with {len(bars_5m)} candles")
@@ -656,32 +472,6 @@ class MarketDataUtils:
             self.logger.error(f"💥 Critical error: {e}", exc_info=True)
             return 0
 
-    async def _compute_5m_features_for_last_candle_with_data(
-            self, symbol: str, bars_5m: List[dict], cusum_signals: List[dict], candles_1m_map: dict
-    ) -> int:
-        """
-        Версия _compute_5m_features_for_last_candle с предзагруженными данными
-        """
-        # Временно используем существующий метод, но передаем данные через атрибуты
-        # или создадим адаптер
-
-        try:
-            # Создаем временный объект для передачи данных
-            class TempData:
-                def __init__(self, cusum_signals, candles_1m_map):
-                    self.cusum_signals = cusum_signals
-                    self.candles_1m_map = candles_1m_map
-
-            temp_data = TempData(cusum_signals, candles_1m_map)
-
-            # Вызываем существующий метод, но подменяем вызовы внутренних методов
-            return await self._compute_5m_features_for_last_candle(symbol, bars_5m)
-
-        except Exception as e:
-            self.logger.error(f"Error in adapted 5m calculation: {e}")
-            # Fallback: сохраняем последнюю свечу без индикаторов
-            await self.upsert_candles_5m(symbol, [bars_5m[-1]])
-            return 0
 
     async def compute_5m_features_incremental(self, symbol: str, new_bar_5m: dict) -> dict:
         """
@@ -788,6 +578,7 @@ class MarketDataUtils:
 
             if preloaded_candles_1m_map is not None:
                 candles_1m_map = preloaded_candles_1m_map
+                self.logger.debug(f"✅ Using preloaded 1m mappings: {len(candles_1m_map)}")
             else:
                 candles_1m_map = await self._get_last_1m_candles(symbol, min_ts_1m, max_ts_1m)
                 self.logger.debug(f"📡 Loaded 1m mappings: {len(candles_1m_map)}")
@@ -869,11 +660,15 @@ class MarketDataUtils:
                 if indicators["price_change_5"] is not None:
                     metrics.indicators_count += 1
 
+                # ✅ ЛОГИРОВАНИЕ ПОСЛЕ КАЖДОГО ИНДИКАТОРА
+                self.logger.debug(f"price_change_5: {indicators['price_change_5']}")
+
                 # CMO-14
                 try:
                     cmo = self._cmo_series(window_data['closes'], 14)
                     indicators["cmo_14"] = cmo[-1] if cmo else None
                     metrics.indicators_count += 1
+                    self.logger.debug(f"cmo_14: {indicators['cmo_14']} (from {len(cmo)} values)")
                 except Exception as e:
                     self.logger.error(f"❌ CMO calculation failed: {e}")
                     indicators["cmo_14"] = None
@@ -883,6 +678,7 @@ class MarketDataUtils:
                     macd_data = self._macd_series(window_data['closes'], 12, 26, 9)
                     indicators["macd_histogram"] = macd_data[2][-1] if macd_data[2] else None
                     metrics.indicators_count += 1
+                    self.logger.debug(f"macd_histogram: {indicators['macd_histogram']}")
                 except Exception as e:
                     self.logger.error(f"❌ MACD calculation failed: {e}")
                     indicators["macd_histogram"] = None
@@ -899,7 +695,11 @@ class MarketDataUtils:
                     indicators["plus_di_14"] = dmi_data[0][-1] if dmi_data[0] else None
                     indicators["minus_di_14"] = dmi_data[1][-1] if dmi_data[1] else None
                     metrics.indicators_count += 3
-
+                    self.logger.debug(
+                        f"adx_14: {indicators['adx_14']}, "
+                        f"plus_di: {indicators['plus_di_14']}, "
+                        f"minus_di: {indicators['minus_di_14']}"
+                    )
                 except Exception as e:
                     self.logger.error(f"❌ DMI/ADX calculation failed: {e}")
                     indicators["adx_14"] = None
@@ -912,6 +712,7 @@ class MarketDataUtils:
                     indicators["atr_14_normalized"] = (atr_val / closes[i]) * 100 if atr_val and closes[
                         i] != 0 else None
                     metrics.indicators_count += 1
+                    self.logger.debug(f"atr_14_normalized: {indicators['atr_14_normalized']}")
                 except Exception as e:
                     self.logger.error(f"❌ ATR calculation failed: {e}")
                     indicators["atr_14_normalized"] = None
@@ -924,6 +725,7 @@ class MarketDataUtils:
                     indicators["bb_width"] = bb_width
                     indicators["bb_position"] = bb_position
                     metrics.indicators_count += 2
+                    self.logger.debug(f"bb_width: {bb_width}, bb_position: {bb_position}")
                 except Exception as e:
                     self.logger.error(f"❌ Bollinger Bands calculation failed: {e}")
                     indicators["bb_width"] = None
@@ -952,6 +754,7 @@ class MarketDataUtils:
                     indicators["close_position_in_range_1m"] = close_pos
                     metrics.indicators_count += 17
 
+                    self.logger.debug(f"ML features calculated: trend_momentum_z={indicators['trend_momentum_z']}")
                 except Exception as e:
                     self.logger.error(f"❌ ML features calculation failed: {e}")
                     # Установка значений по умолчанию
@@ -1061,6 +864,11 @@ class MarketDataUtils:
 
             # СОХРАНЕНИЕ ТОЛЬКО ПОСЛЕДНЕЙ СВЕЧИ
             saved = await self.upsert_candles_5m(symbol, [out_row])
+
+            self.logger.debug(
+                f"Incremental 5m: {symbol}@{base_bar['ts']} - "
+                f"{metrics.indicators_count} indicators in {metrics.duration_ms:.1f}ms"
+            )
 
             return saved
 
@@ -1285,72 +1093,6 @@ class MarketDataUtils:
                 price_move.append(0.0)
 
         return recent, quality, trend_aligned, price_move
-
-    def _validate_input_bars(self, bars: List[dict]) -> bool:
-        """Валидация входных данных"""
-        if not bars:
-            return False
-
-        required = {"open", "high", "low", "close", "ts"}
-
-        for bar in bars:
-            # Проверка наличия полей
-            if not all(field in bar for field in required):
-                return False
-
-            # Проверка типов и значений
-            try:
-                if not all(isinstance(float(bar[f]), (int, float))
-                           and float(bar[f]) > 0 for f in ["open", "high", "low", "close"]):
-                    return False
-
-                if not isinstance(bar["ts"], (int, float)) or bar["ts"] <= 0:
-                    return False
-
-                # Проверка High/Low
-                if not (float(bar["high"]) >= float(bar["open"]) and
-                        float(bar["high"]) >= float(bar["close"]) and
-                        float(bar["low"]) <= float(bar["open"]) and
-                        float(bar["low"]) <= float(bar["close"])):
-                    return False
-
-            except (ValueError, TypeError):
-                return False
-
-        return True
-
-    # ======================================================================
-    # 1m CUSUM (warmup + incremental)
-    # ======================================================================
-
-    def _cosum_series(self, closes: List[float], period: int, normalize_window: int) -> List[Optional[float]]:
-        """
-        Backward-compatible CUSUM (alias).
-        Параметр `period` сохранён для совместимости и на результат не влияет.
-        """
-        # помечаем параметр как "использованный", чтобы линтеры не ругались
-        _ = int(period)
-
-        s = pd.Series(closes, dtype="float64")
-        # при None/NaN в исходных значениях защищаемся от вылетов
-        s = s.ffill().bfill()
-        diff = s.diff().fillna(0.0)
-
-        # Односторонний накопительный сумматор (CUSUM)
-        pos: List[float] = []
-        csum = 0.0
-        for d in diff.tolist():
-            csum = max(0.0, csum + d) if d >= 0 else min(0.0, csum + d)
-            pos.append(csum)
-
-        # Нормализация: z-score по последнему значению в окне normalize_window
-        series_pos = pd.Series(pos, dtype="float64")
-        z = series_pos.rolling(window=normalize_window, min_periods=normalize_window).apply(
-            lambda x: (x.iloc[-1] - np.nanmean(x)) / (np.nanstd(x) if np.nanstd(x) > 0 else np.nan),
-            raw=False
-        )
-
-        return [None if pd.isna(v) or np.isinf(v) else float(v) for v in z.tolist()]
 
     async def upsert_candles_1m(self, symbol: str, bars_1m: List[dict]) -> int:
         if not bars_1m:
@@ -1746,33 +1488,6 @@ class MarketDataUtils:
             "reason": "ready" if ready else "warmup"
         }
 
-    @staticmethod
-    def _roc_series(closes: List[float], period: int) -> List[Optional[float]]:
-        """
-        Rate of Change (ROC) индикатор.
-        ROC = (Close[i] - Close[i-period]) / Close[i-period] * 100
-
-        Args:
-            closes: цены закрытия
-            period: период для расчёта
-
-        Returns:
-            список ROC значений
-        """
-        result: List[Optional[float]] = []
-
-        for i in range(len(closes)):
-            if i < period:
-                result.append(None)
-            else:
-                prev_close = closes[i - period]
-                if prev_close != 0:
-                    roc = ((closes[i] - prev_close) / prev_close) * 100.0
-                    result.append(roc)
-                else:
-                    result.append(None)
-
-        return result
 
     async def upsert_candles_5m(self, symbol: str, bars_5m: List[dict]) -> int:
         if not bars_5m:
@@ -2137,40 +1852,6 @@ class MarketDataUtils:
             [None if pd.isna(v) or np.isinf(v) else float(v) for v in pos.tolist()],
         )
 
-    @staticmethod
-    def _atr_series(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[Optional[float]]:
-        """
-        Average True Range (ATR) индикатор.
-
-        Args:
-            high: максимальные цены
-            low: минимальные цены
-            close: цены закрытия
-            period: период для сглаживания
-
-        Returns:
-            список ATR значений
-        """
-        if len(high) < period + 1:
-            return [None] * len(high)
-
-        h = pd.Series(high, dtype="float64")
-        l = pd.Series(low, dtype="float64")
-        c = pd.Series(close, dtype="float64")
-
-        prev_c = c.shift(1)
-
-        # True Range = max(high-low, |high-prev_close|, |low-prev_close|)
-        tr1 = (h - l).abs()
-        tr2 = (h - prev_c).abs()
-        tr3 = (l - prev_c).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        # ATR = RMA(TR, period) - используем EWM с alpha=1/period для Wilder's smoothing
-        atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-
-        return [None if pd.isna(v) or np.isinf(v) else float(v) for v in atr.tolist()]
-
 
     def _wilders_smoothing(self, series: pd.Series, period: int) -> pd.Series:
         if series is None or len(series) == 0 or period <= 1:
@@ -2339,28 +2020,6 @@ class MarketDataUtils:
             else:
                 result.append(None)
         return result
-
-    @staticmethod
-    def _regime_volatility_series(atr: List[Optional[float]], close: List[float]) -> List[Optional[float]]:
-        """
-        Расчет нормализованной волатильности.
-        regime_volatility = ATR(14) / Close
-
-        Args:
-            atr: значения ATR(14)
-            close: цены закрытия
-
-        Returns:
-            список нормализованной волатильности
-        """
-        result: List[Optional[float]] = []
-        for i in range(len(close)):
-            if atr[i] is not None and close[i] is not None and close[i] != 0:
-                result.append(atr[i] / close[i])
-            else:
-                result.append(None)
-        return result
-
 
     @staticmethod
     def _volume_ratio_ema3_series(volume: List[float], ema_period: int = 3) -> List[Optional[float]]:
