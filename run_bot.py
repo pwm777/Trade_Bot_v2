@@ -1853,27 +1853,32 @@ class BotLifecycleManager:
                         self.logger.error(f"Error in task cleanup: {e}")
 
             async def handle_candle_ready(self, symbol: str, candle: Candle1m, recent_stack: List[Candle1m]) -> None:
-                """
-                Обработка готовой свечи - делегирование в EnhancedTradingBot.
-                
-                MainBotAdapter - это только адаптер интерфейса, вся логика в core bot.
-                """
                 try:
                     self.logger.debug(
                         f"🎯 MainBotAdapter.handle_candle_ready: {symbol} @ {candle.get('ts')} "
                         f"(_timeframe={candle.get('_timeframe', 'unknown')})"
                     )
-                    
-                    # Обновление статистики
+
+                    # статистика
                     self._stats["candles_processed"] += 1
-                    self._stats["last_candle_ts"] = candle.get('ts')
+                    self._stats["last_candle_ts"] = candle.get("ts")
                     self._stats["events_processed"] += 1
-                    
-                    # ✅ Делегирование в EnhancedTradingBot
-                    await self.core.on_candle_ready(symbol, candle, recent_stack)
-                    
+
+                    # ✅ конвертация свечи в dict
+                    candle_dict = candle.raw if hasattr(candle, "raw") else dict(candle)
+
+                    # ✅ конвертация стека свечей в dict list
+                    recent_stack_dicts = [
+                        c.raw if hasattr(c, "raw") else dict(c)
+                        for c in recent_stack
+                    ]
+
+                    # делегируем в core
+                    await self.core.on_candle_ready(symbol, candle_dict, recent_stack_dicts)
+
                 except Exception as e:
                     self.logger.error(f"Error in handle_candle_ready: {e}", exc_info=True)
+
         # ================================================================
         # Возвращаем адаптер
         # ================================================================
@@ -2040,7 +2045,7 @@ async def main():
         return
 
     # For DEMO/LIVE modes, trading_logger not needed upfront
-    runtime_cfg = cfg.build_runtime_config(trading_logger=None)
+    runtime_cfg = await cfg.build_runtime_config(trading_logger=None)
 
     def event_handler(event: BotLifecycleEvent) -> None:
         event_type = event['event_type']
