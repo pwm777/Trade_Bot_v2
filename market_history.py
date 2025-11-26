@@ -509,7 +509,7 @@ class MarketHistoryManager:
                         end_time=end_time,
                         interval_ms=interval_ms,
                         limit=1000,
-                        max_period_retries=2,
+                        max_period_retries=5,
                     )
 
                     if not candles:
