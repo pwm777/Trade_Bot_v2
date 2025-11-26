@@ -21,7 +21,7 @@ import logging
 from datetime import UTC
 import lightgbm as lgb
 import joblib
-
+from config import BASE_FEATURE_NAMES
 from iqts_standards import (
     DetectorSignal, Detector,
     normalize_signal, Timeframe
@@ -54,14 +54,7 @@ class MLGlobalDetector(Detector):
         self.use_scaler = use_scaler
 
         # Базовые признаки — будут заменены при загрузке пакетной модели (из метаданных)
-        self.base_feature_names: List[str] = [
-            'cmo_14', 'volume', 'trend_acceleration_ema7', 'regime_volatility',
-            'bb_width', 'adx_14', 'plus_di_14', 'minus_di_14', 'atr_14_normalized',
-            'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio',
-            'lower_shadow_ratio', 'price_vs_vwap', 'bb_position',
-            'cusum_1m_quality_score', 'cusum_1m_trend_aligned', 'cusum_1m_price_move',
-            'is_trend_pattern_1m', 'body_to_range_ratio_1m', 'close_position_in_range_1m'
-        ]
+        self.base_feature_names = BASE_FEATURE_NAMES
         # lookback по умолчанию (будет заменён из модели при загрузке пакетного формата)
         self.lookback: int = 1
         # Полные имена windowed-признаков (генерируются из base_feature_names и lookback)

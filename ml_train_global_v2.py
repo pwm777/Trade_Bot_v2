@@ -24,7 +24,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 from collections import Counter
 import joblib
 from pathlib import Path
-
+from config import BASE_FEATURE_NAMES
 warnings.filterwarnings('ignore')
 import re
 import os, numpy as np, pandas as pd
@@ -50,34 +50,6 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 MARKET_DB_DSN: str = f"sqlite:///{DATA_DIR}/market_data.sqlite"
-
-# ──────────────────────────────────────────────────────────────
-# СПИСОК БАЗОВЫХ ПРИЗНАКОВ (из одного бара)
-# ──────────────────────────────────────────────────────────────
-BASE_FEATURE_NAMES = [
-    'cmo_14',
-    'volume',
-    'trend_acceleration_ema7',
-    'regime_volatility',
-    'bb_width',
-    'adx_14',
-    'plus_di_14',
-    'minus_di_14',
-    'atr_14_normalized',
-    'volume_ratio_ema3',
-    'candle_relative_body',
-    'upper_shadow_ratio',
-    'lower_shadow_ratio',
-    'price_vs_vwap',
-    'bb_position',
-    'cusum_1m_quality_score',
-    'cusum_1m_trend_aligned',
-    'cusum_1m_price_move',
-    'is_trend_pattern_1m',
-    'body_to_range_ratio_1m',
-    'close_position_in_range_1m'
-]
-
 
 # ──────────────────────────────────────────────────────────────
 # УТИЛИТЫ

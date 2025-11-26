@@ -8,6 +8,7 @@ import pandas as pd
 import sys
 import hashlib, json
 from dataclasses import dataclass
+from config import BASE_FEATURE_NAMES
 from iqts_standards import Direction
 from typing import Tuple, List, Dict,  Any
 from datetime import datetime, UTC
@@ -159,24 +160,8 @@ class DataLoader:
         self.symbol = symbol
         self.timeframe = timeframe
         self.config = config  # ← Сохраняем config
-        self.feature_names = []
-        self._initialize_features()
+        self.feature_names = BASE_FEATURE_NAMES
 
-    def _initialize_features(self):
-        """Инициализация списка фич для ML"""
-        self.feature_names = [
-            # 'trend_momentum_z',  # ← УДАЛИТЬ (дубликат bb_position)
-             'cmo_14',
-            # 'macd_histogram',
-            'volume',
-            'trend_acceleration_ema7', 'regime_volatility', 'bb_width', 'adx_14',
-            'plus_di_14',
-            'minus_di_14', 'atr_14_normalized', 'volume_ratio_ema3',
-            'candle_relative_body', 'upper_shadow_ratio', 'lower_shadow_ratio',
-            'price_vs_vwap', 'bb_position', 'cusum_1m_recent', 'cusum_1m_quality_score',
-            'cusum_1m_trend_aligned', 'cusum_1m_price_move', 'is_trend_pattern_1m',
-            'body_to_range_ratio_1m', 'close_position_in_range_1m',
-        ]
 
     def connect(self) -> Engine:
         """Установка соединения с БД через SQLAlchemy"""
@@ -510,7 +495,7 @@ class AdvancedLabelingTool:
     def _validate_snapshot_frame(self, df: pd.DataFrame):
         """
         Проверяет и очищает датафрейм перед записью в БД.
-        Валидирует структуру для 4-классовой модели.
+        Валидирует структуру для 3-классовой модели.
         """
         # Обязательные колонки для новой структуры
         required = ["ts", "datetime", "reversal_label", "sample_weight"]
@@ -518,10 +503,12 @@ class AdvancedLabelingTool:
         if missing:
             raise ValueError(f"Snapshot validation failed: missing required columns: {missing}")
 
-        # Проверка значений reversal_label (0,1,2,3)
-        if not df["reversal_label"].isin([0, 1, 2, 3]).all():
-            invalid_labels = df[~df["reversal_label"].isin([0, 1, 2, 3])]["reversal_label"].unique()
-            raise ValueError(f"Invalid reversal_label values: {invalid_labels}. Expected: 0,1,2,3")
+        # Проверка значений reversal_label (0=NO_SIGNAL/HOLD, 1=BUY, 2=SELL)
+        allowed_labels = [0, 1, 2]
+        if not df["reversal_label"].isin(allowed_labels).all():
+            invalid_labels = df.loc[~df["reversal_label"].isin(allowed_labels), "reversal_label"].unique()
+            raise ValueError(
+                f"Invalid reversal_label values: {invalid_labels}. Expected: {allowed_labels}")
 
         # Удаление дубликатов по ts
         duplicates_count = df.duplicated(subset=["ts"]).sum()
@@ -534,15 +521,53 @@ class AdvancedLabelingTool:
         nan_mask = df[critical_cols].isna().any(axis=1)
         nan_drop_rows = nan_mask.sum()
         if nan_drop_rows > 0:
-            logger.warning(f"⚠️  Удаляем {nan_drop_rows} строк с NaN в критичных колонках")
+            logger.warning("⚠️  Удаляем %d строк с NaN в критичных колонках", nan_drop_rows)
             df = df[~nan_mask]
 
+        # Базовые метрики
         issues = {
             "duplicates_removed": int(duplicates_count),
-            "class_balance": df["reversal_label"].value_counts().to_dict()
+            "nan_drop_rows": int(nan_drop_rows),
+            "class_balance": df["reversal_label"].value_counts().to_dict(),
         }
 
+        # ── TS-валидация ──────────────────────────────────────────
+        # 1) При необходимости сортируем по ts
+        if not df["ts"].is_monotonic_increasing:
+            logger.warning("⚠️  ts не монотонно возрастают — сортируем по ts")
+            df = df.sort_values("ts").reset_index(drop=True)
+            issues["ts_sorted"] = True
+        else:
+            issues["ts_sorted"] = False
+
+        # 2) Поиск разрывов по времени, если знаем шаг таймфрейма
+        timeframe_ms_map = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+        tf = str(getattr(self.config, "timeframe", "5m")).lower()
+        expected_step = timeframe_ms_map.get(tf)
+
+        ts_gaps_count = 0
+        ts_gap_max = 0
+
+        if expected_step is not None:
+            ts_series = df["ts"].astype("int64").sort_values()
+            diffs = ts_series.diff().dropna()
+            bad_diffs = diffs[diffs != expected_step]
+
+            if not bad_diffs.empty:
+                ts_gaps_count = int(bad_diffs.shape[0])
+                ts_gap_max = int(bad_diffs.max())
+                logger.warning(
+                    "⚠️  Найдено %d разрывов по ts (ожидали шаг %d мс, max_gap=%d мс)",
+                    ts_gaps_count,
+                    expected_step,
+                    ts_gap_max,
+                )
+
+        issues["ts_gaps_count"] = ts_gaps_count
+        issues["ts_gap_max"] = ts_gap_max
+
         return df, issues, int(nan_drop_rows), int(duplicates_count)
+
 
     def _ensure_table_exists(self):
         """Создание расширенных таблиц через SQLAlchemy (идемпотентно)"""
@@ -2961,17 +2986,26 @@ class AdvancedLabelingTool:
         n_hold = len(trade_signals)
         hold_sample = hold_signals.sample(n=min(n_hold, len(hold_signals)), random_state=42) if len(
             hold_signals) > 0 else hold_signals
-        logger.info(f"✅ Downsample HOLD: {len(hold_signals)} → {len(hold_sample)}")
 
-        dataset_df = pd.concat([no_signal_sample, hold_sample, trade_signals], ignore_index=True).sort_values(
-            'ts').reset_index(drop=True)
-        class_counts_after = dataset_df['reversal_label'].value_counts().to_dict()
+        dataset_df = pd.concat(
+            [no_signal_sample, trade_signals],
+            ignore_index=True
+        ).sort_values("ts").reset_index(drop=True)
+
+        class_counts_after = dataset_df["reversal_label"].value_counts().to_dict()
         total = len(dataset_df)
         logger.info(
-            f"✅ Финальный датасет: {total} (NO_SIGNAL={class_counts_after.get(0, 0)}, BUY={class_counts_after.get(1, 0)}, SELL={class_counts_after.get(2, 0)}, HOLD={class_counts_after.get(3, 0)})")
-        max_count = max(class_counts_after.values())
+            "✅ Финальный датасет: %s (NO_SIGNAL=%s, BUY=%s, SELL=%s)",
+            total,
+            class_counts_after.get(0, 0),
+            class_counts_after.get(1, 0),
+            class_counts_after.get(2, 0),
+        )
+
+        # Балансируем веса только для 0/1/2
+        max_count = max(class_counts_after.values()) if class_counts_after else 1
         weights_map = {label: max_count / class_counts_after.get(label, 1) for label in [0, 1, 2]}
-        dataset_df['sample_weight'] = dataset_df['reversal_label'].map(weights_map)
+        dataset_df["sample_weight"] = dataset_df["reversal_label"].map(weights_map)
         allowed_columns = ['ts', 'reversal_label', 'sample_weight', 'datetime', 'cmo_14', 'volume', 'trend_acceleration_ema7',
                            'regime_volatility', 'bb_width', 'adx_14', 'plus_di_14','minus_di_14', 'atr_14_normalized',
                            'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio', 'lower_shadow_ratio',
@@ -2984,12 +3018,22 @@ class AdvancedLabelingTool:
         dataset_df['timeframe'] = self.config.timeframe
         dataset_df['created_at'] = None
         meta_info = {
-            "class_dist": {"no_signal": int(class_counts_after.get(0, 0)), "buy": int(class_counts_after.get(1, 0)),
-                           "sell": int(class_counts_after.get(2, 0)), "hold": int(class_counts_after.get(3, 0)),
-                           "total": total}, "buffer_bars": getattr(self.config, "buffer_bars", None),
+            "class_dist": {
+                "no_signal": int(class_counts_after.get(0, 0)),
+                "buy": int(class_counts_after.get(1, 0)),
+                "sell": int(class_counts_after.get(2, 0)),
+                "total": total,
+            },
+            "buffer_bars": getattr(self.config, "buffer_bars", None),
             "seed": getattr(self.config, "seed", None),
-            "config_json": {"method": self.config.method, "timeframe": self.config.timeframe,
-                            "symbol": self.config.symbol}, "issues": {}}
+            "config_json": {
+                "method": self.config.method,
+                "timeframe": self.config.timeframe,
+                "symbol": self.config.symbol,
+            },
+            "issues": {},
+        }
+
         return dataset_df, meta_info
 
     def create_training_snapshot(self, run_id: str | None = None) -> str:
