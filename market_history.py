@@ -755,8 +755,6 @@ class MarketHistoryManager:
 
     async def interactive_load(self):
         """Переработанное меню с выбором режима"""
-        import sys
-        from tqdm import tqdm
 
         print("\n" + "=" * 60)
         print("HISTORICAL DATA LOADER")
