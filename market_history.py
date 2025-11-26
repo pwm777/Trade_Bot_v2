@@ -763,7 +763,7 @@ class MarketHistoryManager:
         # --- выбор режима ---
         print("\nВыберите режим:")
         print(" 1  Загрузить историю с Binance")
-        print(" 2  Пересчитать индикаторы по локальным данным")
+        print(" 2  Пересчитать индикаторы по локальным данным,далее last N days = 0!")
         while True:
             choice = input(">>> [1/2]: ").strip()
             if choice in {"1", "2"}:
@@ -897,10 +897,52 @@ class MarketHistoryManager:
             return None
 
     async def _warmup_existing_data(self, symbol: str, days_back: int):
-        """Прогрев индикаторов для существующих данных с продолжением и прогресс-баром"""
+        """Прогрев индикаторов для существующих данных с продолжением и прогресс-баром.
+
+        days_back > 0  -> ручной режим (от текущего времени назад на N дней).
+        days_back <= 0 -> авто-режим: весь доступный диапазон локальных данных по символу.
+        """
         symbol_norm = self._normalize_symbol(symbol)
-        end_time = get_current_ms()
-        start_time = end_time - (days_back * 24 * 60 * 60 * 1000)
+
+        # --- РАСЧЁТ ДИАПАЗОНА start_time / end_time ---
+        if days_back > 0:
+            # Старое поведение: от "сейчас" назад на N дней (используем для загрузки с биржи)
+            end_time = get_current_ms()
+            start_time = end_time - (days_back * 24 * 60 * 60 * 1000)
+            self.logger.info(
+                f"Using manual range: last {days_back} days "
+                f"(start_ts={start_time}, end_ts={end_time}) for {symbol_norm}"
+            )
+        else:
+            # Авто-режим: ориентируемся на последние локальные свечи по символу
+            last_ts = None
+
+            try:
+                # 1) Пробуем найти последнюю 1m свечу
+                last_1m = await self.market_data_utils.read_candles_1m(symbol_norm, last_n=1)
+                if last_1m:
+                    last_ts = int(last_1m[0]["ts"])
+                else:
+                    # 2) Если нет 1m — пробуем последнюю 5m свечу
+                    last_5m = await self.market_data_utils.read_candles_5m(symbol_norm, last_n=1)
+                    if last_5m:
+                        last_ts = int(last_5m[0]["ts"])
+            except Exception as e:
+                self.logger.error(f"Error while detecting last local candle for {symbol_norm}: {e}", exc_info=True)
+
+            if last_ts is None:
+                self.logger.warning(
+                    f"No local candles found for {symbol_norm}, nothing to warm up (auto mode)."
+                )
+                print(f"\n⚠ No local candles found for {symbol_norm}, warmup skipped.")
+                return
+
+            end_time = last_ts
+            start_time = 0  # Берём всю историю по символу до последней свечи
+
+            self.logger.info(
+                f"Using AUTO range for {symbol_norm}: all local data up to ts={end_time}"
+            )
 
         # ✅ ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ
         candles_1m = []
@@ -934,6 +976,7 @@ class MarketHistoryManager:
             except Exception as e:
                 main_pbar.update(1)
                 main_pbar.set_postfix(m=f"Error: {str(e)[:20]}")
+                self.logger.error(f"Error warming up 1m data for {symbol_norm}: {e}", exc_info=True)
 
             # ✅ 2. УМНЫЙ ПРОГРЕВ 5m ДАННЫХ С ПРОДОЛЖЕНИЕМ
             try:
@@ -962,19 +1005,18 @@ class MarketHistoryManager:
                     main_pbar.set_description("✅ 5m indicators ready")
 
                     # ✅ НОВОЕ: Устанавливаем флаг готовности для первого анализа
-                    if candles_5m:
-                        self.logger.info(
-                            f"📊 History warmup completed for {symbol_norm}: "
-                            f"{len(candles_5m)} 5m candles with indicators ready"
-                        )
-                    #  Триггер первого анализа ML модели
-                    if candles_5m:
-                        self.logger.info(f"🚀 Triggering initial ML analysis on last historical candle")
-                        # Здесь можно вызвать callback или установить флаг, что система готова
+                    self.logger.info(
+                        f"📊 History warmup completed for {symbol_norm}: "
+                        f"{len(candles_5m)} 5m candles with indicators ready"
+                    )
+
+                    # Триггер первого анализа ML модели (если нужно)
+                    self.logger.info(f"🚀 Triggering initial ML analysis on last historical candle")
                 else:
                     main_pbar.set_postfix(m5="No data")
             except Exception as e:
                 main_pbar.set_postfix(m5=f"Error: {str(e)[:20]}")
+                self.logger.error(f"Error warming up 5m data for {symbol_norm}: {e}", exc_info=True)
 
             #  ВТОРОЙ update(1) ДОЛЖЕН БЫТЬ ЗДЕСЬ, ПОСЛЕ ЗАВЕРШЕНИЯ 5m БЛОКА
             main_pbar.update(1)
