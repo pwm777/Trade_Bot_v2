@@ -352,62 +352,6 @@ class IndicatorWarmupManager:
             self.logger.error(f"Error warming up 1m indicators for {symbol}: {e}", exc_info=True)
             return False
 
-    async def _get_hist_1m_candles(self, symbol: str, start_ts: int, end_ts: int) -> dict:
-        """
-        Получение исторических 1m свечей БЕЗ фазы для маппинга на 5m свечи.
-        Специально для данных загруженных с Binance (все свечи начинаются в :00).
-
-        Args:
-            symbol: торговый символ
-            start_ts: начало диапазона
-            end_ts: конец диапазона
-
-        Returns:
-            словарь {ts_5m: {open, high, low, close, ema7}} где ts_5m БЕЗ фазы
-        """
-        try:
-            # Получаем 1m свечи из БД
-            candles_1m = await self.market_data_utils.read_candles_1m(
-                symbol, start_ts=start_ts, end_ts=end_ts
-            )
-
-            if not candles_1m:
-                self.logger.warning(f"No 1m candles found for {symbol} in range {start_ts}-{end_ts}")
-                return {}
-
-            # Создаем маппинг: для каждой 5m свечи БЕЗ фазы находим последнюю 1m свечу
-            mapping = {}
-            FIVE_M_MS = 300_000
-
-            for candle in candles_1m:
-                ts_1m = int(candle['ts'])
-
-                # Для исторических данных БЕЗ фазы: простое выравнивание к началу 5m
-                # 10:44:00 -> 10:40:00, 10:45:00 -> 10:45:00, etc.
-                ts_5m = (ts_1m // FIVE_M_MS) * FIVE_M_MS
-
-                # Сохраняем последнюю 1m свечу для каждого 5m периода
-                if ts_5m not in mapping or ts_1m > mapping[ts_5m]['ts_1m']:
-                    ema7_val = float(candle.get('ema7')) if candle.get('ema7') is not None else None
-                    mapping[ts_5m] = {
-                        'ts_1m': ts_1m,
-                        'open': float(candle['open']),
-                        'high': float(candle['high']),
-                        'low': float(candle['low']),
-                        'close': float(candle['close']),
-                        'ema7': ema7_val
-                    }
-
-            self.logger.debug(
-                f"Mapped {len(mapping)} historical 5m periods to 1m candles for {symbol}"
-            )
-            return mapping
-
-        except Exception as e:
-            self.logger.error(f"Failed to get historical 1m candles for {symbol}: {e}", exc_info=True)
-            return {}
-
-
 class MarketHistoryManager:
     """Основной класс управления историческими данными"""
 
