@@ -1513,16 +1513,15 @@ FEATURE_NAME_MAP: dict[str, dict[str, tuple[str, str]]] = {
         "cusum_neg": ("cusum_neg", "REAL"),
     },
     "5m": {
-        # Базовые изменения цены
         "price_change_5": ("price_change_5", "REAL"),
 
-        # Группа 1: Тренд и импульс (4)
+        # Группа 1: Тренд и импульс
         "trend_momentum_z": ("trend_momentum_z", "REAL"),
         "cmo_14": ("cmo_14", "REAL"),
         "macd_histogram": ("macd_histogram", "REAL"),
         "trend_acceleration_ema7": ("trend_acceleration_ema7", "REAL"),
 
-        # Группа 2: Волатильность и режим (3)
+        # Группа 2: Волатильность и режим
         "regime_volatility": ("regime_volatility", "REAL"),
         "bb_width": ("bb_width", "REAL"),
         "adx_14": ("adx_14", "REAL"),
@@ -1530,40 +1529,49 @@ FEATURE_NAME_MAP: dict[str, dict[str, tuple[str, str]]] = {
         "minus_di_14": ("minus_di_14", "REAL"),
         "atr_14_normalized": ("atr_14_normalized", "REAL"),
 
-        # Группа 3: Объём (1)
+        # Группа 3: Объём
         "volume_ratio_ema3": ("volume_ratio_ema3", "REAL"),
 
-        # Группа 4: Структура свечи (3)
+        # Группа 4: Структура свечи
         "candle_relative_body": ("candle_relative_body", "REAL"),
         "upper_shadow_ratio": ("upper_shadow_ratio", "REAL"),
         "lower_shadow_ratio": ("lower_shadow_ratio", "REAL"),
 
-        # Группа 5: Положение цены (2)
+        # Группа 5: Положение цены
         "price_vs_vwap": ("price_vs_vwap", "REAL"),
         "bb_position": ("bb_position", "REAL"),
 
-        # Группа 6: CUSUM с 1m (5)
+        # Группа 6: CUSUM с 1m
         "cusum_1m_recent": ("cusum_1m_recent", "INTEGER"),
         "cusum_1m_quality_score": ("cusum_1m_quality_score", "REAL"),
         "cusum_1m_trend_aligned": ("cusum_1m_trend_aligned", "INTEGER"),
         "cusum_1m_price_move": ("cusum_1m_price_move", "REAL"),
 
-        # Группа 7: Микроструктура 1m (3)
+        # Группа 7: Микроструктура 1m
         "is_trend_pattern_1m": ("is_trend_pattern_1m", "INTEGER"),
         "body_to_range_ratio_1m": ("body_to_range_ratio_1m", "REAL"),
         "close_position_in_range_1m": ("close_position_in_range_1m", "REAL"),
 
-        # Группа 8: CUSUM 5m
+        # === Новые фичи (Группа 9) ===
+        "volume_imbalance_5m": ("volume_imbalance_5m", "REAL"),
+        "volume_supported_trend": ("volume_supported_trend", "REAL"),
+        "exhaustion_score": ("exhaustion_score", "REAL"),
+        "cusum_price_conflict": ("cusum_price_conflict", "INTEGER"),
+        "cusum_state_conflict": ("cusum_state_conflict", "INTEGER"),
+        "trend_vs_noise": ("trend_vs_noise", "REAL"),
+
+        # Группа 10: CUSUM 5m
         "cusum": ("cusum", "REAL"),
         "cusum_state": ("cusum_state", "INTEGER"),
         "cusum_zscore": ("cusum_zscore", "REAL"),
-        "cusum_conf": ("cusum_conf", "REAL"),  # |z| * z_to_conf
+        "cusum_conf": ("cusum_conf", "REAL"),
         "cusum_reason": ("cusum_reason", "TEXT"),
         "cusum_price_mean": ("cusum_price_mean", "REAL"),
         "cusum_price_std": ("cusum_price_std", "REAL"),
         "cusum_pos": ("cusum_pos", "REAL"),
         "cusum_neg": ("cusum_neg", "REAL"),
     },
+
 }
 # ============ Время ===============================
 _SIM_TIME_MS: Optional[int] = None

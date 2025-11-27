@@ -10,7 +10,7 @@ from typing import Dict, Set, Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import  create_async_engine
 import logging
-from typing import  List, Tuple
+from typing import  List, Tuple, Any
 import pandas as pd
 import numpy as np
 from config import TABLES
@@ -573,7 +573,9 @@ class MarketDataUtils:
                 cusum_signals = preloaded_cusum_signals
                 self.logger.debug(f"✅ Using preloaded CUSUM signals: {len(cusum_signals)}")
             else:
-                cusum_signals = await self._get_cusum_signals_1m(symbol, cusum_start_ts, cusum_end_ts, threshold=2.0)
+                cusum_signals = await self._get_cusum_signals_1m(
+                    symbol, cusum_start_ts, cusum_end_ts, threshold=2.0
+                )
                 self.logger.debug(f"📡 Loaded CUSUM signals: {len(cusum_signals)}")
 
             if preloaded_candles_1m_map is not None:
@@ -592,8 +594,8 @@ class MarketDataUtils:
                 else:
                     price_change_5_list.append(None)
 
-            # Тренд и импульс
-            trend_momentum_z = self._z_score_series(price_change_5_list, window=20)
+            # Тренд и импульс (полная серия)
+            trend_momentum_z_series = self._z_score_series(price_change_5_list, window=20)
 
             # EMA7 для trend_acceleration
             ema7_list = [b.get('ema7') for b in bars_5m]
@@ -613,9 +615,13 @@ class MarketDataUtils:
             vwap = self._calculate_vwap(bars_5m, period=96)
             price_vs_vwap = self._price_vs_vwap_series(closes, vwap)
 
-            # CUSUM
-            (cusum_1m_recent, cusum_1m_quality_score,
-             cusum_1m_trend_aligned, cusum_1m_price_move) = self._cusum_1m_features(
+            # CUSUM 1m → фичи
+            (
+                cusum_1m_recent,
+                cusum_1m_quality_score,
+                cusum_1m_trend_aligned,
+                cusum_1m_price_move
+            ) = self._cusum_1m_features(
                 cusum_signals, ts_list, closes, volumes, price_change_5_list
             )
 
@@ -631,7 +637,7 @@ class MarketDataUtils:
                 pattern, body_ratio, close_pos = 0, 0.0, 0.5
 
             # БЛОК 3: РАСЧЕТ ИНДИКАТОРОВ ДЛЯ ПОСЛЕДНЕЙ СВЕЧИ
-            indicators = {}
+            indicators: dict[str, Any] = {}
             i = last_idx
 
             # Окно данных для расчета
@@ -647,13 +653,11 @@ class MarketDataUtils:
             }
 
             if len(window_data['closes']) < 14:
-                # Недостаточно данных
+                # Недостаточно данных — сохраняем сырую свечу
                 await self.upsert_candles_5m(symbol, [base_bar])
                 return 1
 
             try:
-                # ✅ ДОБАВИТЬ ЛОГИРОВАНИЕ НАЧАЛА
-
                 # === БАЗОВЫЕ ИНДИКАТОРЫ ===
                 indicators["price_change_5"] = price_change_5_list[i]
                 if indicators["price_change_5"] is not None:
@@ -678,6 +682,7 @@ class MarketDataUtils:
                     indicators["macd_histogram"] = None
 
                 # DMI/ADX-14
+                dmi_data = None
                 try:
                     dmi_data = self._dmi_adx_series(
                         window_data['highs'],
@@ -698,13 +703,15 @@ class MarketDataUtils:
 
                 # ATR нормализованный
                 try:
-                    atr_val = dmi_data[3][-1] if dmi_data[3] else None
-                    indicators["atr_14_normalized"] = (atr_val / closes[i]) * 100 if atr_val and closes[
-                        i] != 0 else None
+                    atr_val = dmi_data[3][-1] if dmi_data and dmi_data[3] else None
+                    indicators["atr_14_normalized"] = (
+                        (atr_val / closes[i]) * 100 if atr_val and closes[i] != 0 else None
+                    )
                     metrics.indicators_count += 1
                 except Exception as e:
                     self.logger.error(f"❌ ATR calculation failed: {e}")
                     indicators["atr_14_normalized"] = None
+                    atr_val = None
 
                 # Bollinger Bands
                 try:
@@ -718,36 +725,61 @@ class MarketDataUtils:
                     self.logger.error(f"❌ Bollinger Bands calculation failed: {e}")
                     indicators["bb_width"] = None
                     indicators["bb_position"] = None
+                    bb_position = None
 
-                # === ML ФИЧИ ===
+                # === ML ФИЧИ (по сериям) ===
                 try:
-                    indicators["trend_momentum_z"] = trend_momentum_z[i] if i < len(trend_momentum_z) else None
-                    indicators["trend_acceleration_ema7"] = trend_acceleration_ema7[i] if i < len(
-                        trend_acceleration_ema7) else None
-                    indicators["regime_volatility"] = (atr_val / closes[i]) if atr_val and closes[i] != 0 else None
-                    indicators["volume_ratio_ema3"] = volume_ratio_ema3[i] if i < len(volume_ratio_ema3) else None
-                    indicators["candle_relative_body"] = candle_relative_body[i] if i < len(
-                        candle_relative_body) else None
-                    indicators["upper_shadow_ratio"] = upper_shadow_ratio[i] if i < len(upper_shadow_ratio) else None
-                    indicators["lower_shadow_ratio"] = lower_shadow_ratio[i] if i < len(lower_shadow_ratio) else None
-                    indicators["price_vs_vwap"] = price_vs_vwap[i] if i < len(price_vs_vwap) else None
-                    indicators["cusum_1m_recent"] = cusum_1m_recent[i] if i < len(cusum_1m_recent) else 0
-                    indicators["cusum_1m_quality_score"] = cusum_1m_quality_score[i] if i < len(
-                        cusum_1m_quality_score) else 0.0
-                    indicators["cusum_1m_trend_aligned"] = cusum_1m_trend_aligned[i] if i < len(
-                        cusum_1m_trend_aligned) else 0
-                    indicators["cusum_1m_price_move"] = cusum_1m_price_move[i] if i < len(cusum_1m_price_move) else 0.0
+                    last_trend_momentum_z = (
+                        trend_momentum_z_series[i] if i < len(trend_momentum_z_series) else None
+                    )
+                    indicators["trend_momentum_z"] = last_trend_momentum_z
+
+                    indicators["trend_acceleration_ema7"] = (
+                        trend_acceleration_ema7[i] if i < len(trend_acceleration_ema7) else None
+                    )
+                    indicators["regime_volatility"] = (
+                        (atr_val / closes[i]) if atr_val and closes[i] != 0 else None
+                    )
+                    indicators["volume_ratio_ema3"] = (
+                        volume_ratio_ema3[i] if i < len(volume_ratio_ema3) else None
+                    )
+                    indicators["candle_relative_body"] = (
+                        candle_relative_body[i] if i < len(candle_relative_body) else None
+                    )
+                    indicators["upper_shadow_ratio"] = (
+                        upper_shadow_ratio[i] if i < len(upper_shadow_ratio) else None
+                    )
+                    indicators["lower_shadow_ratio"] = (
+                        lower_shadow_ratio[i] if i < len(lower_shadow_ratio) else None
+                    )
+                    indicators["price_vs_vwap"] = (
+                        price_vs_vwap[i] if i < len(price_vs_vwap) else None
+                    )
+                    indicators["cusum_1m_recent"] = (
+                        cusum_1m_recent[i] if i < len(cusum_1m_recent) else 0
+                    )
+                    indicators["cusum_1m_quality_score"] = (
+                        cusum_1m_quality_score[i] if i < len(cusum_1m_quality_score) else 0.0
+                    )
+                    indicators["cusum_1m_trend_aligned"] = (
+                        cusum_1m_trend_aligned[i] if i < len(cusum_1m_trend_aligned) else 0
+                    )
+                    indicators["cusum_1m_price_move"] = (
+                        cusum_1m_price_move[i] if i < len(cusum_1m_price_move) else 0.0
+                    )
                     indicators["is_trend_pattern_1m"] = pattern
                     indicators["body_to_range_ratio_1m"] = body_ratio
                     indicators["close_position_in_range_1m"] = close_pos
+
                     metrics.indicators_count += 17
 
                 except Exception as e:
                     self.logger.error(f"❌ ML features calculation failed: {e}")
-                    # Установка значений по умолчанию
-                    for field in ['trend_momentum_z', 'trend_acceleration_ema7', 'regime_volatility',
-                                  'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio',
-                                  'lower_shadow_ratio', 'price_vs_vwap']:
+                    for field in [
+                        'trend_momentum_z', 'trend_acceleration_ema7', 'regime_volatility',
+                        'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio',
+                        'lower_shadow_ratio', 'price_vs_vwap'
+                    ]:
                         indicators[field] = None
                     for field in ['cusum_1m_recent', 'cusum_1m_trend_aligned']:
                         indicators[field] = 0
@@ -756,6 +788,85 @@ class MarketDataUtils:
                     indicators["is_trend_pattern_1m"] = 0
                     indicators["body_to_range_ratio_1m"] = 0.0
                     indicators["close_position_in_range_1m"] = 0.5
+                    last_trend_momentum_z = indicators.get("trend_momentum_z")
+                    bb_position = indicators.get("bb_position")
+
+                # --- VOLUME IMBALANCE 5m ---
+                volume_imbalance_5m = 0.0
+                try:
+                    if candles_1m_map is not None:
+                        last_ts_5m = base_bar["ts"]
+                        one_minute_candles = candles_1m_map.get(last_ts_5m) or []
+
+                        prices_1m = [
+                            float(c["close"]) for c in one_minute_candles
+                            if c.get("close") is not None
+                        ]
+                        volumes_1m = [
+                            float(c.get("volume", 0.0)) for c in one_minute_candles
+                        ]
+                        total_volume_1m = float(sum(volumes_1m)) if volumes_1m else 0.0
+                        bar_range = float(base_bar["high"] - base_bar["low"])
+
+                        if prices_1m and total_volume_1m > 0.0 and bar_range > 0.0:
+                            vwap_local_5m = (
+                                sum(p * v for p, v in zip(prices_1m, volumes_1m)) /
+                                total_volume_1m
+                            )
+                            price_median_5m = float(np.median(prices_1m))
+                            raw_imb = (vwap_local_5m - price_median_5m) / bar_range
+                            volume_imbalance_5m = float(np.clip(raw_imb, -1.0, 1.0))
+                except Exception as e:
+                    self.logger.error(f"❌ volume_imbalance_5m calc failed: {e}")
+                    volume_imbalance_5m = 0.0
+
+                indicators["volume_imbalance_5m"] = volume_imbalance_5m
+
+                # --- TREND VS NOISE ---
+                atr_norm = indicators.get("atr_14_normalized")
+                trend_momentum_z_val = indicators.get("trend_momentum_z")
+                if atr_norm is not None and atr_norm >= 0:
+                    trend_vs_noise = (
+                        float(trend_momentum_z_val) / float(1e-5 + atr_norm)
+                        if trend_momentum_z_val is not None else 0.0
+                    )
+                else:
+                    trend_vs_noise = 0.0
+                indicators["trend_vs_noise"] = trend_vs_noise
+
+                # --- VOLUME SUPPORTED TREND ---
+                volume_supported_trend = 0.0
+                if trend_momentum_z_val is not None and volume_imbalance_5m is not None:
+                    volume_supported_trend = float(trend_momentum_z_val) * float(volume_imbalance_5m)
+                indicators["volume_supported_trend"] = volume_supported_trend
+
+                # --- EXHAUSTION SCORE ---
+                bb_position_val = indicators.get("bb_position")
+                if bb_position_val is not None:
+                    raw_vol_factor = (atr_norm or 0.0) * 200.0
+                    if atr_norm is None or atr_norm <= 0:
+                        volatility_factor = 0.2
+                    else:
+                        volatility_factor = float(np.clip(raw_vol_factor, 0.2, 1.0))
+
+                    exhaustion_score = (
+                        (float(bb_position_val) - 0.5) *
+                        float(volume_imbalance_5m) *
+                        float(volatility_factor)
+                    )
+                else:
+                    exhaustion_score = 0.0
+                indicators["exhaustion_score"] = exhaustion_score
+
+                # --- CUSUM PRICE CONFLICT ---
+                cusum_1m_trend = indicators.get("cusum_1m_trend_aligned")
+                price_change_5 = indicators.get("price_change_5")
+                cusum_price_conflict = 0
+                if cusum_1m_trend is not None and price_change_5 is not None:
+                    price_dir = np.sign(price_change_5)
+                    if price_dir != 0 and cusum_1m_trend in (-1, 0, 1):
+                        cusum_price_conflict = int(cusum_1m_trend * price_dir == -1)
+                indicators["cusum_price_conflict"] = cusum_price_conflict
 
                 # Формируем выходную строку
                 out_row = dict(base_bar)
@@ -769,19 +880,25 @@ class MarketDataUtils:
                 metrics.errors_count += 1
                 # Сохраняем базовую свечу без индикаторов
                 out_row = dict(base_bar)
-                for field in ['price_change_5', 'cmo_14', 'macd_histogram',
-                              'adx_14', 'plus_di_14', 'minus_di_14', 'atr_14_normalized',
-                              'bb_width', 'bb_position',
-                              'trend_momentum_z', 'trend_acceleration_ema7',
-                              'regime_volatility',
-                              'volume_ratio_ema3',
-                              'candle_relative_body', 'upper_shadow_ratio', 'lower_shadow_ratio',
-                              'price_vs_vwap',
-                              'cusum_1m_recent', 'cusum_1m_quality_score',
-                              'cusum_1m_trend_aligned', 'cusum_1m_price_move',
-                              'is_trend_pattern_1m', 'body_to_range_ratio_1m', 'close_position_in_range_1m']:
+                for field in [
+                    'price_change_5', 'cmo_14', 'macd_histogram',
+                    'adx_14', 'plus_di_14', 'minus_di_14', 'atr_14_normalized',
+                    'bb_width', 'bb_position',
+                    'trend_momentum_z', 'trend_acceleration_ema7',
+                    'regime_volatility',
+                    'volume_ratio_ema3',
+                    'candle_relative_body', 'upper_shadow_ratio', 'lower_shadow_ratio',
+                    'price_vs_vwap',
+                    'cusum_1m_recent', 'cusum_1m_quality_score',
+                    'cusum_1m_trend_aligned', 'cusum_1m_price_move',
+                    'is_trend_pattern_1m', 'body_to_range_ratio_1m', 'close_position_in_range_1m',
+                    'volume_imbalance_5m', 'volume_supported_trend',
+                    'exhaustion_score', 'cusum_price_conflict',
+                    'cusum_state_conflict', 'trend_vs_noise'
+                ]:
                     out_row[field] = None
-            # Финализация метрик
+
+            # Финализация метрик по индикаторам
             metrics.complete()
 
             # CUSUM 5m:
@@ -802,24 +919,23 @@ class MarketDataUtils:
                     cusum_results = self.calculate_cusum(close_series, cfg)
 
                     # Берем последние значения (для последней свечи)
-                    last_idx = len(cusum_results['cusum']) - 1
+                    last_idx_cusum = len(cusum_results['cusum']) - 1
 
                     # Заполняем out_row ВСЕМИ CUSUM полями
                     out_row.update({
-                        "cusum": float(cusum_results['cusum'].iloc[last_idx]),
-                        "cusum_state": int(cusum_results['cusum_state'].iloc[last_idx]),
-                        "cusum_zscore": float(cusum_results['cusum_zscore'].iloc[last_idx]),
-                        "cusum_conf": float(cusum_results['cusum_conf'].iloc[last_idx]),
-                        "cusum_price_mean": float(cusum_results['cusum_price_mean'].iloc[last_idx]),
-                        "cusum_price_std": float(cusum_results['cusum_price_std'].iloc[last_idx]),
-                        "cusum_pos": float(cusum_results['cusum_pos'].iloc[last_idx]),
-                        "cusum_neg": float(cusum_results['cusum_neg'].iloc[last_idx]),
-                        "cusum_reason": f"z={cusum_results['cusum_zscore'].iloc[last_idx]:.3f}"
+                        "cusum": float(cusum_results['cusum'].iloc[last_idx_cusum]),
+                        "cusum_state": int(cusum_results['cusum_state'].iloc[last_idx_cusum]),
+                        "cusum_zscore": float(cusum_results['cusum_zscore'].iloc[last_idx_cusum]),
+                        "cusum_conf": float(cusum_results['cusum_conf'].iloc[last_idx_cusum]),
+                        "cusum_price_mean": float(cusum_results['cusum_price_mean'].iloc[last_idx_cusum]),
+                        "cusum_price_std": float(cusum_results['cusum_price_std'].iloc[last_idx_cusum]),
+                        "cusum_pos": float(cusum_results['cusum_pos'].iloc[last_idx_cusum]),
+                        "cusum_neg": float(cusum_results['cusum_neg'].iloc[last_idx_cusum]),
+                        "cusum_reason": f"z={cusum_results['cusum_zscore'].iloc[last_idx_cusum]:.3f}"
                     })
 
                 else:
                     self.logger.warning(f"⚠️ [CUSUM 5m] Insufficient data: {data_to_use} < {win}")
-                    # Устанавливаем значения по умолчанию
                     current_price = float(bars_5m[-1]["close"]) if bars_5m else 0.0
                     out_row.update({
                         "cusum": 0.0,
@@ -835,7 +951,6 @@ class MarketDataUtils:
 
             except Exception as e:
                 self.logger.error(f"❌ [CUSUM 5m] calculation failed for {symbol}: {e}", exc_info=True)
-                # Fallback с текущей ценой
                 current_price = float(bars_5m[-1]["close"]) if bars_5m else 0.0
                 out_row.update({
                     "cusum": 0.0,
@@ -848,12 +963,22 @@ class MarketDataUtils:
                     "cusum_neg": 0.0,
                     "cusum_reason": f"error: {str(e)[:50]}",
                 })
+            # --- CUSUM STATE CONFLICT (микро vs макро CUSUM) ---
+            try:
+                cusum_state_val = out_row.get("cusum_state")
+                cusum_1m_trend_val = out_row.get("cusum_1m_trend_aligned")
+                if cusum_state_val in (-1, 0, 1) and cusum_1m_trend_val in (-1, 0, 1):
+                    cusum_state_conflict = int(cusum_state_val * cusum_1m_trend_val == -1)
+                else:
+                    cusum_state_conflict = 0
 
+                out_row["cusum_state_conflict"] = cusum_state_conflict
+            except Exception as e:
+                self.logger.error(f"❌ cusum_state_conflict calc failed: {e}")
+                out_row["cusum_state_conflict"] = 0
             # СОХРАНЕНИЕ ТОЛЬКО ПОСЛЕДНЕЙ СВЕЧИ
             saved = await self.upsert_candles_5m(symbol, [out_row])
-
             return saved
-
         except Exception as e:
             metrics.errors_count += 1
             metrics.complete()
@@ -1079,7 +1204,6 @@ class MarketDataUtils:
     async def upsert_candles_1m(self, symbol: str, bars_1m: List[dict]) -> int:
         if not bars_1m:
             return 0
-
         # Функция для безопасного приведения типов CUSUM полей
         def safe_cusum_value(value, field_name):
             if value is None:
@@ -1096,17 +1220,20 @@ class MarketDataUtils:
                     if isinstance(value, (int, float, np.integer)):
                         return int(value)
                     elif isinstance(value, str):
-                        # Конвертация из текста в число если нужно
-                        if value.upper() == 'BUY':
+                        v = value.upper()
+                        if v == 'BUY':
                             return 1
-                        elif value.upper() == 'SELL':
+                        elif v == 'SELL':
                             return -1
                         else:
                             return 0
                     else:
                         return 0
-                elif field_name in ['cusum', 'cusum_zscore', 'cusum_conf', 'cusum_price_mean',
-                                    'cusum_price_std', 'cusum_pos', 'cusum_neg']:
+                elif field_name in [
+                    'cusum', 'cusum_zscore', 'cusum_conf',
+                    'cusum_price_mean', 'cusum_price_std',
+                    'cusum_pos', 'cusum_neg'
+                ]:
                     # Приведение к float для REAL полей
                     return float(value)
                 else:
@@ -1120,10 +1247,42 @@ class MarketDataUtils:
                 else:
                     return None
 
+        # --- Базовые столбцы 1m свечи (сырые данные) ---
+        base_cols = [
+            "symbol", "ts", "ts_close",
+            "open", "high", "low", "close",
+            "volume", "count", "quote",
+            "finalized", "checksum", "created_ts",
+        ]
+
+        # --- Фичи 1m из единого FEATURE_NAME_MAP ---
+        feature_cols = [
+            db_col
+            for _, (db_col, _col_type) in FEATURE_NAME_MAP["1m"].items()
+        ]
+
+        # какие из них относятся к CUSUM (для safe_cusum_value)
+        cusum_fields = {
+            "cusum", "cusum_state", "cusum_zscore", "cusum_conf",
+            "cusum_price_mean", "cusum_price_std", "cusum_pos", "cusum_neg", "cusum_reason"
+        }
+
+        all_cols = base_cols + feature_cols
+        columns_sql = ", ".join(all_cols)
+        values_sql = ", ".join(f":{c}" for c in all_cols)
+
+        sql = text(f"""
+            INSERT OR REPLACE INTO {TABLES['candles_1m']}
+            ({columns_sql})
+            VALUES ({values_sql})
+        """)
+
         rows = []
         nowms = int(datetime.now().timestamp() * 1000)
+
         for b in bars_1m:
             row_data = {
+                # базовые поля
                 "symbol": symbol,
                 "ts": int(b["ts"]),
                 "ts_close": int(b.get("ts_close", b["ts"] + 59_999)),
@@ -1137,50 +1296,17 @@ class MarketDataUtils:
                 "finalized": int(b.get("finalized", 1)),
                 "checksum": b.get("checksum"),
                 "created_ts": int(b.get("created_ts", nowms)),
-                "ema3": b.get("ema3"),
-                "ema7": b.get("ema7"),
-                "ema9": b.get("ema9"),
-                "ema15": b.get("ema15"),
-                "ema30": b.get("ema30"),
-                "cmo14": b.get("cmo14"),
-                "adx14": b.get("adx14"), "plus_di14": b.get("plus_di14"), "minus_di14": b.get("minus_di14"),
-                "atr14": b.get("atr14"),
             }
 
-            # Безопасное приведение CUSUM полей с проверкой типов
-            cusum_fields = {
-                'cusum': 'real',
-                'cusum_state': 'integer',  # INTEGER поле в БД
-                'cusum_zscore': 'real',
-                'cusum_conf': 'real',
-                'cusum_price_mean': 'real',
-                'cusum_price_std': 'real',
-                'cusum_pos': 'real',
-                'cusum_neg': 'real',
-                'cusum_reason': 'text'
-            }
-
-            for field, field_type in cusum_fields.items():
-                if field_type == 'integer':
-                    row_data[field] = safe_cusum_value(b.get(field), field)
+            # фичи из FEATURE_NAME_MAP["1m"]
+            for col in feature_cols:
+                if col in cusum_fields:
+                    row_data[col] = safe_cusum_value(b.get(col), col)
                 else:
-                    row_data[field] = safe_cusum_value(b.get(field), field)
+                    # ema*, cmo14, adx14, plus_di14, minus_di14, atr14 и т.д.
+                    row_data[col] = b.get(col)
 
             rows.append(row_data)
-
-        sql = text(f"""
-            INSERT OR REPLACE INTO {TABLES['candles_1m']}
-            (symbol, ts, ts_close, open, high, low, close, volume, count, quote, finalized, checksum, created_ts,
-             ema3, ema7, ema9, ema15, ema30, cmo14,
-             adx14, plus_di14, minus_di14, atr14,
-             cusum, cusum_state, cusum_zscore, cusum_conf, 
-             cusum_price_mean, cusum_price_std, cusum_pos, cusum_neg, cusum_reason)
-            VALUES (:symbol, :ts, :ts_close, :open, :high, :low, :close, :volume, :count, :quote, :finalized, :checksum, :created_ts,
-                    :ema3, :ema7, :ema9, :ema15, :ema30, :cmo14,
-                    :adx14, :plus_di14, :minus_di14, :atr14,
-                    :cusum, :cusum_state, :cusum_zscore, :cusum_conf, 
-                    :cusum_price_mean, :cusum_price_std, :cusum_pos, :cusum_neg, :cusum_reason)
-        """)
 
         try:
             async with self.aengine.begin() as conn:
@@ -1474,42 +1600,30 @@ class MarketDataUtils:
     async def upsert_candles_5m(self, symbol: str, bars_5m: List[dict]) -> int:
         if not bars_5m:
             return 0
+
+        # Базовые (сырые) поля свечи, которые жёстко храним в БД
+        base_cols = [
+            "symbol", "ts", "ts_close",
+            "open", "high", "low", "close",
+            "volume", "count", "quote",
+            "finalized", "checksum", "created_ts",
+        ]
+
+        # Все фичи 5m из единого источника истины
+        feature_cols = [
+            db_col
+            for _, (db_col, _col_type) in FEATURE_NAME_MAP["5m"].items()
+        ]
+
+        all_cols = base_cols + feature_cols
+
+        columns_sql = ", ".join(all_cols)
+        values_sql = ", ".join(f":{c}" for c in all_cols)
+
         sql = text(f"""
             INSERT OR REPLACE INTO {TABLES['candles_5m']}
-            (symbol, ts, ts_close, open, high, low, close, volume, count, quote, finalized, checksum, created_ts,
-             price_change_5, cmo_14, macd_histogram,
-             adx_14, plus_di_14, minus_di_14, atr_14_normalized,
-             bb_width, bb_position,
-             trend_momentum_z, trend_acceleration_ema7,
-             regime_volatility,
-             volume_ratio_ema3,
-             candle_relative_body, upper_shadow_ratio, lower_shadow_ratio,
-             price_vs_vwap,
-             cusum_1m_recent, cusum_1m_quality_score,
-             cusum_1m_trend_aligned, cusum_1m_price_move,
-             is_trend_pattern_1m, body_to_range_ratio_1m, close_position_in_range_1m,
-             -- Группа 8: CUSUM 5m
-             cusum, cusum_state, cusum_zscore, cusum_conf,
-             cusum_reason,
-             cusum_price_mean, cusum_price_std,
-             cusum_pos, cusum_neg)
-            VALUES (:symbol, :ts, :ts_close, :open, :high, :low, :close, :volume, :count, :quote, :finalized, :checksum, :created_ts,
-                    :price_change_5, :cmo_14, :macd_histogram,
-                    :adx_14, :plus_di_14, :minus_di_14, :atr_14_normalized,
-                    :bb_width, :bb_position,
-                    :trend_momentum_z, :trend_acceleration_ema7,
-                    :regime_volatility,
-                    :volume_ratio_ema3,
-                    :candle_relative_body, :upper_shadow_ratio, :lower_shadow_ratio,
-                    :price_vs_vwap,
-                    :cusum_1m_recent, :cusum_1m_quality_score,
-                    :cusum_1m_trend_aligned, :cusum_1m_price_move,
-                    :is_trend_pattern_1m, :body_to_range_ratio_1m, :close_position_in_range_1m,
-                    -- Группа 8: CUSUM 5m
-                    :cusum, :cusum_state, :cusum_zscore, :cusum_conf,
-                    :cusum_reason,
-                    :cusum_price_mean, :cusum_price_std,
-                    :cusum_pos, :cusum_neg)
+            ({columns_sql})
+            VALUES ({values_sql})
         """)
 
         rows = []
@@ -1518,52 +1632,28 @@ class MarketDataUtils:
             # Для исторических данных created_ts = ts_close
             ts_close = int(b.get("ts_close", b["ts"] + 299_999))
 
-            rows.append({
+            row = {
+                # базовые поля
                 "symbol": symbol,
                 "ts": int(b["ts"]),
                 "ts_close": ts_close,
-                "open": float(b["open"]), "high": float(b["high"]), "low": float(b["low"]), "close": float(b["close"]),
-                "volume": float(b.get("volume", 0.0)), "count": int(b.get("count", 0)),
+                "open": float(b["open"]),
+                "high": float(b["high"]),
+                "low": float(b["low"]),
+                "close": float(b["close"]),
+                "volume": float(b.get("volume", 0.0)),
+                "count": int(b.get("count", 0)),
                 "quote": float(b.get("quote", 0.0)),
                 "finalized": int(b.get("finalized", 1)),
                 "checksum": b.get("checksum"),
-                # ИСПРАВЛЕНИЕ: created_ts = ts_close для исторических данных
                 "created_ts": ts_close,
+            }
 
-                "price_change_5": b.get("price_change_5"),
-                "cmo_14": b.get("cmo_14"),
-                "macd_histogram": b.get("macd_histogram"),
-                "adx_14": b.get("adx_14"), "plus_di_14": b.get("plus_di_14"), "minus_di_14": b.get("minus_di_14"),
-                "atr_14_normalized": b.get("atr_14_normalized"),
-                "bb_width": b.get("bb_width"), "bb_position": b.get("bb_position"),
+            # все фичи заполняем автоматом из dict бара
+            for col in feature_cols:
+                row[col] = b.get(col)
 
-                "trend_momentum_z": b.get("trend_momentum_z"),
-                "trend_acceleration_ema7": b.get("trend_acceleration_ema7"),
-                "regime_volatility": b.get("regime_volatility"),
-                "volume_ratio_ema3": b.get("volume_ratio_ema3"),
-                "candle_relative_body": b.get("candle_relative_body"),
-                "upper_shadow_ratio": b.get("upper_shadow_ratio"),
-                "lower_shadow_ratio": b.get("lower_shadow_ratio"),
-                "price_vs_vwap": b.get("price_vs_vwap"),
-                "cusum_1m_recent": b.get("cusum_1m_recent"),
-                "cusum_1m_quality_score": b.get("cusum_1m_quality_score"),
-                "cusum_1m_trend_aligned": b.get("cusum_1m_trend_aligned"),
-                "cusum_1m_price_move": b.get("cusum_1m_price_move"),
-                "is_trend_pattern_1m": b.get("is_trend_pattern_1m"),
-                "body_to_range_ratio_1m": b.get("body_to_range_ratio_1m"),
-                "close_position_in_range_1m": b.get("close_position_in_range_1m"),
-
-                # CUSUM 5m
-                "cusum": b.get("cusum"),
-                "cusum_state": b.get("cusum_state"),
-                "cusum_zscore": b.get("cusum_zscore"),
-                "cusum_conf": b.get("cusum_conf"),
-                "cusum_reason": b.get("cusum_reason"),
-                "cusum_price_mean": b.get("cusum_price_mean"),
-                "cusum_price_std": b.get("cusum_price_std"),
-                "cusum_pos": b.get("cusum_pos"),
-                "cusum_neg": b.get("cusum_neg"),
-            })
+            rows.append(row)
 
         try:
             async with self.aengine.begin() as conn:

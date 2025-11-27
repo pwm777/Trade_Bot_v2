@@ -15,9 +15,29 @@ from datetime import datetime, UTC
 import warnings
 import logging
 import traceback
+FEATURE_SQL_TYPE_OVERRIDES: dict[str, str] = {
+    "is_trend_pattern_1m": "INTEGER",
+    "cusum_price_conflict": "INTEGER",
+    "cusum_state_conflict": "INTEGER",
+    # если решишь добавить в BASE_FEATURE_NAMES:
+    "cusum_1m_recent": "INTEGER",
+    "cusum_1m_trend_aligned": "INTEGER",
+}
 
 # --- DDL для таблиц снапшота тренировочного датасета ---
-CREATE_TRAINING_DATASET_SQL = """
+def _build_training_dataset_sql() -> str:
+    """
+    Генерирует DDL для training_dataset на основе BASE_FEATURE_NAMES.
+    Все фичи по умолчанию REAL, исключения в FEATURE_SQL_TYPE_OVERRIDES.
+    """
+    feature_lines: list[str] = []
+    for name in BASE_FEATURE_NAMES:
+        sql_type = FEATURE_SQL_TYPE_OVERRIDES.get(name, "REAL")
+        feature_lines.append(f"    {name: <28} {sql_type},")
+
+    feature_block = "\n".join(feature_lines)
+
+    return f"""
 CREATE TABLE IF NOT EXISTS training_dataset (
     run_id           TEXT    NOT NULL,
     symbol           TEXT    NOT NULL,
@@ -26,32 +46,13 @@ CREATE TABLE IF NOT EXISTS training_dataset (
     datetime         TEXT    NOT NULL,
     reversal_label   INTEGER NOT NULL,
     sample_weight    REAL    NOT NULL,
-    cmo_14           REAL,
-    volume           REAL,
-    trend_acceleration_ema7     REAL,
-    regime_volatility           REAL,
-    bb_width                    REAL,
-    adx_14                      REAL,
-    plus_di_14                  REAL,
-    minus_di_14                 REAL,
-    atr_14_normalized           REAL,
-    volume_ratio_ema3           REAL,
-    candle_relative_body        REAL,
-    upper_shadow_ratio          REAL,
-    lower_shadow_ratio          REAL,
-    price_vs_vwap               REAL,
-    bb_position                 REAL,
-    cusum_1m_recent             INTEGER,
-    cusum_1m_quality_score      REAL,
-    cusum_1m_trend_aligned      INTEGER,
-    cusum_1m_price_move         REAL,
-    is_trend_pattern_1m         INTEGER,
-    body_to_range_ratio_1m      REAL,
-    close_position_in_range_1m  REAL,
+{feature_block}
     created_at       TEXT    NOT NULL,
     PRIMARY KEY (run_id, symbol, ts)
 );
 """
+
+CREATE_TRAINING_DATASET_SQL = _build_training_dataset_sql()
 CREATE_TRAINING_DATASET_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_training_dataset_run_id      ON training_dataset(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_training_dataset_symbol      ON training_dataset(symbol)",
@@ -3006,12 +3007,12 @@ class AdvancedLabelingTool:
         max_count = max(class_counts_after.values()) if class_counts_after else 1
         weights_map = {label: max_count / class_counts_after.get(label, 1) for label in [0, 1, 2]}
         dataset_df["sample_weight"] = dataset_df["reversal_label"].map(weights_map)
-        allowed_columns = ['ts', 'reversal_label', 'sample_weight', 'datetime', 'cmo_14', 'volume', 'trend_acceleration_ema7',
-                           'regime_volatility', 'bb_width', 'adx_14', 'plus_di_14','minus_di_14', 'atr_14_normalized',
-                           'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio', 'lower_shadow_ratio',
-                           'price_vs_vwap', 'bb_position', 'cusum_1m_recent', 'cusum_1m_quality_score',
-                           'cusum_1m_trend_aligned', 'cusum_1m_price_move', 'is_trend_pattern_1m',
-                           'body_to_range_ratio_1m', 'close_position_in_range_1m']
+        # служебные поля + все фичи из BASE_FEATURE_NAMES
+        feature_columns = list(BASE_FEATURE_NAMES)
+        allowed_columns = ["ts","datetime",
+            "reversal_label","sample_weight",
+            *feature_columns,]
+        # оставляем только нужные колонки, не падаем если чего-то нет
         dataset_df = dataset_df[[c for c in allowed_columns if c in dataset_df.columns]]
         dataset_df['symbol'] = self.config.symbol
         dataset_df['run_id'] = None
