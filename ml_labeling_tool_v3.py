@@ -3111,16 +3111,21 @@ class AdvancedLabelingTool:
             df_clean["timeframe"] = self.config.timeframe
             df_clean["created_at"] = created_at
 
-            # Колонки для новой структуры (29 колонок)
-            required_columns = [
-                'run_id', 'symbol', 'timeframe', 'ts', 'datetime', 'reversal_label', 'sample_weight',
-                'cmo_14','volume', 'trend_acceleration_ema7', 'regime_volatility', 'bb_width', 'adx_14',
-                'plus_di_14', 'minus_di_14', 'atr_14_normalized', 'volume_ratio_ema3', 'candle_relative_body',
-                'upper_shadow_ratio', 'lower_shadow_ratio', 'price_vs_vwap', 'bb_position',
-                'cusum_1m_recent', 'cusum_1m_quality_score', 'cusum_1m_trend_aligned',
-                'cusum_1m_price_move', 'is_trend_pattern_1m', 'body_to_range_ratio_1m',
-                'close_position_in_range_1m', 'created_at'
-            ]
+
+            # Формируем таблицу ТОЛЬКО на основе BASE_FEATURE_NAMES
+            required_columns = (
+                    [
+                        'run_id',
+                        'symbol',
+                        'timeframe',
+                        'ts',
+                        'datetime',
+                        'reversal_label',
+                        'sample_weight',
+                    ]
+                    + BASE_FEATURE_NAMES
+                    + ['created_at']
+            )
 
             # Оставляем только колонки из DDL
             final_columns = [col for col in required_columns if col in df_clean.columns]
