@@ -450,8 +450,8 @@ class MarketDataUtils:
                         pbar.update(1)
                         pbar.set_postfix(
                             saved=saved_count,
-                            cusum_signals=len(cusum_signals),
-                            progress=f"{i + 1}/{len(bars_5m)}"
+                            cusum=len(cusum_signals),
+                            pos=f"{i + 1}/{len(bars_5m)}"
                         )
 
                     except Exception as e:
@@ -626,15 +626,33 @@ class MarketDataUtils:
             )
 
             # Микроструктура 1m для последней свечи
+            # Микроструктура 1m для последней свечи
             last_ts = ts_list[last_idx]
-            candle_1m = candles_1m_map.get(last_ts)
-            if candle_1m:
+            candle_1m_raw = None
+            if candles_1m_map is not None:
+                candle_1m_raw = candles_1m_map.get(last_ts)
+
+            # Поддерживаем оба формата:
+            # 1) ts_5m -> List[dict] (новый, "правильный")
+            # 2) ts_5m -> dict (старый формат, на всякий случай)
+            if isinstance(candle_1m_raw, list) and candle_1m_raw:
+                candle_1m = candle_1m_raw[-1]   # последняя 1m внутри 5m
+            elif isinstance(candle_1m_raw, dict):
+                candle_1m = candle_1m_raw
+            else:
+                candle_1m = None
+
+            if candle_1m is not None:
                 pattern, body_ratio, close_pos = self._pattern_features_1m(
-                    candle_1m['open'], candle_1m['high'], candle_1m['low'],
-                    candle_1m['close'], candle_1m['ema7']
+                    float(candle_1m['open']),
+                    float(candle_1m['high']),
+                    float(candle_1m['low']),
+                    float(candle_1m['close']),
+                    candle_1m.get('ema7'),
                 )
             else:
                 pattern, body_ratio, close_pos = 0, 0.0, 0.5
+
 
             # БЛОК 3: РАСЧЕТ ИНДИКАТОРОВ ДЛЯ ПОСЛЕДНЕЙ СВЕЧИ
             indicators: dict[str, Any] = {}
@@ -821,6 +839,7 @@ class MarketDataUtils:
                     volume_imbalance_5m = 0.0
 
                 indicators["volume_imbalance_5m"] = volume_imbalance_5m
+
 
                 # --- TREND VS NOISE ---
                 atr_norm = indicators.get("atr_14_normalized")
@@ -1047,58 +1066,77 @@ class MarketDataUtils:
 
     async def _get_last_1m_candles(self, symbol: str, start_ts: int, end_ts: int) -> dict:
         """
-        Получение всех 1m свечей для диапазона и создание маппинга ts_5m -> 1m_candle.
+        Получение всех 1m свечей для диапазона и создание маппинга
+        ts_5m -> список 1m-свечей в этом 5m-интервале.
 
         Args:
             symbol: торговый символ
-            start_ts: начало диапазона
-            end_ts: конец диапазона
+            start_ts: начало диапазона (ms, по 5m)
+            end_ts: конец диапазона (ms, по 5m)
 
         Returns:
-            словарь {ts_5m: {open, high, low, close, ema7}}
+            словарь {ts_5m: [ {ts_1m, open, high, low, close, ema7, volume}, ... ]}
         """
         try:
+            # Чуть расширяем диапазон, чтобы не потерять крайние 1m,
+            # которые фазируются в граничные 5m-бары.
+            start_ts_adj = int(start_ts) - self.FIVE_M_MS
+            end_ts_adj = int(end_ts) + self.FIVE_M_MS
+
             query = text(f"""
-                SELECT ts, open, high, low, close, ema7
+                SELECT ts, open, high, low, close, ema7, volume
                 FROM {TABLES['candles_1m']}
                 WHERE symbol = :symbol
-                  AND ts BETWEEN :start_ts AND :end_ts
-                ORDER BY ts
+                  AND ts >= :start_ts
+                  AND ts <= :end_ts
+                ORDER BY ts ASC
             """)
 
             async with self.aengine.begin() as conn:
-                result = await conn.execute(query, {
-                    "symbol": symbol,
-                    "start_ts": start_ts,
-                    "end_ts": end_ts
-                })
+                result = await conn.execute(
+                    query,
+                    {
+                        "symbol": symbol,
+                        "start_ts": start_ts_adj,
+                        "end_ts": end_ts_adj,
+                    },
+                )
                 rows = result.mappings().all()
 
-            # Создаем маппинг: для каждой 5m свечи находим последнюю 1m свечу
-            mapping = {}
+            mapping: dict[int, list[dict]] = {}
 
             # Группируем 1m свечи по 5m периодам
             for row in rows:
-                ts_1m = int(row['ts'])
-                # Находим к какой 5m свече относится эта 1m свеча (с учетом фазирования)
-                # Определяем фазу 1m свечи
-                is_phased = (ts_1m % self.ONE_M_MS) == 50_000
-                ts_5m = self.align_to_interval(ts_1m, self.FIVE_M_MS, self.PHASE_5M) if is_phased else (
-                            ts_1m // self.FIVE_M_MS) * self.FIVE_M_MS
+                ts_1m = int(row["ts"])
 
-                # Сохраняем последнюю 1m свечу для каждого 5m периода
-                if ts_5m not in mapping or ts_1m > mapping[ts_5m]['ts_1m']:
-                    ema7_val = float(row['ema7']) if row['ema7'] is not None else None
-                    mapping[ts_5m] = {
-                        'ts_1m': ts_1m,
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'ema7': ema7_val
-                    }
+                # Определяем, "фазированная" ли 1m свеча
+                # (как в offline-скрипте и align_to_interval)
+                is_phased = (ts_1m % self.ONE_M_MS) == self.PHASE_1M
 
-            self.logger.debug(f"Mapped {len(mapping)} 5m periods to 1m candles for {symbol}")
+                if is_phased:
+                    ts_5m = self.align_to_interval(ts_1m, self.FIVE_M_MS, self.PHASE_5M)
+                else:
+                    # классическое бинансовское бинning без фазы
+                    ts_5m = (ts_1m // self.FIVE_M_MS) * self.FIVE_M_MS
+
+                ema7_val = float(row["ema7"]) if row["ema7"] is not None else None
+                volume_val = row.get("volume", 0.0)
+
+                item = {
+                    "ts_1m": ts_1m,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "ema7": ema7_val,
+                    "volume": float(volume_val or 0.0),
+                }
+
+                mapping.setdefault(ts_5m, []).append(item)
+
+            self.logger.debug(
+                f"Mapped {len(mapping)} 5m periods to 1m candles for {symbol}"
+            )
             return mapping
 
         except Exception as e:

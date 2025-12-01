@@ -181,7 +181,7 @@ class IndicatorWarmupManager:
             return False
 
         try:
-            # ✅ ИСПРАВЛЕНИЕ: compute_5m_features_bulk сам сохранит свечи С индикаторами
+            #  compute_5m_features_bulk сам сохранит свечи С индикаторами
             # Не нужно предварительно сохранять сырые данные
 
             # Используем bulk calculation (он сам вызовет upsert_candles_5m с индикаторами)

@@ -802,10 +802,17 @@ class TradingLogger:
             })
         return None
 
-
-    def close_position(self, position_id: int, exit_price: Decimal, exit_reason: str = "MANUAL",
-                       exit_fee: Decimal = None, gross_pnl_usdt: Decimal = None, gross_pnl_pct: Decimal = None,
-                       net_pnl_usdt: Decimal = None, net_pnl_pct: Decimal = None) -> bool:
+    def close_position(
+            self,
+            position_id: int,
+            exit_price: Decimal,
+            exit_reason: str = "MANUAL",
+            exit_fee: Decimal = None,
+            gross_pnl_usdt: Decimal = None,
+            gross_pnl_pct: Decimal = None,
+            net_pnl_usdt: Decimal = None,
+            net_pnl_pct: Decimal = None,
+    ) -> bool:
         """Закрыть позицию с автоматическим созданием trade record."""
         try:
             position_before_close = self.get_position_by_id(position_id)
@@ -815,28 +822,53 @@ class TradingLogger:
 
             symbol = position_before_close["symbol"]
 
-            if all(v is not None for v in [gross_pnl_usdt, gross_pnl_pct, net_pnl_usdt, net_pnl_pct, exit_fee]):
-                entry_fee = position_before_close.get("fee_total_usdt", Decimal('0')) or Decimal('0')
+            # -------------------------------------------------------------
+            # 1) Определяем, переданы ли все PnL-параметры явно
+            # -------------------------------------------------------------
+            explicit_pnl_provided = all(
+                v is not None
+                for v in [gross_pnl_usdt, gross_pnl_pct, net_pnl_usdt, net_pnl_pct, exit_fee]
+            )
+
+            # -------------------------------------------------------------
+            # 2) Выбираем "эффективную" причину выхода
+            #    - если PositionManager уже поставил STOP_LOSS / TRAILING_STOP / ...
+            #      → не трогаем
+            #    - если причина не задана (MANUAL / "" / None)
+            #      → пытаемся вывести её из последнего ордера
+            # -------------------------------------------------------------
+            effective_exit_reason: str = exit_reason or "MANUAL"
+
+            if not explicit_pnl_provided:
+                # Фолбэк: смотрим на последний FILLED ордер только если
+                # явная причина не задана (MANUAL/""/None/UNKNOWN)
+                if effective_exit_reason in ("MANUAL", "", None, "UNKNOWN"):
+                    last_orders = self.get_orders_for_position(position_id, status="FILLED", limit=1)
+
+                    if last_orders:
+                        last_order = last_orders[0]
+                        order_type = str(last_order.get("type", "")).upper()
+
+                        if order_type in ["STOP_MARKET", "STOP", "STOP_LOSS"]:
+                            effective_exit_reason = "STOP_LOSS"
+                        elif order_type in ["TAKE_PROFIT", "TAKE_PROFIT_MARKET"]:
+                            effective_exit_reason = "TAKE_PROFIT"
+
+            # -------------------------------------------------------------
+            # 3) Расчёт PnL (если не передан полностью извне)
+            # -------------------------------------------------------------
+            if explicit_pnl_provided:
+                entry_fee = position_before_close.get("fee_total_usdt", Decimal("0")) or Decimal("0")
                 total_fees = entry_fee + exit_fee
 
                 self.logger.info(
                     f"Closing position {position_id}: "
                     f"gross={float(gross_pnl_usdt):.4f} USDT, "
                     f"net={float(net_pnl_usdt):.4f} USDT, "
-                    f"fees={float(total_fees):.4f} USDT"
+                    f"fees={float(total_fees):.4f} USDT, "
+                    f"reason={effective_exit_reason}"
                 )
             else:
-                last_orders = self.get_orders_for_position(position_id, status="FILLED", limit=1)
-
-                if last_orders:
-                    last_order = last_orders[0]
-                    order_type = str(last_order.get("type", "")).upper()
-
-                    if order_type in ["STOP_MARKET", "STOP", "STOP_LOSS"]:
-                        exit_reason = "STOP_LOSS"
-                    elif order_type in ["TAKE_PROFIT", "TAKE_PROFIT_MARKET"]:
-                        exit_reason = "TAKE_PROFIT"
-
                 entry_price = position_before_close["entry_price"]
                 qty = position_before_close["qty"]
                 side = position_before_close["side"]
@@ -847,43 +879,62 @@ class TradingLogger:
                     gross_pnl_usdt = (entry_price - exit_price) * qty
 
                 position_usdt = entry_price * qty
-                gross_pnl_pct = (gross_pnl_usdt / position_usdt * 100) if position_usdt > 0 else Decimal('0')
+                gross_pnl_pct = (
+                    gross_pnl_usdt / position_usdt * 100
+                    if position_usdt > 0
+                    else Decimal("0")
+                )
 
-                existing_fees = position_before_close.get("fee_total_usdt", Decimal('0')) or Decimal('0')
+                existing_fees = position_before_close.get("fee_total_usdt", Decimal("0")) or Decimal("0")
                 exit_position_usdt = exit_price * qty
-                exit_fee = exit_position_usdt * Decimal('0.001') if exit_fee is None else exit_fee
+                exit_fee = exit_position_usdt * Decimal("0.001") if exit_fee is None else exit_fee
                 total_fees = existing_fees + exit_fee
 
                 net_pnl_usdt = gross_pnl_usdt - total_fees
-                net_pnl_pct = (net_pnl_usdt / position_usdt * 100) if position_usdt > 0 else Decimal('0')
+                net_pnl_pct = (
+                    net_pnl_usdt / position_usdt * 100
+                    if position_usdt > 0
+                    else Decimal("0")
+                )
 
-            success = self.update_position(position_id, {
-                "status": "CLOSED",
-                "exit_ts": get_current_timestamp_ms(),
-                "exit_price": exit_price,
-                "reason_exit": exit_reason,
-                "realized_pnl_usdt": net_pnl_usdt,
-                "realized_pnl_pct": net_pnl_pct,
-                "fee_total_usdt": total_fees
-            })
+            # -------------------------------------------------------------
+            # 4) Обновляем позицию в БД
+            # -------------------------------------------------------------
+            success = self.update_position(
+                position_id,
+                {
+                    "status": "CLOSED",
+                    "exit_ts": get_current_timestamp_ms(),
+                    "exit_price": exit_price,
+                    "reason_exit": effective_exit_reason,
+                    "realized_pnl_usdt": net_pnl_usdt,
+                    "realized_pnl_pct": net_pnl_pct,
+                    "fee_total_usdt": total_fees,
+                },
+            )
 
+            # -------------------------------------------------------------
+            # 5) Создаём запись в trades
+            # -------------------------------------------------------------
             if success:
                 closed_position = self.get_position_by_id(position_id)
                 if closed_position:
                     self._create_trade_record_from_position(
                         closed_position,
                         gross_pnl_usdt=gross_pnl_usdt,
-                        gross_pnl_pct=gross_pnl_pct
+                        gross_pnl_pct=gross_pnl_pct,
                     )
 
             return success
 
         except Exception as e:
-            self.record_error({
-                "error_type": "position_close",
-                "position_id": position_id,
-                "error": str(e)
-            })
+            self.record_error(
+                {
+                    "error_type": "position_close",
+                    "position_id": position_id,
+                    "error": str(e),
+                }
+            )
             return False
 
     def get_orders_for_position(self, position_id: int, status: str = None, limit: int = None) -> List[Dict[str, Any]]:

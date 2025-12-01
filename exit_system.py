@@ -566,9 +566,10 @@ class AdaptiveExitManager:
         if pnl_pct >= self.trailing_stop_activation:
             tracking['trailing_active'] = True
 
-            # Расчет трейлинга
-            if direction == 'BUY':
-                peak_price = tracking['peak_price']
+            peak_price = tracking['peak_price']
+
+            if direction == Direction.BUY:
+                # Для лонга стоп НИЖЕ пика
                 trailing_stop = peak_price * (1 - self.trailing_stop_distance)
                 if current_price <= trailing_stop:
                     return {
@@ -579,8 +580,9 @@ class AdaptiveExitManager:
                         'trailing_stop': trailing_stop,
                         'pnl_pct': pnl_pct
                     }
-            else:  # SELL
-                peak_price = tracking['peak_price']
+
+            elif direction == Direction.SELL:
+                # Для шорта стоп ВЫШЕ пика (локального минимума)
                 trailing_stop = peak_price * (1 + self.trailing_stop_distance)
                 if current_price >= trailing_stop:
                     return {
@@ -591,6 +593,7 @@ class AdaptiveExitManager:
                         'trailing_stop': trailing_stop,
                         'pnl_pct': pnl_pct
                     }
+
 
         return {'should_exit': False, 'reason': 'no_protection_exit', 'type': 'protection'}
 
