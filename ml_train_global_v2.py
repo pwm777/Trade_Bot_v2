@@ -264,6 +264,10 @@ class ModelTrainer:
 
         n_samples = len(df_filtered)
         n_features = len(self.base_feature_names)
+
+        # ✅ ИСПРАВЛЕНО: Окно заканчивается НА метке (включительно)
+        # Для каждой метки на позиции i нужно lookback баров ВКЛЮЧАЯ i
+        # Минимальная позиция метки: lookback-1 (чтобы было достаточно истории)
         n_valid = n_samples - (self.lookback - 1)
 
         if n_valid <= 0:
@@ -274,22 +278,26 @@ class ModelTrainer:
         # Предаллокация массива результатов
         X_windowed = np.zeros((n_valid, self.lookback * n_features), dtype=np.float32)
 
-        # Векторизованное создание окон с ПРАВИЛЬНЫМ порядком
-        for i in range(n_valid):
-            start_idx = i
-            end_idx = i + self.lookback
+        # ✅ ПРАВИЛЬНАЯ ЛОГИКА:
+        # Метка на позиции label_idx (это extreme_timestamp)
+        # Окно: [label_idx - (lookback-1), .. ., label_idx-1, label_idx]
+        # То есть lookback баров, ЗАКАНЧИВАЮЩИХСЯ на label_idx
 
-            # Берём окно [start_idx:end_idx]
+        for i in range(n_valid):
+            label_idx = i + (self.lookback - 1)  # Позиция метки в исходном массиве
+            start_idx = label_idx - (self.lookback - 1)  # Начало окна
+            end_idx = label_idx + 1  # Конец окна (эксклюзивно)
+
+            # Окно: [start_idx : end_idx] = lookback баров
             window = feature_matrix[start_idx:end_idx, :]  # shape: (lookback, n_features)
 
-            # ПРАВИЛЬНЫЙ ПОРЯДОК: [t0, t-1, t-2, ..., t-(lookback-1)]
-            # где t0 = end_idx-1 (последний бар окна)
-            window_ordered = window[::-1]  # Разворачиваем чтобы t0 был первым
+            # Порядок признаков: [t0, t-1, t-2, ..., t-(lookback-1)]
+            # где t0 = label_idx (текущий бар с меткой)
+            window_ordered = window[::-1]  # Разворачиваем: последний бар становится первым
 
-            # Flatten в правильном порядке: t0_feat1, t0_feat2, ..., t-1_feat1, ...
             X_windowed[i] = window_ordered.ravel()
 
-        # Метки и веса соответствуют ПОСЛЕДНЕМУ бару каждого окна (t0)
+        # ✅ Метки соответствуют label_idx для каждого окна
         y_windowed = labels[self.lookback - 1:]
         w_windowed = weights[self.lookback - 1:]
 

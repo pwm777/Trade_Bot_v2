@@ -555,7 +555,7 @@ class AdvancedLabelingTool:
         # Проверка значений reversal_label (0=NO_SIGNAL/HOLD, 1=BUY, 2=SELL)
         allowed_labels = [0, 1, 2]
         if not df["reversal_label"].isin(allowed_labels).all():
-            invalid_labels = df.loc[~df["reversal_label"].isin(allowed_labels), "reversal_label"].unique()
+            invalid_labels = list(df.loc[~df["reversal_label"].isin(allowed_labels), "reversal_label"].unique())
             raise ValueError(
                 f"Invalid reversal_label values: {invalid_labels}. Expected: {allowed_labels}")
 
@@ -2708,18 +2708,31 @@ class AdvancedLabelingTool:
 
         close_prices = range_bars['close'].values
 
-        # ATR (если есть в данных, иначе рассчитываем из high-low)
+        # ✅ ИСПРАВЛЕНО: Проверка всех возможных имен колонок ATR (в правильном порядке!)
         atr_normalized = 0.0
-        if 'atr' in range_bars.columns or 'atr_14' in range_bars.columns:
-            atr_col = 'atr' if 'atr' in range_bars.columns else 'atr_14'
-            atr_values = range_bars[atr_col].dropna()
+        atr_candidates = ['atr_14_normalized', 'atr', 'atr_14']  # ← Ваша БД использует atr_14_normalized
+
+        atr_col_found = None
+        for col in atr_candidates:
+            if col in range_bars.columns:
+                atr_col_found = col
+                break
+
+        if atr_col_found:
+            atr_values = range_bars[atr_col_found].dropna()
             if len(atr_values) > 0:
                 atr_mean = float(atr_values.mean())
-                price_mean = float(range_bars['close'].mean())
-                if price_mean > 0:
-                    atr_normalized = atr_mean / price_mean
+
+                if 'normalized' in atr_col_found.lower():
+                    atr_normalized = atr_mean  # Уже нормализовано
+                else:
+                    # Нормализуем к цене
+                    price_mean = float(range_bars['close'].mean())
+                    if price_mean > 0:
+                        atr_normalized = atr_mean / price_mean
+
+        # Fallback: если ATR не найден, оцениваем через (high - low)
         elif 'high' in range_bars.columns and 'low' in range_bars.columns:
-            # Простая оценка волатильности через (high - low) / close
             hl_range = (range_bars['high'] - range_bars['low']).mean()
             price_mean = float(range_bars['close'].mean())
             if price_mean > 0:
@@ -2734,20 +2747,30 @@ class AdvancedLabelingTool:
         trend_strength = 0.0
         if len(close_prices) >= 3:
             x = np.arange(len(close_prices))
-            if SCIPY_AVAILABLE and scipy_linregress is not None:
+
+            # ✅ ИСПРАВЛЕНО: Безопасная проверка scipy
+            try:
+                from scipy.stats import linregress
+                slope, intercept, r_value, p_value, std_err = linregress(x, close_prices)
+                trend_strength = float(r_value ** 2)  # R² показывает линейность
+            except ImportError:
+                # Fallback: простая корреляция через numpy
                 try:
-                    slope, intercept, r_value, p_value, std_err = scipy_linregress(x, close_prices)
-                    trend_strength = float(r_value ** 2)  # R² показывает линейность
-                except Exception:
-                    # Fallback to numpy correlation
                     correlation = np.corrcoef(x, close_prices)[0, 1]
                     if not np.isnan(correlation):
                         trend_strength = float(correlation ** 2)
-            else:
-                # Fallback: простая корреляция через numpy
-                correlation = np.corrcoef(x, close_prices)[0, 1]
-                if not np.isnan(correlation):
-                    trend_strength = float(correlation ** 2)
+                except Exception as e:
+                    logger.debug(f"Не удалось рассчитать trend_strength: {e}")
+                    trend_strength = 0.0
+            except Exception as e:
+                # Любые другие ошибки при расчете регрессии
+                logger.debug(f"Ошибка linregress: {e}")
+                try:
+                    correlation = np.corrcoef(x, close_prices)[0, 1]
+                    if not np.isnan(correlation):
+                        trend_strength = float(correlation ** 2)
+                except Exception:
+                    trend_strength = 0.0
 
         # Классификация волатильности
         volatility_level = self._classify_volatility(atr_normalized)
@@ -2765,17 +2788,19 @@ class AdvancedLabelingTool:
 
     def _classify_volatility(self, atr_normalized: float) -> str:
         """
-        Классифицирует уровень волатильности на основе нормализованного ATR.
+        Классифицирует волатильность на основе нормализованного ATR.
 
         Args:
-            atr_normalized: ATR / средняя цена
+            atr_normalized: ATR деленный на цену (или уже normalized из БД)
 
         Returns:
-            str: 'LOW', 'MEDIUM', 'HIGH'
+            'LOW', 'MEDIUM', или 'HIGH'
         """
-        # Пороги волатильности (уже в десятичном формате: 0.005 = 0.5%)
-        low_threshold = getattr(self.config, 'atr_low_threshold', 0.005)
-        high_threshold = getattr(self.config, 'atr_high_threshold', 0.015)
+        cfg = self.config
+
+        # Пороги из конфига (или дефолтные)
+        low_threshold = getattr(cfg, 'atr_low_threshold', 0.005)  # 0.5%
+        high_threshold = getattr(cfg, 'atr_high_threshold', 0.015)  # 1.5%
 
         if atr_normalized < low_threshold:
             return 'LOW'
@@ -2786,16 +2811,19 @@ class AdvancedLabelingTool:
 
     def _classify_trend(self, trend_strength: float) -> str:
         """
-        Классифицирует силу тренда на основе R².
+        Классифицирует силу тренда на основе R² (коэффициент детерминации).
 
         Args:
-            trend_strength: R² линейной регрессии (0-1)
+            trend_strength: R² от линейной регрессии (0. 0 - 1.0)
 
         Returns:
-            str: 'WEAK', 'MODERATE', 'STRONG'
+            'WEAK', 'MODERATE', или 'STRONG'
         """
-        weak_threshold = getattr(self.config, 'trend_weak_threshold', 0.3)
-        strong_threshold = getattr(self.config, 'trend_strong_threshold', 0.7)
+        cfg = self.config
+
+        # Пороги из конфига (или дефолтные)
+        weak_threshold = getattr(cfg, 'trend_weak_threshold', 0.3)  # R² < 0.3
+        strong_threshold = getattr(cfg, 'trend_strong_threshold', 0.7)  # R² > 0.7
 
         if trend_strength < weak_threshold:
             return 'WEAK'
@@ -2847,51 +2875,38 @@ class AdvancedLabelingTool:
         # Прибыльный сильный тренд — НЕ размечаем как HOLD
         return None
 
-    def _generate_holds_for_range(
-        self,
-        ts_list: List[int],
-        range_type: str,
-        sample_weight: float = 1.0
-    ) -> List[dict]:
+    def _generate_holds_for_range(self, ts_list: List[int], range_type: str) -> List[Dict]:
         """
-        Генерирует HOLD-метки в зависимости от типа диапазона.
+        Генерирует HOLD-метки для диапазона.
 
         Args:
-            ts_list: список timestamps баров в диапазоне
-            range_type: тип диапазона из _classify_range()
-            sample_weight: вес для sample_weight
+            ts_list: Список timestamp из candles_5m (int64!)
+            range_type: Тип диапазона
 
         Returns:
-            List[dict]: список HOLD-меток для вставки в БД
+            List[Dict]: HOLD-метки для вставки
         """
-        if not ts_list or not range_type:
-            return []
-
         holds = []
-        n = len(ts_list)
-        symbol = self.config.symbol
-        tf = self.config.timeframe
 
-        # Конфигурационные параметры
-        min_window_bars = getattr(self.config, 'hold_min_window_bars', 6)
-        min_mid_end_gap = getattr(self.config, 'hold_min_mid_end_gap', 3)
-        consolidation_step = getattr(self.config, 'consolidation_hold_every_n_bars', 3)
-        # Вес для консолидаций (повышенный, так как это качественные примеры HOLD)
-        consolidation_weight = getattr(self.config, 'consolidation_sample_weight', 1.5)
+        if not ts_list or len(ts_list) < 2:
+            return holds
 
-        def _make_hold_record(ts: int, method: str, weight: float = 1.0) -> dict:
-            """Создает запись HOLD для вставки."""
+        # Базовая структура HOLD-метки
+        def _create_hold(ts: int, method: str) -> Dict:
+            # ✅ КРИТИЧНО: явное приведение к int (Python int64)
+            ts_int64 = int(ts)
+
             return {
-                "symbol": symbol,
-                "timestamp": ts,
-                "timeframe": tf,
-                "reversal_label": 0,  # HOLD
+                "symbol": self.config.symbol,
+                "timestamp": ts_int64,
+                "timeframe": self.config.timeframe,
+                "reversal_label": 0,
                 "reversal_confidence": 1.0,
                 "labeling_method": method,
                 "labeling_params": None,
                 "extreme_index": None,
                 "extreme_price": None,
-                "extreme_timestamp": ts,
+                "extreme_timestamp": ts_int64,  # ✅ Дублируем как int64
                 "confirmation_index": None,
                 "confirmation_timestamp": None,
                 "price_change_after": 0.0,
@@ -2899,36 +2914,27 @@ class AdvancedLabelingTool:
                 "is_high_quality": 1,
             }
 
+        # Генерация по типу диапазона
         if range_type == "HOLD_CONSOLIDATION":
-            # Плотная разметка консолидаций — каждые N баров (с повышенным весом)
-            for i in range(1, n - 1, consolidation_step):
-                holds.append(_make_hold_record(ts_list[i], "HOLD_CONSOLIDATION", weight=consolidation_weight))
+            step = getattr(self.config, 'consolidation_hold_every_n_bars', 3)
+            for i in range(1, len(ts_list) - 1, step):
+                holds.append(_create_hold(ts_list[i], "HOLD_CONSOLIDATION"))
 
         elif range_type == "HOLD_AFTER_LOSS":
-            # Текущая логика: MID + END
-            # HOLD-END — последний бар перед следующим сигналом
-            if n >= 1:
-                holds.append(_make_hold_record(ts_list[-1], "HOLD_AFTER_LOSS_END"))
-
-            # HOLD-MID — середина окна (если достаточно баров)
-            if n >= min_window_bars:
-                mid_idx = n // 2
-                gap = (n - 1) - mid_idx
-                if gap >= min_mid_end_gap and mid_idx < n - 1:
-                    holds.append(_make_hold_record(ts_list[mid_idx], "HOLD_AFTER_LOSS_MID"))
+            min_window = getattr(self.config, 'min_window_bars', 6)
+            if len(ts_list) >= min_window:
+                mid_idx = len(ts_list) // 2
+                holds.append(_create_hold(ts_list[mid_idx], "HOLD_AFTER_LOSS_MID"))
+            holds.append(_create_hold(ts_list[-1], "HOLD_AFTER_LOSS_END"))
 
         elif range_type == "HOLD_WEAK_PROFIT":
-            # MID + END для слабой прибыли
-            if n >= min_window_bars:
-                mid_idx = n // 2
-                holds.append(_make_hold_record(ts_list[mid_idx], "HOLD_WEAK_PROFIT_MID"))
-            if n >= 1:
-                holds.append(_make_hold_record(ts_list[-1], "HOLD_WEAK_PROFIT_END"))
+            if len(ts_list) >= 6:
+                mid_idx = len(ts_list) // 2
+                holds.append(_create_hold(ts_list[mid_idx], "HOLD_WEAK_PROFIT_MID"))
+            holds.append(_create_hold(ts_list[-1], "HOLD_WEAK_PROFIT_END"))
 
         elif range_type == "HOLD_CHOPPY":
-            # Только END для рваного рынка
-            if n >= 1:
-                holds.append(_make_hold_record(ts_list[-1], "HOLD_CHOPPY"))
+            holds.append(_create_hold(ts_list[-1], "HOLD_CHOPPY"))
 
         return holds
 
@@ -3029,11 +3035,11 @@ class AdvancedLabelingTool:
                     )
                     stats['updated_losers'] += 1
 
-                # 3.2) Загружаем бары диапазона для анализа
+                # 3.2) ✅ ИСПРАВЛЕНО: Загружаем бары диапазона с правильным именем колонки ATR
                 range_bars_result = conn.execute(
                     text(f"""
                         SELECT ts, open, high, low, close, volume,
-                               COALESCE(atr_14, NULL) as atr
+                               COALESCE(atr_14_normalized, NULL) as atr
                           FROM {candles_table}
                          WHERE symbol=:symbol
                            AND ts > :ts_cur
@@ -3056,20 +3062,32 @@ class AdvancedLabelingTool:
                 stats['ranges_analyzed'] += 1
 
                 # 3.3) Рассчитываем метрики диапазона
-                metrics = self._calculate_range_metrics(range_bars)
+                try:
+                    metrics = self._calculate_range_metrics(range_bars)
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка расчета метрик для диапазона {ts_cur}-{ts_next}: {e}")
+                    continue
 
                 # 3.4) Классифицируем диапазон
-                range_type = self._classify_range(metrics, pnl)
+                try:
+                    range_type = self._classify_range(metrics, pnl)
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка классификации диапазона {ts_cur}-{ts_next}: {e}")
+                    continue
 
                 if range_type is None:
                     # Прибыльный тренд — не размечаем
                     continue
 
                 # 3.5) Генерируем HOLD-метки
-                ts_list = range_bars['ts'].astype(int).tolist()
-                holds = self._generate_holds_for_range(ts_list, range_type)
+                ts_list = range_bars['ts'].astype('int64').tolist()
+                try:
+                    holds = self._generate_holds_for_range(ts_list, range_type)
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка генерации HOLD для диапазона {ts_cur}-{ts_next}: {e}")
+                    continue
 
-                # 3.6) Фильтруем дубликаты и добавляем в batch
+                # 3. 6) Фильтруем дубликаты и добавляем в batch
                 for hold in holds:
                     ts_hold = hold['extreme_timestamp']
                     if ts_hold not in existing_holds and ts_hold not in new_holds_in_batch:
@@ -3297,7 +3315,7 @@ class AdvancedLabelingTool:
             print("[21] Устранение дублирования меток")
 
 
-            print("\n[0] Выход")
+            print("\n[22] Выход")
 
             choice = input("\nВаш выбор: ").strip()
             if choice == '0':
@@ -3400,7 +3418,7 @@ class AdvancedLabelingTool:
                 except Exception as err:
                     print(f"❌ Ошибка: {err}")
 
-            elif choice == '0':
+            elif choice == '22':
                 print("👋 До свидания!")
                 break
             else:
@@ -3462,6 +3480,26 @@ class AdvancedLabelingTool:
             raise RuntimeError("Пустые рыночные данные")
         if "ts" not in market_df.columns:
             raise RuntimeError("В market_df отсутствует колонка 'ts'")
+
+        # ✅ ДОБАВЬТЕ DEBUG:
+        logger.info(f"🔍 market_df колонок: {len(market_df.columns)}")
+        logger.info(f"🔍 Первые 10 колонок: {list(market_df.columns[:10])}")
+
+        # Проверяем признаки из BASE_FEATURE_NAMES
+        missing_features = [f for f in BASE_FEATURE_NAMES if f not in market_df.columns]
+        if missing_features:
+            logger.warning(f"⚠️ Отсутствуют признаки: {missing_features}")
+        else:
+            logger.info("✅ Все BASE_FEATURE_NAMES присутствуют в market_df")
+
+        # Проверяем заполненность
+        sample_row = market_df.iloc[0][BASE_FEATURE_NAMES]
+        null_count = sample_row.isna().sum()
+        logger.info(f"🔍 В первой строке NULL признаков: {null_count}/{len(BASE_FEATURE_NAMES)}")
+        if null_count > 0:
+            null_features = sample_row[sample_row.isna()].index.tolist()
+            logger.warning(f"⚠️ NULL признаки в первой строке: {null_features}")
+
         logger.info(f"✅ Загружено {len(market_df)} свечей с индикаторами")
         with self.engine.begin() as conn:
             rows = conn.execute(text("""
@@ -3495,16 +3533,41 @@ class AdvancedLabelingTool:
         labeled_mask = mapped.notna()
         labeled_df = market_df.loc[labeled_mask].copy()
 
+        # ✅ ДОБАВЬТЕ DEBUG:
+        logger.info(f"🔍 labeled_df: {len(labeled_df)} строк, {len(labeled_df.columns)} колонок")
+
+        # Проверяем признаки
+        sample_labeled = labeled_df.iloc[0][BASE_FEATURE_NAMES]
+        null_labeled = sample_labeled.isna().sum()
+        logger.info(f"🔍 В первой строке labeled_df NULL признаков: {null_labeled}/{len(BASE_FEATURE_NAMES)}")
+
+        if null_labeled > 0:
+            null_features_labeled = sample_labeled[sample_labeled.isna()].index.tolist()
+            logger.warning(f"⚠️ NULL признаки в labeled_df: {null_features_labeled}")
+
         if labeled_df.empty:
             raise RuntimeError("После применения expanded_labels не осталось размеченных баров")
 
         labeled_df["reversal_label"] = mapped[labeled_mask].astype(int)
 
+        # ✅ ДОБАВЬТЕ: Удаляем строки с NULL в критичных признаках
+        critical_features = ['cmo_14', 'adx_14', 'bb_position', 'atr_14_normalized', 'trend_acceleration_ema7']
+        before_null_drop = len(labeled_df)
+        labeled_df = labeled_df.dropna(subset=critical_features)
+        after_null_drop = len(labeled_df)
+
+        dropped_count = before_null_drop - after_null_drop
+        if dropped_count > 0:
+            logger.info(f"🔧 Удалено {dropped_count} меток с NULL индикаторами (прогрев)")
+
+        if labeled_df.empty:
+            raise RuntimeError("❌ После удаления NULL не осталось размеченных данных!")
+
         # sanity-check: только 0/1/2
         invalid_mask = ~labeled_df["reversal_label"].isin([0, 1, 2])
         if invalid_mask.any():
-            bad_vals = labeled_df.loc[invalid_mask, "reversal_label"].unique().tolist()
-            logger.warning(f"⚠️ Обнаружены недопустимые метки после маппинга: {bad_vals} — удаляем их")
+            invalid_count = invalid_mask.sum()
+            logger.warning(f"⚠️ Обнаружено {invalid_count} недопустимых меток после маппинга — удаляем их")
             labeled_df = labeled_df[~invalid_mask]
 
         if labeled_df.empty:
@@ -3539,10 +3602,18 @@ class AdvancedLabelingTool:
         )
 
         # итоговый датасет на этой стадии
-        dataset_df = pd.concat(
-            [hold_sample, signals_df],
-            ignore_index=True
-        ).sort_values("ts").reset_index(drop=True)
+        dataset_df = pd.concat([hold_sample, signals_df], ignore_index=True).sort_values("ts").reset_index(drop=True)
+
+        # ✅ ДОБАВЬТЕ DEBUG:
+        logger.info(f"🔍 dataset_df ДО фильтрации колонок: {len(dataset_df)} строк, {len(dataset_df.columns)} колонок")
+
+        # Проверяем есть ли признаки
+        features_present = [f for f in BASE_FEATURE_NAMES if f in dataset_df.columns]
+        logger.info(f"🔍 Признаков в dataset_df: {len(features_present)}/{len(BASE_FEATURE_NAMES)}")
+
+        sample_dataset = dataset_df.iloc[0][features_present]
+        null_dataset = sample_dataset.isna().sum()
+        logger.info(f"🔍 NULL в первой строке dataset_df: {null_dataset}/{len(features_present)}")
 
 
         class_counts_after = dataset_df["reversal_label"].value_counts().to_dict()
