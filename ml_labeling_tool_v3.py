@@ -31,6 +31,15 @@ except ImportError:
     RUPTURES_AVAILABLE = False
     logging.warning("⚠️ ruptures не установлен — функции BinSeg и PELT отключены")
 
+# === Безопасный импорт scipy ===
+try:
+    from scipy.stats import linregress as scipy_linregress
+    SCIPY_AVAILABLE = True
+except ImportError:
+    scipy_linregress = None
+    SCIPY_AVAILABLE = False
+    logging.warning("⚠️ scipy не установлен — линейная регрессия использует numpy fallback")
+
 FEATURE_SQL_TYPE_OVERRIDES: dict[str, str] = {
     "is_trend_pattern_1m": "INTEGER",
     "cusum_price_conflict": "INTEGER",
@@ -160,9 +169,9 @@ class LabelingConfig:
     min_profit_target: float = 0.001
     tool: Any = None
 
-    # === HOLD разметка: пороги волатильности (в % от ATR) ===
-    atr_low_threshold: float = 0.5      # низкая волатильность
-    atr_high_threshold: float = 1.5     # высокая волатильность
+    # === HOLD разметка: пороги волатильности (нормализованное значение ATR/price) ===
+    atr_low_threshold: float = 0.005      # 0.5% волатильности = низкая
+    atr_high_threshold: float = 0.015     # 1.5% волатильности = высокая
 
     # === HOLD разметка: пороги силы тренда (R² линейной регрессии) ===
     trend_weak_threshold: float = 0.3    # слабый тренд
@@ -176,6 +185,9 @@ class LabelingConfig:
 
     # === HOLD разметка: минимальная прибыль для "слабого" профита ===
     weak_profit_threshold: float = 0.002  # 0.2%
+
+    # === HOLD разметка: веса для различных типов HOLD ===
+    consolidation_sample_weight: float = 1.5  # Повышенный вес для консолидаций
 
     # === HOLD разметка: минимальная длина окна для MID ===
     hold_min_window_bars: int = 6
@@ -2721,14 +2733,18 @@ class AdvancedLabelingTool:
         # Сила тренда через линейную регрессию (R²)
         trend_strength = 0.0
         if len(close_prices) >= 3:
-            try:
-                from scipy.stats import linregress
-                x = np.arange(len(close_prices))
-                slope, intercept, r_value, p_value, std_err = linregress(x, close_prices)
-                trend_strength = float(r_value ** 2)  # R² показывает линейность
-            except Exception:
-                # Fallback: простая корреляция
-                x = np.arange(len(close_prices))
+            x = np.arange(len(close_prices))
+            if SCIPY_AVAILABLE and scipy_linregress is not None:
+                try:
+                    slope, intercept, r_value, p_value, std_err = scipy_linregress(x, close_prices)
+                    trend_strength = float(r_value ** 2)  # R² показывает линейность
+                except Exception:
+                    # Fallback to numpy correlation
+                    correlation = np.corrcoef(x, close_prices)[0, 1]
+                    if not np.isnan(correlation):
+                        trend_strength = float(correlation ** 2)
+            else:
+                # Fallback: простая корреляция через numpy
                 correlation = np.corrcoef(x, close_prices)[0, 1]
                 if not np.isnan(correlation):
                     trend_strength = float(correlation ** 2)
@@ -2757,9 +2773,9 @@ class AdvancedLabelingTool:
         Returns:
             str: 'LOW', 'MEDIUM', 'HIGH'
         """
-        # Пороги волатильности (процент от цены)
-        low_threshold = getattr(self.config, 'atr_low_threshold', 0.5) / 100  # 0.5% → 0.005
-        high_threshold = getattr(self.config, 'atr_high_threshold', 1.5) / 100  # 1.5% → 0.015
+        # Пороги волатильности (уже в десятичном формате: 0.005 = 0.5%)
+        low_threshold = getattr(self.config, 'atr_low_threshold', 0.005)
+        high_threshold = getattr(self.config, 'atr_high_threshold', 0.015)
 
         if atr_normalized < low_threshold:
             return 'LOW'
@@ -2860,6 +2876,8 @@ class AdvancedLabelingTool:
         min_window_bars = getattr(self.config, 'hold_min_window_bars', 6)
         min_mid_end_gap = getattr(self.config, 'hold_min_mid_end_gap', 3)
         consolidation_step = getattr(self.config, 'consolidation_hold_every_n_bars', 3)
+        # Вес для консолидаций (повышенный, так как это качественные примеры HOLD)
+        consolidation_weight = getattr(self.config, 'consolidation_sample_weight', 1.5)
 
         def _make_hold_record(ts: int, method: str, weight: float = 1.0) -> dict:
             """Создает запись HOLD для вставки."""
@@ -2882,9 +2900,9 @@ class AdvancedLabelingTool:
             }
 
         if range_type == "HOLD_CONSOLIDATION":
-            # Плотная разметка консолидаций — каждые N баров
+            # Плотная разметка консолидаций — каждые N баров (с повышенным весом)
             for i in range(1, n - 1, consolidation_step):
-                holds.append(_make_hold_record(ts_list[i], "HOLD_CONSOLIDATION", weight=1.5))
+                holds.append(_make_hold_record(ts_list[i], "HOLD_CONSOLIDATION", weight=consolidation_weight))
 
         elif range_type == "HOLD_AFTER_LOSS":
             # Текущая логика: MID + END
