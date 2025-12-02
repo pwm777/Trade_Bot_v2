@@ -322,10 +322,10 @@ class ModelTrainer:
             y_val: np.ndarray,
             proba: np.ndarray,
             bars_per_day: int,
-            spd_min: float = 8.0,  # Реалистичный диапазон
-            spd_max: float = 25.0,
-            precision_min: float = 0.60,
-            delta: float = 0.08,
+            spd_min: float = 20.0,  # Реалистичный диапазон
+            spd_max: float = 35.0,
+            precision_min: float = 0.70,
+            delta: float = 0.06,
             cooldown_bars: int = 2,
             log_stats: bool = True,  # ← логировать статистики maxp только один раз
     ):
@@ -663,20 +663,20 @@ class ModelTrainer:
         # ─────────────────────────────────────────────────────────────
         # bars_per_day определяем из run_id (если возможно)
         bars_per_day = _infer_bars_per_day_from_run_id(run_id, default=TIMEFRAME_TO_BARS.get(str(self.timeframe).lower(), 288))
-
+        candidates = []
         # Перебор precision_min НА ТЕСТОВОМ НАБОРЕ
         precision_grid = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
-        candidates = []
+
         for idx, pm in enumerate(precision_grid):
             try:
                 tau_i, tstats_i = self.tune_tau_for_spd_range(
                     y_val=np.asarray(y_test),
                     proba=np.asarray(y_test_pred_proba),
                     bars_per_day=bars_per_day,
-                    spd_min=12.0,
-                    spd_max=25.0,
+                    spd_min=20.0,
+                    spd_max=35.0,
                     precision_min=pm,
-                    delta=0.08,
+                    delta=0.06,
                     cooldown_bars=2,
                     log_stats=(idx == 0),  # логировать max-proba stats только в первой итерации
                 )

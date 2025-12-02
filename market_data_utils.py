@@ -2113,13 +2113,24 @@ class MarketDataUtils:
 
     @staticmethod
     def _trend_acceleration_series(ema_values: List[Optional[float]]) -> List[Optional[float]]:
-        result: List[Optional[float]] = [None, None]  # Первые 2 бара = None
-        for i in range(2, len(ema_values)):
-            if ema_values[i - 1] is not None and ema_values[i - 2] is not None:
-                # ✅ Используем ПРОШЛЫЕ значения
-                result.append(ema_values[i - 1] - ema_values[i - 2])
+        """
+        Рассчитывает ускорение тренда как первую производную EMA(7).
+        Формула: acceleration[i] = EMA(7)[i] - EMA(7)[i-1]
+        Args:
+            ema_values: Список значений EMA(7)
+        Returns:
+            Список значений ускорения (первая производная)
+        """
+        result: List[Optional[float]] = [None]  # Первый бар = None (нет предыдущего)
+
+        for i in range(1, len(ema_values)):
+            if ema_values[i] is not None and ema_values[i - 1] is not None:
+                # Первая производная: текущее значение - предыдущее
+                acceleration = ema_values[i] - ema_values[i - 1]
+                result.append(acceleration)
             else:
                 result.append(None)
+
         return result
 
     @staticmethod

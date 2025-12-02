@@ -3680,6 +3680,99 @@ class AdvancedLabelingTool:
 
         return dataset_df, meta_info
 
+    def _add_hard_hold_labels(self, dataset_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Добавляет 'твердые' HOLD метки за 1-2 бара до экстремумов.
+        Это заставляет модель различать BUY/SELL не только по bb_position,
+        но и по другим признакам (CUSUM, volume, momentum).
+        Args:
+            dataset_df: датасет с метками (уже содержит BUY/SELL/HOLD)
+        Returns:
+            датасет с добавленными "твердыми" HOLD
+        """
+        try:
+            # 1. Находим все BUY/SELL метки
+            extremes = dataset_df[dataset_df['reversal_label'].isin([1, 2])]['ts'].values
+
+            if len(extremes) == 0:
+                self.logger.info("ℹ️  Нет экстремумов для добавления твердых HOLD")
+                return dataset_df
+
+            # 2. Генерируем timestamp для "твердых" HOLD
+            hard_hold_timestamps = []
+            FIVE_M_MS = 300_000  # 5 минут в миллисекундах
+
+            for ext_ts in extremes:
+                # За 1-2 бара до экстремума
+                ts_minus_1 = int(ext_ts) - FIVE_M_MS
+                ts_minus_2 = int(ext_ts) - (2 * FIVE_M_MS)
+                hard_hold_timestamps.append(ts_minus_1)
+                hard_hold_timestamps.append(ts_minus_2)
+
+            # 3. Убираем уже размеченные timestamp
+            already_labeled = set(dataset_df['ts'].values)
+            hard_hold_timestamps = [ts for ts in hard_hold_timestamps if ts not in already_labeled]
+
+            if not hard_hold_timestamps:
+                self.logger.info("ℹ️ Все твердые HOLD уже размечены")
+                return dataset_df
+
+            # 4. Загружаем полные данные для этих timestamp из candles_5m
+            with self.engine.connect() as conn:
+                # Используем IN clause с параметрами
+                placeholders = ','.join([f':ts{i}' for i in range(len(hard_hold_timestamps))])
+                params = {f'ts{i}': int(ts) for i, ts in enumerate(hard_hold_timestamps)}
+                params['symbol'] = self.config.symbol
+
+                query = text(f"""
+                    SELECT * 
+                    FROM candles_5m 
+                    WHERE symbol = :symbol 
+                      AND ts IN ({placeholders})
+                    ORDER BY ts
+                """)
+
+                hard_hold_df = pd.read_sql(query, conn, params=params)
+
+            if hard_hold_df.empty:
+                self.logger.warning("⚠️ Не удалось загрузить данные для твердых HOLD")
+                return dataset_df
+
+            # 5. ✅ ДОБАВЛЯЕМ datetime (ОБЯЗАТЕЛЬНОЕ ПОЛЕ!)
+            if 'datetime' not in hard_hold_df.columns:
+                hard_hold_df['datetime'] = pd.to_datetime(hard_hold_df['ts'], unit='ms')
+
+            # 6. Заполняем служебные поля
+            hard_hold_df['reversal_label'] = 0  # HOLD
+            hard_hold_df['sample_weight'] = 2.
+            0  # ✅ Удвоенный вес
+
+            # Убедимся что все нужные колонки есть
+            required_cols = dataset_df.columns.tolist()
+            for col in required_cols:
+                if col not in hard_hold_df.columns:
+                    # Если колонки нет - заполняем NaN (будут отфильтрованы позже)
+                    hard_hold_df[col] = None
+
+            # Оставляем только нужные колонки в правильном порядке
+            hard_hold_df = hard_hold_df[required_cols]
+
+            # 7.  Объединяем с основным датасетом
+            dataset_df = pd.concat([dataset_df, hard_hold_df], ignore_index=True)
+            dataset_df = dataset_df.drop_duplicates(subset=['ts'], keep='first')
+            dataset_df = dataset_df.sort_values('ts').reset_index(drop=True)
+
+            self.logger.info(f"➕ Добавлено {len(hard_hold_df)} 'твердых' HOLD меток (weight=2.0)")
+            self.logger.info(f"   За 1-2 бара до {len(extremes)} экстремумов")
+
+            return dataset_df
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка добавления твердых HOLD: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return dataset_df
+
     def create_training_snapshot(self, run_id: str | None = None) -> str:
         """
         Формирует БД-снапшот тренировочного датасета:
@@ -3724,7 +3817,7 @@ class AdvancedLabelingTool:
         try:
             # 1) Сборка датасета (ваш существующий конвейер)
             dataset_df, meta_info = self._build_training_snapshot_dataframe()
-
+            dataset_df = self._add_hard_hold_labels(dataset_df)
             # 2) Валидация/очистка
             try:
                 df_clean, issues, nan_drop_rows, duplicates_count = self._validate_snapshot_frame(dataset_df)
