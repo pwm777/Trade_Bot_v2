@@ -15,7 +15,12 @@ from datetime import datetime, UTC
 import warnings
 import logging
 import traceback
-import msvcrt
+
+# msvcrt is Windows-only, make import conditional
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # Not available on Linux/macOS
 
 # === Безопасный импорт ruptures ===
 try:
@@ -154,6 +159,29 @@ class LabelingConfig:
     fee_percent: float = 0.0004
     min_profit_target: float = 0.001
     tool: Any = None
+
+    # === HOLD разметка: пороги волатильности (в % от ATR) ===
+    atr_low_threshold: float = 0.5      # низкая волатильность
+    atr_high_threshold: float = 1.5     # высокая волатильность
+
+    # === HOLD разметка: пороги силы тренда (R² линейной регрессии) ===
+    trend_weak_threshold: float = 0.3    # слабый тренд
+    trend_strong_threshold: float = 0.7  # сильный тренд
+
+    # === HOLD разметка: пороги движения цены ===
+    price_range_threshold: float = 0.003  # 0.3% движение = консолидация
+
+    # === HOLD разметка: плотность меток для консолидаций ===
+    consolidation_hold_every_n_bars: int = 3
+
+    # === HOLD разметка: минимальная прибыль для "слабого" профита ===
+    weak_profit_threshold: float = 0.002  # 0.2%
+
+    # === HOLD разметка: минимальная длина окна для MID ===
+    hold_min_window_bars: int = 6
+    hold_min_mid_end_gap: int = 3
+    hold_mid_margin_left: int = 1
+    hold_mid_margin_right: int = 1
 
     def __post_init__(self):
         if self.db_engine is None:
@@ -2637,51 +2665,313 @@ class AdvancedLabelingTool:
             logger.error(f"❌ Ошибка полной очистки таблицы: {err}")
             print(f"❌ Ошибка: {err}")
 
-    def mark_unprofitable_ranges_as_negatives(self) -> int:
-        """
-        Помечает убыточные BUY/SELL (price_change_after < threshold) и добавляет HOLD-точки в окне [текущий сигнал; следующий сигнал):
-          • Обнуляет price_change_after у «лузеров» до 0.0 (как флаг применения правила)
-          • Вставляет HOLD-END (label=0) на последнем баре ПЕРЕД следующим сигналом
-          • Вставляет HOLD-MID (label=0) в середине окна, если окно достаточно длинное и выдержана минимальная дистанция до конца
-        Возвращает количество обновлённых «лузеров».
-        """
+    # =========================================================================
+    # УЛУЧШЕННЫЕ МЕТОДЫ РАЗМЕТКИ HOLD С АНАЛИЗОМ ВОЛАТИЛЬНОСТИ И ТРЕНДА
+    # =========================================================================
 
-        # ------------------------ Параметры из конфига (с дефолтами) ------------------------
-        thr = float(getattr(self.config, "min_profit_target", 0.001))  # порог убыточности
+    def _calculate_range_metrics(self, range_bars: pd.DataFrame) -> dict:
+        """
+        Анализ волатильности и тренда для диапазона баров.
+
+        Args:
+            range_bars: DataFrame с барами диапазона (должен содержать 'close', опционально 'atr')
+
+        Returns:
+            dict: {
+                'atr_normalized': float,  # ATR нормализованный к цене
+                'price_range': float,     # движение цены в диапазоне
+                'trend_strength': float,  # R² линейной регрессии (0-1)
+                'volatility_level': str,  # 'LOW', 'MEDIUM', 'HIGH'
+                'trend_level': str        # 'WEAK', 'MODERATE', 'STRONG'
+            }
+        """
+        if range_bars.empty or len(range_bars) < 2:
+            return {
+                'atr_normalized': 0.0,
+                'price_range': 0.0,
+                'trend_strength': 0.0,
+                'volatility_level': 'MEDIUM',
+                'trend_level': 'WEAK'
+            }
+
+        close_prices = range_bars['close'].values
+
+        # ATR (если есть в данных, иначе рассчитываем из high-low)
+        atr_normalized = 0.0
+        if 'atr' in range_bars.columns or 'atr_14' in range_bars.columns:
+            atr_col = 'atr' if 'atr' in range_bars.columns else 'atr_14'
+            atr_values = range_bars[atr_col].dropna()
+            if len(atr_values) > 0:
+                atr_mean = float(atr_values.mean())
+                price_mean = float(range_bars['close'].mean())
+                if price_mean > 0:
+                    atr_normalized = atr_mean / price_mean
+        elif 'high' in range_bars.columns and 'low' in range_bars.columns:
+            # Простая оценка волатильности через (high - low) / close
+            hl_range = (range_bars['high'] - range_bars['low']).mean()
+            price_mean = float(range_bars['close'].mean())
+            if price_mean > 0:
+                atr_normalized = float(hl_range) / price_mean
+
+        # Движение цены (от первого до последнего бара)
+        price_start = float(close_prices[0])
+        price_end = float(close_prices[-1])
+        price_range = abs(price_end - price_start) / price_start if price_start > 0 else 0.0
+
+        # Сила тренда через линейную регрессию (R²)
+        trend_strength = 0.0
+        if len(close_prices) >= 3:
+            try:
+                from scipy.stats import linregress
+                x = np.arange(len(close_prices))
+                slope, intercept, r_value, p_value, std_err = linregress(x, close_prices)
+                trend_strength = float(r_value ** 2)  # R² показывает линейность
+            except Exception:
+                # Fallback: простая корреляция
+                x = np.arange(len(close_prices))
+                correlation = np.corrcoef(x, close_prices)[0, 1]
+                if not np.isnan(correlation):
+                    trend_strength = float(correlation ** 2)
+
+        # Классификация волатильности
+        volatility_level = self._classify_volatility(atr_normalized)
+
+        # Классификация тренда
+        trend_level = self._classify_trend(trend_strength)
+
+        return {
+            'atr_normalized': atr_normalized,
+            'price_range': price_range,
+            'trend_strength': trend_strength,
+            'volatility_level': volatility_level,
+            'trend_level': trend_level
+        }
+
+    def _classify_volatility(self, atr_normalized: float) -> str:
+        """
+        Классифицирует уровень волатильности на основе нормализованного ATR.
+
+        Args:
+            atr_normalized: ATR / средняя цена
+
+        Returns:
+            str: 'LOW', 'MEDIUM', 'HIGH'
+        """
+        # Пороги волатильности (процент от цены)
+        low_threshold = getattr(self.config, 'atr_low_threshold', 0.5) / 100  # 0.5% → 0.005
+        high_threshold = getattr(self.config, 'atr_high_threshold', 1.5) / 100  # 1.5% → 0.015
+
+        if atr_normalized < low_threshold:
+            return 'LOW'
+        elif atr_normalized > high_threshold:
+            return 'HIGH'
+        else:
+            return 'MEDIUM'
+
+    def _classify_trend(self, trend_strength: float) -> str:
+        """
+        Классифицирует силу тренда на основе R².
+
+        Args:
+            trend_strength: R² линейной регрессии (0-1)
+
+        Returns:
+            str: 'WEAK', 'MODERATE', 'STRONG'
+        """
+        weak_threshold = getattr(self.config, 'trend_weak_threshold', 0.3)
+        strong_threshold = getattr(self.config, 'trend_strong_threshold', 0.7)
+
+        if trend_strength < weak_threshold:
+            return 'WEAK'
+        elif trend_strength > strong_threshold:
+            return 'STRONG'
+        else:
+            return 'MODERATE'
+
+    def _classify_range(self, metrics: dict, pnl: float) -> Optional[str]:
+        """
+        Определяет тип диапазона для разметки HOLD.
+
+        Args:
+            metrics: словарь с метриками диапазона из _calculate_range_metrics()
+            pnl: PnL диапазона
+
+        Returns:
+            str or None: тип диапазона или None (не размечаем как HOLD)
+                - 'HOLD_AFTER_LOSS': убыточные диапазоны
+                - 'HOLD_CONSOLIDATION': явная консолидация
+                - 'HOLD_WEAK_PROFIT': слабая прибыль без тренда
+                - 'HOLD_CHOPPY': рваный рынок (высокая волатильность, слабый тренд)
+        """
+        cfg = self.config
+        min_profit = getattr(cfg, 'min_profit_target', 0.001)
+        weak_profit = getattr(cfg, 'weak_profit_threshold', 0.002)
+        price_range_thr = getattr(cfg, 'price_range_threshold', 0.003)
+
+        # Убыточный — приоритет 1
+        if pnl < min_profit:
+            return "HOLD_AFTER_LOSS"
+
+        # Консолидация — приоритет 2 (низкая волатильность + слабый тренд + малое движение)
+        if (metrics['volatility_level'] == 'LOW' and
+            metrics['trend_level'] == 'WEAK' and
+            metrics['price_range'] < price_range_thr):
+            return "HOLD_CONSOLIDATION"
+
+        # Слабая прибыль без тренда — приоритет 3
+        if (pnl < weak_profit and
+            metrics['trend_level'] == 'WEAK'):
+            return "HOLD_WEAK_PROFIT"
+
+        # Рваный рынок — приоритет 4 (высокая волатильность без направления)
+        if (metrics['volatility_level'] == 'HIGH' and
+            metrics['trend_level'] == 'WEAK'):
+            return "HOLD_CHOPPY"
+
+        # Прибыльный сильный тренд — НЕ размечаем как HOLD
+        return None
+
+    def _generate_holds_for_range(
+        self,
+        ts_list: List[int],
+        range_type: str,
+        sample_weight: float = 1.0
+    ) -> List[dict]:
+        """
+        Генерирует HOLD-метки в зависимости от типа диапазона.
+
+        Args:
+            ts_list: список timestamps баров в диапазоне
+            range_type: тип диапазона из _classify_range()
+            sample_weight: вес для sample_weight
+
+        Returns:
+            List[dict]: список HOLD-меток для вставки в БД
+        """
+        if not ts_list or not range_type:
+            return []
+
+        holds = []
+        n = len(ts_list)
+        symbol = self.config.symbol
+        tf = self.config.timeframe
+
+        # Конфигурационные параметры
+        min_window_bars = getattr(self.config, 'hold_min_window_bars', 6)
+        min_mid_end_gap = getattr(self.config, 'hold_min_mid_end_gap', 3)
+        consolidation_step = getattr(self.config, 'consolidation_hold_every_n_bars', 3)
+
+        def _make_hold_record(ts: int, method: str, weight: float = 1.0) -> dict:
+            """Создает запись HOLD для вставки."""
+            return {
+                "symbol": symbol,
+                "timestamp": ts,
+                "timeframe": tf,
+                "reversal_label": 0,  # HOLD
+                "reversal_confidence": 1.0,
+                "labeling_method": method,
+                "labeling_params": None,
+                "extreme_index": None,
+                "extreme_price": None,
+                "extreme_timestamp": ts,
+                "confirmation_index": None,
+                "confirmation_timestamp": None,
+                "price_change_after": 0.0,
+                "features_json": None,
+                "is_high_quality": 1,
+            }
+
+        if range_type == "HOLD_CONSOLIDATION":
+            # Плотная разметка консолидаций — каждые N баров
+            for i in range(1, n - 1, consolidation_step):
+                holds.append(_make_hold_record(ts_list[i], "HOLD_CONSOLIDATION", weight=1.5))
+
+        elif range_type == "HOLD_AFTER_LOSS":
+            # Текущая логика: MID + END
+            # HOLD-END — последний бар перед следующим сигналом
+            if n >= 1:
+                holds.append(_make_hold_record(ts_list[-1], "HOLD_AFTER_LOSS_END"))
+
+            # HOLD-MID — середина окна (если достаточно баров)
+            if n >= min_window_bars:
+                mid_idx = n // 2
+                gap = (n - 1) - mid_idx
+                if gap >= min_mid_end_gap and mid_idx < n - 1:
+                    holds.append(_make_hold_record(ts_list[mid_idx], "HOLD_AFTER_LOSS_MID"))
+
+        elif range_type == "HOLD_WEAK_PROFIT":
+            # MID + END для слабой прибыли
+            if n >= min_window_bars:
+                mid_idx = n // 2
+                holds.append(_make_hold_record(ts_list[mid_idx], "HOLD_WEAK_PROFIT_MID"))
+            if n >= 1:
+                holds.append(_make_hold_record(ts_list[-1], "HOLD_WEAK_PROFIT_END"))
+
+        elif range_type == "HOLD_CHOPPY":
+            # Только END для рваного рынка
+            if n >= 1:
+                holds.append(_make_hold_record(ts_list[-1], "HOLD_CHOPPY"))
+
+        return holds
+
+    def mark_unprofitable_ranges_as_negatives(self) -> dict:
+        """
+        Улучшенная разметка HOLD с анализом волатильности и тренда.
+
+        Анализирует ВСЕ диапазоны между сигналами (не только убыточные):
+        - Убыточные (pnl < min_profit_target) → HOLD обязательно
+        - Прибыльные но слабые → HOLD с учетом условий
+        - Консолидации (низкая волатильность + слабый тренд) → HOLD плотно
+        - Периоды после сильных движений → HOLD (ожидание новой возможности)
+
+        Returns:
+            dict: {
+                'updated_losers': int,
+                'hold_after_loss': int,
+                'hold_consolidation': int,
+                'hold_weak_profit': int,
+                'hold_choppy': int,
+                'total_holds': int
+            }
+        """
         symbol = self.config.symbol
         tf = self.config.timeframe
         candles_table = f"candles_{tf}"
+        thr = float(getattr(self.config, "min_profit_target", 0.001))
 
-        # минимальная длина окна (в барах) для постановки второго HOLD (MID)
-        min_window_bars = int(getattr(self.config, "hold_min_window_bars", 6))
-        # минимальная дистанция (в барах) между HOLD-MID и HOLD-END
-        min_mid_end_gap = int(getattr(self.config, "hold_min_mid_end_gap", 3))
-        # смещения от краёв окна, в которых MID не ставим (чтобы не прилипал к краям)
-        margin_left = int(getattr(self.config, "hold_mid_margin_left", 1))
-        margin_right = int(getattr(self.config, "hold_mid_margin_right", 1))
+        logger.info(f"🔧 Улучшенная HOLD-разметка с анализом волатильности и тренда | {symbol} {tf}")
 
-        logger.info(f"🔧 Поиск убыточных меток: pnl < {thr} | {symbol} {tf} | MID+END HOLD")
+        # Статистика
+        stats = {
+            'updated_losers': 0,
+            'hold_after_loss': 0,
+            'hold_consolidation': 0,
+            'hold_weak_profit': 0,
+            'hold_choppy': 0,
+            'total_holds': 0,
+            'ranges_analyzed': 0,
+            'ranges_skipped': 0
+        }
 
-        updated_count = 0
         inserted_rows = []
 
         with self.engine.begin() as conn:
-            # 1) Убыточные BUY/SELL для текущего символа/TF
-            losers = pd.read_sql(
+            # 1) Загружаем ВСЕ BUY/SELL метки (отсортированные по времени)
+            all_signals = pd.read_sql(
                 text("""
                     SELECT reversal_label, extreme_timestamp, price_change_after
                       FROM labeling_results
                      WHERE symbol=:symbol AND timeframe=:tf
-                       AND reversal_label IN (1,2)      -- BUY/SELL
-                       AND price_change_after < :thr
+                       AND reversal_label IN (1,2)
+                     ORDER BY extreme_timestamp
                 """),
                 conn,
-                params={"symbol": symbol, "tf": tf, "thr": thr},
+                params={"symbol": symbol, "tf": tf},
             )
 
-            if losers.empty:
-                logger.info(f"ℹ️ Нет убыточных меток (pnl<{thr})")
-                return 0
+            if all_signals.empty or len(all_signals) < 2:
+                logger.info(f"ℹ️ Недостаточно сигналов для анализа диапазонов")
+                return stats
 
             # 2) Существующие HOLD (для идемпотентности)
             existing_holds = set()
@@ -2699,43 +2989,33 @@ class AdvancedLabelingTool:
 
             new_holds_in_batch = set()
 
-            # 3) Обработка каждого «лузера»
-            for _, row in losers.iterrows():
-                ts_cur = int(row.extreme_timestamp)
+            # 3) Обрабатываем каждую пару последовательных сигналов
+            for i in range(len(all_signals) - 1):
+                current_sig = all_signals.iloc[i]
+                next_sig = all_signals.iloc[i + 1]
 
-                # 3.1) Обнуляем PnL у самого лузера (как флаг, что правило применено)
-                conn.execute(
-                    text("""
-                        UPDATE labeling_results
-                           SET price_change_after = 0.0
-                         WHERE symbol=:symbol AND timeframe=:tf
-                           AND extreme_timestamp=:ts
-                    """),
-                    {"symbol": symbol, "tf": tf, "ts": ts_cur},
-                )
-                updated_count += 1
+                ts_cur = int(current_sig.extreme_timestamp)
+                ts_next = int(next_sig.extreme_timestamp)
+                pnl = float(current_sig.price_change_after) if pd.notna(current_sig.price_change_after) else 0.0
 
-                # 3.2) Следующий сигнал (граница окна)
-                next_sig = conn.execute(
-                    text("""
-                        SELECT MIN(extreme_timestamp)
-                          FROM labeling_results
-                         WHERE symbol=:symbol AND timeframe=:tf
-                           AND extreme_timestamp > :ts
-                    """),
-                    {"symbol": symbol, "tf": tf, "ts": ts_cur},
-                ).fetchone()
+                # 3.1) Обновляем убыточные сигналы (pnl < threshold)
+                if pnl < thr:
+                    conn.execute(
+                        text("""
+                            UPDATE labeling_results
+                               SET price_change_after = 0.0
+                             WHERE symbol=:symbol AND timeframe=:tf
+                               AND extreme_timestamp=:ts
+                        """),
+                        {"symbol": symbol, "tf": tf, "ts": ts_cur},
+                    )
+                    stats['updated_losers'] += 1
 
-                if not next_sig or not next_sig[0]:
-                    # Хвост истории — без следующего сигнала не ставим HOLD (чтобы не смотреть в будущее)
-                    continue
-
-                ts_next = int(next_sig[0])
-
-                # 3.3) Список баров между текущим и следующим сигналом (исключая крайние)
-                bars = conn.execute(
+                # 3.2) Загружаем бары диапазона для анализа
+                range_bars_result = conn.execute(
                     text(f"""
-                        SELECT ts
+                        SELECT ts, open, high, low, close, volume,
+                               COALESCE(atr_14, NULL) as atr
                           FROM {candles_table}
                          WHERE symbol=:symbol
                            AND ts > :ts_cur
@@ -2745,57 +3025,49 @@ class AdvancedLabelingTool:
                     {"symbol": symbol, "ts_cur": ts_cur, "ts_next": ts_next},
                 ).fetchall()
 
-                if not bars:
-                    # Между сигналами нет ни одной свечи — ставить HOLD бессмысленно
+                if not range_bars_result:
+                    stats['ranges_skipped'] += 1
                     continue
 
-                ts_list = [int(b[0]) for b in bars]
-                n = len(ts_list)
+                # Конвертируем в DataFrame
+                range_bars = pd.DataFrame(
+                    range_bars_result,
+                    columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'atr']
+                )
 
-                # ------------------------ HOLD-END (всегда, если есть место) ------------------------
-                ts_end = ts_list[-1]  # последний бар ПЕРЕД следующим сигналом
+                stats['ranges_analyzed'] += 1
 
-                def _try_queue_hold(ts_hold: int, method_tag: str):
-                    """Локальный помощник: добавить HOLD, если его ещё нет."""
-                    if ts_hold in existing_holds or ts_hold in new_holds_in_batch:
-                        return False
+                # 3.3) Рассчитываем метрики диапазона
+                metrics = self._calculate_range_metrics(range_bars)
 
-                    # ✓ ИСПРАВЛЕНО: Добавлены все обязательные поля из схемы таблицы
-                    inserted_rows.append({
-                        "symbol": symbol,
-                        "timestamp": ts_hold,  # ✓ Обязательное поле
-                        "timeframe": tf,  # ✓ Обязательное поле
-                        "reversal_label": 0,  # HOLD
-                        "reversal_confidence": 1.0,
-                        "labeling_method": method_tag,  # 'HOLD_AFTER_LOSS_END' или 'HOLD_AFTER_LOSS_MID'
-                        "labeling_params": None,  # ✓ Добавлено
-                        "extreme_index": None,  # ✓ Добавлено
-                        "extreme_price": None,  # ✓ Добавлено
-                        "extreme_timestamp": ts_hold,
-                        "confirmation_index": None,  # ✓ Добавлено
-                        "confirmation_timestamp": None,  # ✓ Добавлено
-                        "price_change_after": 0.0,
-                        "features_json": None,  # ✓ Добавлено
-                        "is_high_quality": 1,  # ✓ Добавлено
-                    })
-                    new_holds_in_batch.add(ts_hold)
-                    return True
-                _try_queue_hold(ts_end, "HOLD_AFTER_LOSS_END")
+                # 3.4) Классифицируем диапазон
+                range_type = self._classify_range(metrics, pnl)
 
-                # ------------------------ HOLD-MID (по условиям) ------------------------
-                # Требуем минимальную длину окна, отступы от краёв и минимальную дистанцию до END
-                if n >= min_window_bars:
-                    # Геометрический центр окна с отступами
-                    left = margin_left
-                    right = n - 1 - margin_right
-                    if left <= right:
-                        mid_idx = (left + right) // 2  # середина с учётом margins
-                        ts_mid = ts_list[mid_idx]
+                if range_type is None:
+                    # Прибыльный тренд — не размечаем
+                    continue
 
-                        # Дистанция MID → END в барах
-                        gap = (n - 1) - mid_idx
-                        if gap >= min_mid_end_gap and ts_mid != ts_end:
-                            _try_queue_hold(ts_mid, "HOLD_AFTER_LOSS_MID")
+                # 3.5) Генерируем HOLD-метки
+                ts_list = range_bars['ts'].astype(int).tolist()
+                holds = self._generate_holds_for_range(ts_list, range_type)
+
+                # 3.6) Фильтруем дубликаты и добавляем в batch
+                for hold in holds:
+                    ts_hold = hold['extreme_timestamp']
+                    if ts_hold not in existing_holds and ts_hold not in new_holds_in_batch:
+                        inserted_rows.append(hold)
+                        new_holds_in_batch.add(ts_hold)
+
+                        # Обновляем статистику по типам
+                        method = hold['labeling_method']
+                        if 'LOSS' in method:
+                            stats['hold_after_loss'] += 1
+                        elif 'CONSOLIDATION' in method:
+                            stats['hold_consolidation'] += 1
+                        elif 'WEAK_PROFIT' in method:
+                            stats['hold_weak_profit'] += 1
+                        elif 'CHOPPY' in method:
+                            stats['hold_choppy'] += 1
 
             # 4) Пакетная вставка HOLD
             if inserted_rows:
@@ -2803,11 +3075,22 @@ class AdvancedLabelingTool:
                     "labeling_results", conn, if_exists="append", index=False
                 )
 
+        stats['total_holds'] = len(inserted_rows)
+
+        # Логируем результаты
         logger.info(
-            f"✅ Обновлено лузеров: {updated_count} | добавлено HOLD: {len(inserted_rows)} "
-            f"(END всегда при наличии окна; MID — при n>={min_window_bars} и gap>={min_mid_end_gap})"
+            "✅ HOLD разметка завершена:\n"
+            f"   • Диапазонов проанализировано: {stats['ranges_analyzed']}\n"
+            f"   • Диапазонов пропущено (нет баров): {stats['ranges_skipped']}\n"
+            f"   • Убыточные диапазоны: {stats['hold_after_loss']} HOLD\n"
+            f"   • Консолидации: {stats['hold_consolidation']} HOLD (плотная разметка)\n"
+            f"   • Слабая прибыль: {stats['hold_weak_profit']} HOLD\n"
+            f"   • Рваный рынок: {stats['hold_choppy']} HOLD\n"
+            f"   • ИТОГО: {stats['total_holds']} HOLD меток\n"
+            f"   • Обновлено убыточных сигналов: {stats['updated_losers']}"
         )
-        return updated_count
+
+        return stats
 
     def _calculate_unprofitable_hold_ranges(self, df: pd.DataFrame, signals: List[Dict]) -> List[Dict]:
         """
@@ -3083,8 +3366,13 @@ class AdvancedLabelingTool:
                     print(f"❌ Ошибка: {err}")
             elif choice == '20':
                     try:
-                        count = self.mark_unprofitable_ranges_as_negatives()
-                        print(f"✅ Проставлены HOLD-метки: {count}")
+                        stats = self.mark_unprofitable_ranges_as_negatives()
+                        print(f"✅ HOLD разметка завершена:")
+                        print(f"   • Убыточные диапазоны: {stats.get('hold_after_loss', 0)} HOLD")
+                        print(f"   • Консолидации: {stats.get('hold_consolidation', 0)} HOLD")
+                        print(f"   • Слабая прибыль: {stats.get('hold_weak_profit', 0)} HOLD")
+                        print(f"   • Рваный рынок: {stats.get('hold_choppy', 0)} HOLD")
+                        print(f"   • ИТОГО: {stats.get('total_holds', 0)} HOLD меток")
                     except Exception as err:
                         print(f"❌ Ошибка: {err}")
             elif choice == '21':
