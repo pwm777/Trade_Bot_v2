@@ -829,10 +829,11 @@ class PositionManager:
                                     if hasattr(self, 'trade_log') and self.trade_log:
                                         stop_position_id = self._position_ids.get(symbol)
                                         if stop_position_id:
-                                            self.trade_log.create_order_from_req(stop_order,
-                                                                                 position_id=stop_position_id)
-                                            self.logger.debug(
-                                                f"Initial stop order saved to DB: position_id={stop_position_id}")
+                                            success = self.trade_log.create_order_from_req(stop_order,
+                                                                                           position_id=stop_position_id)
+                                            if success:
+                                                self.logger.info(
+                                                    f"✅ Initial stop saved to DB: position_id={stop_position_id}")
 
                                     # Отправляем на биржу
                                     result = self.exchange_manager.place_order(stop_order)
@@ -1088,7 +1089,7 @@ class PositionManager:
                     if symbol in self._position_ids:
                         del self._position_ids[symbol]
 
-                    # ✅ ИСПРАВЛЕНИЕ: Проверяем async/sync
+                    # Проверяем async/sync
                     cancel_method = self._cancel_stops_for_symbol
                     if asyncio.iscoroutinefunction(cancel_method):
                         asyncio.create_task(cancel_method(symbol))
