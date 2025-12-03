@@ -61,7 +61,7 @@ class MLGlobalDetector(Detector):
         self.feature_names: List[str] = self._generate_windowed_feature_names()
 
         # Порог и warmup — будут заменены при загрузке модельного пакета
-        self.min_confidence = 0.53
+        self.min_confidence = 0.8
         self.scaler = None
         self.required_warmup = 20  # общий тёплый старт (может быть больше, чем lookback)
 

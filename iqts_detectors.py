@@ -265,8 +265,8 @@ class RoleBasedOnlineTrendDetector(Detector):
         3. Инициализируем пороги на основе role
 
         Args:
-            timeframe: таймфрейм анализа (1m, 5m, 10s и т.д.)
-            role: роль детектора (trend, entry, exit)
+            timeframe: таймфрейм анализа (1m, 5m и т.д.)
+            role: роль детектора (trend, entry)
             name: имя детектора для логирования
         """
         # ✅ ИСПРАВЛЕНИЕ: Передаем name родительскому классу Detector

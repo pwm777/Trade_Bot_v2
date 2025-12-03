@@ -394,31 +394,31 @@ def get_default_config():
                 },
 
                 # ✅ ДОБАВИТЬ ПОРОГИ CONFIDENCE:
-                'min_global_confidence': 0.70,  # ← ВАЖНО!  Фильтр слабых 5m
-                'min_trend_confidence': 0.35,  # ← Для слабых 1m (уже есть в коде)
-                'min_combined_confidence': 0.50  # ← НОВОЕ!  Минимум для входа
+                'min_global_confidence': 0.75,  # ← ВАЖНО!  Фильтр слабых 5m
+                'min_trend_confidence': 0.40,  # ← Для слабых 1m (уже есть в коде)
+                'min_combined_confidence': 0.60  # ← НОВОЕ!  Минимум для входа
             },
 
             'risk_management': {
-                'max_position_risk': 0.02,
+                'max_position_risk': 0.01,
                 'max_daily_loss': 0.05,
                 'atr_periods': 14,
 
                 # ✅ УВЕЛИЧИТЬ SL/TP:
-                'stop_atr_multiplier': 2.0,  # SL ~0.20% (было 1.1)
-                'tp_atr_multiplier': 4.0,  # TP ~0.40% (было 1.5)
+                'stop_atr_multiplier': 1.8,  # SL ~0.20% (было 1.1)
+                'tp_atr_multiplier': 2.5,  # TP ~0.40% (было 1.5)
 
                 # ✅ ДОБАВИТЬ МИНИМАЛЬНЫЕ ПОРОГИ:
                 'min_stop_loss_percent': 0.0020,  # Минимум 0.20%
-                'min_take_profit_percent': 0.0040  # Минимум 0. 40%
+                'min_take_profit_percent': 0.0025  # Минимум 0. 40%
             },
 
             # ✅ Exit Management (хорошие настройки):
             'exit_management': {
-                'trailing_stop_activation': 0.015,  # 1.5%
-                'trailing_stop_distance': 0.01,  # 1. 0%
-                'breakeven_activation': 0.008,  # 0.8%
-                'max_hold_time_hours': 6,  # 6 часов
+                'trailing_stop_activation': 0.005,  # 1.5%
+                'trailing_stop_distance': 0.004,  # 1. 0%
+                'breakeven_activation': 0.004,  # 0.8%
+                'max_hold_time_hours': 4,  # 4 часов
                 'min_bars_before_signal_exit': 10,  # 10 баров (50 мин)
                 'min_profit_for_early_exit': 0.008  # 0.8%
             }

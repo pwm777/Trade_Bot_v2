@@ -702,62 +702,65 @@ class EnhancedRiskManager:
             atr: float,
             regime_ctx: Dict[str, Any]
     ) -> Tuple[float, float]:
-        """
-        Расчёт адаптивных стоп-лосса и тейк-профита с учётом режима рынка.
+        """Расчёт адаптивных стоп-лосса и тейк-профита"""
 
-        **КРИТИЧНОЕ ИСПРАВЛЕНИЕ**: Теперь использует Direction enum вместо строковых сравнений.
-
-        **BACKWARD COMPATIBILITY**: Сохранён для совместимости, но требует Direction enum.
-        **РЕКОМЕНДАЦИЯ**: Используйте calculate_risk_context() вместо этого метода.
-
-        Args:
-            entry_price: Цена входа
-            direction: Direction enum (BUY, SELL, FLAT)
-            atr: Average True Range
-            regime_ctx: Контекст режима рынка с полем 'volatility_regime'
-
-        Returns:
-            (stop_loss, take_profit)
-
-        Raises:
-            TypeError: Если direction не Direction enum
-        """
         # Валидация входных данных
         if entry_price <= 0 or atr <= 0:
             self.logger.warning(f"⚠️ Invalid inputs: entry_price={entry_price}, atr={atr}")
-            return entry_price, entry_price  # Защита
+            return entry_price, entry_price
 
         # Проверка типа direction
         if not isinstance(direction, Direction):
-            # Попытка конвертации для обратной совместимости
             self.logger.warning(
-                f"⚠️ direction должен быть Direction enum, получен {type(direction)}. "
-                f"Попытка автоматической конвертации..."
+                f"⚠️ direction должен быть Direction enum, получен {type(direction)}"
             )
             direction = normalize_direction(direction)
 
         # Адаптация к волатильности
         volatility_regime = regime_ctx.get("volatility_regime", 1.0)
-        vola_factor = 1.0 / max(volatility_regime, 0.1)  # Избегаем деления на 0
+        vola_factor = 1.0 / max(volatility_regime, 0.1)
         adjustment = np.clip(vola_factor, 0.5, 2.0)
 
         adjusted_sl_mult = self.limits.stop_loss_atr_multiplier * adjustment
         adjusted_tp_mult = self.limits.take_profit_atr_multiplier * adjustment
 
-        # ✅ ИСПРАВЛЕНО: Правильное использование Direction enum
+        # Расчёт базовых расстояний от ATR
+        stop_distance = atr * adjusted_sl_mult
+        tp_distance = atr * adjusted_tp_mult
+
+        # ✅ ДОБАВИТЬ: Применение минимальных порогов
+        min_sl_distance = entry_price * self.limits.min_stop_loss_percent
+        min_tp_distance = entry_price * self.limits.min_take_profit_percent
+
+        # Берём максимум (защита от слишком узких стопов)
+        stop_distance = max(stop_distance, min_sl_distance)
+        tp_distance = max(tp_distance, min_tp_distance)
+
+        # Рассчитываем уровни
         if direction == Direction.BUY:
-            stop_loss = entry_price - atr * adjusted_sl_mult
-            take_profit = entry_price + atr * adjusted_tp_mult
+            stop_loss = entry_price - stop_distance
+            take_profit = entry_price + tp_distance
         elif direction == Direction.SELL:
-            stop_loss = entry_price + atr * adjusted_sl_mult
-            take_profit = entry_price - atr * adjusted_tp_mult
+            stop_loss = entry_price + stop_distance
+            take_profit = entry_price - tp_distance
         else:  # FLAT
-            self.logger.warning("⚠️ Direction.FLAT: returning entry_price for both SL and TP")
+            self.logger.warning("⚠️ Direction. FLAT: returning entry_price")
             return entry_price, entry_price
 
         # Защита от некорректных значений
         stop_loss = max(0.0, stop_loss)
         take_profit = max(0.0, take_profit)
+
+        # ✅ ДОБАВИТЬ: Логирование для отладки
+        self.logger.info(
+            f"📊 SL/TP calculated:\n"
+            f"  Entry: {entry_price:.2f}\n"
+            f"  ATR: {atr:.2f}\n"
+            f"  SL: {stop_loss:.2f} (-{stop_distance / entry_price * 100:.2f}%)\n"
+            f"  TP: {take_profit:.2f} (+{tp_distance / entry_price * 100:.2f}%)\n"
+            f"  SL distance: {stop_distance:.2f} (ATR: {adjusted_sl_mult:.2f}x, min: {min_sl_distance:.2f})\n"
+            f"  TP distance: {tp_distance:.2f} (ATR: {adjusted_tp_mult:.2f}x, min: {min_tp_distance:.2f})"
+        )
 
         return float(stop_loss), float(take_profit)
 

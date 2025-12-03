@@ -117,7 +117,7 @@ _REASON_CODE_DEFINITIONS = {
     "hierarchical_confirmed": {"category": "success", "aliases": []},
     "trend_confirmed": {"category": "success", "aliases": ["TREND"]},
     "entry_confirmed": {"category": "success", "aliases": ["ENTRY"]},
-    "three_level_confirmed": {"category": "success", "aliases": []},
+    "two_level_confirmed": {"category": "success", "aliases": []},
 
     # Отклонения по слабым сигналам
     "no_trend_signal": {"category": "weak_signal", "aliases": []},
@@ -162,7 +162,7 @@ ReasonCode = Literal[
     "hierarchical_confirmed",
     "trend_confirmed",
     "entry_confirmed",
-    "three_level_confirmed",
+    "two_level_confirmed",
     "no_trend_signal",
     "weak_trend_signal",
     "low_confidence",
@@ -1348,13 +1348,10 @@ def direction_to_side(direction: Union[int, Direction]) -> DirectionStr:
 def direction_to_int(direction: Union[Direction, DirectionStr, str]) -> DirectionLiteral:
     """
     Конвертация Direction/str → числовое значение.
-
     Args:
         direction: Direction enum или строка ("BUY", "SELL", "FLAT")
-
     Returns:
         Числовое значение (1, -1, 0)
-
     Examples:
         >>> direction_to_int(Direction.BUY)
         1
