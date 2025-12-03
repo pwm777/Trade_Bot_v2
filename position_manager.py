@@ -737,7 +737,6 @@ class PositionManager:
         Создаёт новую позицию и сохраняет её в БД.
         """
         try:
-            from typing import cast, Literal
 
             filled_qty = fill["filled_qty"]
             avg_price_raw = fill.get("avg_price")
@@ -794,9 +793,24 @@ class PositionManager:
             # ════════════════════════════════════════════════════════════
 
             client_order_id = fill.get('client_order_id')
+            # ✅ ДИАГНОСТИКА #1
+            self.logger.warning(
+                f"🔍 _process_entry_fill DIAGNOSTIC:\n"
+                f"  symbol: {symbol}\n"
+                f"  client_order_id: {client_order_id}\n"
+                f"  in _pending_orders: {client_order_id in self._pending_orders if client_order_id else False}"
+            )
 
             if client_order_id and client_order_id in self._pending_orders:
                 pending_order = self._pending_orders[client_order_id]
+                # ✅ ДИАГНОСТИКА #2
+                self.logger.warning(
+                    f"🔍 ENTRY FILL METADATA CHECK:\n"
+                    f"  has metadata: {pending_order.metadata is not None}\n"
+                    f"  metadata keys: {list(pending_order.metadata.keys()) if pending_order.metadata else []}\n"
+                    f"  stops_precomputed: {pending_order.metadata.get('stops_precomputed') if pending_order.metadata else 'N/A'}\n"
+                    f"  has risk_context: {'risk_context' in (pending_order.metadata or {})}"
+                )
 
                 if pending_order.metadata:
                     stops_precomputed = pending_order.metadata.get('stops_precomputed', False)
