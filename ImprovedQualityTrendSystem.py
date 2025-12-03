@@ -133,20 +133,49 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
     def _initialize_risk_manager(self, risk_config: Dict):
         """
         Инициализация риск-менеджера с новым API (v2.0).
+
         Args:
             risk_config: Конфигурация риска из config.py
+
         Returns:
             EnhancedRiskManager с настроенными лимитами
         """
-        # создаём RiskLimits объект
+        # ✅ ДИАГНОСТИКА: Что пришло из конфига
+        self.logger.info(
+            f"🔧 Initializing Risk Manager from config:\n"
+            f"  stop_atr_multiplier: {risk_config.get('stop_atr_multiplier', 'NOT SET')}\n"
+            f"  tp_atr_multiplier: {risk_config.get('tp_atr_multiplier', 'NOT SET')}\n"
+            f"  min_stop_loss_percent: {risk_config.get('min_stop_loss_percent', 'NOT SET')}\n"
+            f"  min_take_profit_percent: {risk_config.get('min_take_profit_percent', 'NOT SET')}"
+        )
+
+        # ✅ Создаём RiskLimits объект со ВСЕМИ параметрами
         limits = RiskLimits(
             max_portfolio_risk=risk_config.get('max_position_risk', 0.02),
             max_daily_loss=risk_config.get('max_daily_loss', 0.05),
-            max_position_value_pct=0.30,  # Default из RiskLimits
+            max_position_value_pct=risk_config.get('max_position_value_pct', 0.30),
+
+            # SL/TP мультипликаторы
             stop_loss_atr_multiplier=risk_config.get('stop_atr_multiplier', 2.0),
-            take_profit_atr_multiplier=risk_config.get('tp_atr_multiplier', 3.0),
-            atr_periods=risk_config.get('atr_periods', 14)
+            take_profit_atr_multiplier=risk_config.get('tp_atr_multiplier', 4.0),  # ✅ 4.0, не 3.0!
+            atr_periods=risk_config.get('atr_periods', 14),
+
+            # ✅ ДОБАВИТЬ МИНИМАЛЬНЫЕ ПОРОГИ:
+            min_stop_loss_percent=risk_config.get('min_stop_loss_percent', 0.0020),
+            min_take_profit_percent=risk_config.get('min_take_profit_percent', 0.0040)
         )
+
+        # ✅ ДИАГНОСТИКА: Что получилось в RiskLimits
+        self.logger.info(
+            f"📊 Risk Manager initialized:\n"
+            f"  SL ATR multiplier: {limits.stop_loss_atr_multiplier}\n"
+            f"  TP ATR multiplier: {limits.take_profit_atr_multiplier}\n"
+            f"  Min SL: {limits.min_stop_loss_percent * 100:.2f}%\n"
+            f"  Min TP: {limits.min_take_profit_percent * 100:.2f}%\n"
+            f"  Max portfolio risk: {limits.max_portfolio_risk * 100:.1f}%\n"
+            f"  Max daily loss: {limits.max_daily_loss * 100:.1f}%"
+        )
+
         return EnhancedRiskManager(limits=limits)
 
     def _initialize_performance_tracker(self) -> Dict:

@@ -122,6 +122,7 @@ _REASON_CODE_DEFINITIONS = {
     # Отклонения по слабым сигналам
     "no_trend_signal": {"category": "weak_signal", "aliases": []},
     "weak_trend_signal": {"category": "weak_signal", "aliases": []},
+    "low_confidence": {"category": "weak_signal", "aliases": []},
     "no_entry_signal": {"category": "weak_signal", "aliases": []},
     "weak_entry_signal": {"category": "weak_signal", "aliases": []},
 
@@ -164,6 +165,7 @@ ReasonCode = Literal[
     "three_level_confirmed",
     "no_trend_signal",
     "weak_trend_signal",
+    "low_confidence",
     "no_entry_signal",
     "weak_entry_signal",
     "direction_disagreement",

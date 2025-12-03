@@ -312,7 +312,7 @@ class ThreeLevelHierarchicalConfirmator(Detector):
         if trend_dir != 0 and trend_conf < self.min_trend_confidence:
             self.logger.info(
                 f"⚠️ Weak trend signal: dir={trend_dir}, conf={trend_conf:.2f} "
-                f"< threshold={self.min_trend_confidence:. 2f}. "
+                f"< threshold={self.min_trend_confidence:.2f}. "
                 f"Passing to consistency check (not converting to FLAT)."
             )
 
