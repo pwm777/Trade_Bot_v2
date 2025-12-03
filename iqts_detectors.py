@@ -275,7 +275,9 @@ class RoleBasedOnlineTrendDetector(Detector):
         self.timeframe: Timeframe = timeframe
         self.role: str = role
         self.signal_count: int = 0
-
+        #  Настройка логгера
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = True
         # Пороги в зависимости от role
         role_thresholds = {
             "trend": 0.55,  # Тренд-детектор: пороги средние
@@ -288,7 +290,7 @@ class RoleBasedOnlineTrendDetector(Detector):
         self.required_warmup = 1
 
         self.logger.info(
-            f"Initialized {role}_{timeframe} detector:\n"
+            f"  Initialized {role}_{timeframe} detector:\n"
             f"  Role: {role}\n"
             f"  Timeframe: {timeframe}\n"
             f"  Min confidence threshold: {self.min_confidence}\n"
@@ -301,21 +303,15 @@ class RoleBasedOnlineTrendDetector(Detector):
     async def analyze(self, data: Dict[Timeframe, pd.DataFrame]) -> DetectorSignal:
         """
         Анализирует готовые CUSUM данные из БД и формирует сигнал.
-        CUSUM уже рассчитан при агрегации свечей.
 
-        ✅ ИСПРАВЛЕНИЯ v3:
-        1. Инициализация всех переменных в начале
-        2. Валидация cusum_state как INTEGER перед использованием
-        3. Проверка NaN ПЕРЕД преобразованием типов
-        4. Единая точка нормализации confidence
-        5. Устранены дубликаты кода
-        6. Улучшено логирование ошибок
-        7. ✅ НОВОЕ: Валидация консистентности ok + reason
+        ✅ ИСПРАВЛЕНО v4:
+        - Возвращает ok=True даже для слабых сигналов (пусть confirmator решает)
+        - Не блокирует по порогу confidence внутри детектора
         """
         self.logger.debug(f"[{self.role}] Analyzing {self.timeframe}")
 
         # ═══════════════════════════════════════════════════════════
-        # 1. ВАЛИДАЦИЯ ДАННЫХ
+        # 1.  ВАЛИДАЦИЯ ДАННЫХ
         # ═══════════════════════════════════════════════════════════
         if self.timeframe not in data:
             return normalize_signal({
@@ -346,9 +342,9 @@ class RoleBasedOnlineTrendDetector(Detector):
                 "metadata": {"required": self.required_warmup, "actual": len(df)}
             })
 
-        # ═════════════════════════════════════════════════════════════
-        # 2. ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ (для избежания UnboundLocalError)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════
+        # 2. ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ
+        # ═══════════════════════════════════════════════════════════
         cusum_state_raw = None
         cusum_conf_raw = None
         cusum_zscore_raw = None
@@ -357,15 +353,13 @@ class RoleBasedOnlineTrendDetector(Detector):
         # 3. ЧТЕНИЕ ГОТОВЫХ CUSUM ДАННЫХ ИЗ БД
         # ═══════════════════════════════════════════════════════════
         try:
-            # Проверка наличия необходимых колонок
             required_cols = ['cusum_state', 'cusum_conf', 'cusum_reason',
                              'cusum_zscore', 'cusum_pos', 'cusum_neg']
             missing_cols = [col for col in required_cols if col not in df.columns]
 
             if missing_cols:
                 self.logger.error(
-                    f"[{self.role}] Missing CUSUM columns: {missing_cols}. "
-                    f"Available columns: {list(df.columns)[:20]}"
+                    f"[{self.role}] Missing CUSUM columns: {missing_cols}"
                 )
                 return normalize_signal({
                     "ok": False,
@@ -375,9 +369,8 @@ class RoleBasedOnlineTrendDetector(Detector):
                     "metadata": {"missing_columns": missing_cols}
                 })
 
-            # ✅ БЕЗОПАСНОЕ извлечение скалярных значений
+            # ✅ ШАГ 1: Извлекаем raw значения
             try:
-                # ✅ ШАГ 1: Извлекаем raw значения
                 cusum_state_raw = df['cusum_state'].iloc[-1]
                 cusum_conf_raw = df['cusum_conf'].iloc[-1]
                 cusum_zscore_raw = df['cusum_zscore'].iloc[-1]
@@ -385,52 +378,38 @@ class RoleBasedOnlineTrendDetector(Detector):
                 cusum_neg_raw = df['cusum_neg'].iloc[-1]
                 cusum_reason_raw = df['cusum_reason'].iloc[-1]
 
-                # ✅ ШАГ 2: Проверяем NaN ПЕРЕД преобразованием типов
+                # ✅ ШАГ 2: Проверяем NaN
                 if pd.isna(cusum_state_raw) or pd.isna(cusum_conf_raw):
                     self.logger.warning(
-                        f"[{self.role}] NaN in CUSUM data: "
-                        f"state={cusum_state_raw}, conf={cusum_conf_raw}"
+                        f"[{self.role}] NaN in CUSUM data"
                     )
                     return normalize_signal({
                         "ok": False,
                         "direction": 0,
                         "confidence": 0.0,
                         "reason": "invalid_cusum_data",
-                        "metadata": {
-                            "cusum_state": "NaN" if pd.isna(cusum_state_raw) else str(cusum_state_raw),
-                            "cusum_conf": "NaN" if pd.isna(cusum_conf_raw) else str(cusum_conf_raw),
-                            "reason": "null_values"
-                        }
+                        "metadata": {"reason": "null_values"}
                     })
 
-                # ✅ ШАГ 3: Преобразуем типы с валидацией
+                # ✅ ШАГ 3: Преобразуем типы
                 try:
-                    # cusum_state должен быть INTEGER: 1 (BUY), -1 (SELL), 0 (FLAT)
                     cusum_state = int(cusum_state_raw)
-
-                    # ✅ Валидируем что значение корректно
                     if cusum_state not in (1, -1, 0):
                         self.logger.warning(
-                            f"[{self.role}] Invalid cusum_state={cusum_state}, "
-                            f"expected 1, -1, or 0. Normalizing..."
+                            f"[{self.role}] Invalid cusum_state={cusum_state}, normalizing..."
                         )
-                        # Нормализуем к ближайшему корректному значению
                         cusum_state = 1 if cusum_state > 0 else (-1 if cusum_state < 0 else 0)
-                        self.logger.info(f"[{self.role}] Normalized cusum_state to {cusum_state}")
 
                 except (ValueError, TypeError) as e:
-                    self.logger.error(
-                        f"[{self.role}] Failed to convert cusum_state '{cusum_state_raw}' to int: {e}"
-                    )
+                    self.logger.error(f"[{self.role}] Failed to convert cusum_state: {e}")
                     return normalize_signal({
                         "ok": False,
                         "direction": 0,
                         "confidence": 0.0,
                         "reason": "cusum_state_conversion_error",
-                        "metadata": {"error": str(e), "raw_value": str(cusum_state_raw)}
+                        "metadata": {"error": str(e)}
                     })
 
-                # Преобразуем остальные значения
                 cusum_conf = float(cusum_conf_raw)
                 cusum_zscore = float(cusum_zscore_raw)
                 cusum_pos = float(cusum_pos_raw) if not pd.isna(cusum_pos_raw) else 0.0
@@ -439,11 +418,7 @@ class RoleBasedOnlineTrendDetector(Detector):
                 original_conf = cusum_conf
 
             except (ValueError, TypeError) as conv_err:
-                self.logger.error(
-                    f"[{self.role}] Type conversion error: {conv_err}. "
-                    f"Raw values: state={cusum_state_raw}, conf={cusum_conf_raw}, "
-                    f"zscore={cusum_zscore_raw}"
-                )
+                self.logger.error(f"[{self.role}] Type conversion error: {conv_err}")
                 return normalize_signal({
                     "ok": False,
                     "direction": 0,
@@ -452,67 +427,51 @@ class RoleBasedOnlineTrendDetector(Detector):
                     "metadata": {"error": str(conv_err)}
                 })
 
-            # ✅ ДИАГНОСТИКА: Логируем значения после преобразования
-            self.logger.debug(
-                f"[{self.role}] CUSUM values (after conversion): "
-                f"state={cusum_state} (type={type(cusum_state).__name__}), "
-                f"conf={cusum_conf:.3f}, zscore={cusum_zscore:.3f}, "
-                f"pos={cusum_pos:.3f}, neg={cusum_neg:.3f}, reason={cusum_reason}"
-            )
-
         except (KeyError, IndexError) as e:
-            self.logger.error(
-                f"[{self.role}] Error accessing CUSUM data: {e}",
-                exc_info=True
-            )
+            self.logger.error(f"[{self.role}] Error accessing CUSUM data: {e}")
             return normalize_signal({
                 "ok": False,
                 "direction": 0,
                 "confidence": 0.0,
                 "reason": "cusum_read_error",
-                "metadata": {"error": str(e), "role": self.role, "timeframe": self.timeframe}
+                "metadata": {"error": str(e)}
             })
 
         # ═══════════════════════════════════════════════════════════
-        # 4. ✅ ЕДИНАЯ ТОЧКА НОРМАЛИЗАЦИИ CONFIDENCE (БЕЗ ДУБЛИКАТОВ)
+        # 4. НОРМАЛИЗАЦИЯ CONFIDENCE
         # ═══════════════════════════════════════════════════════════
-
-        # CUSUM confidence в БД - это abs(z-score)
-        # Нужно нормализовать к [0, 1]
-        # z-score обычно в диапазоне [-10, 10], но может быть и больше
-
-        # Нормализация: берем абсолют и масштабируем
-        # Используем формулу: conf_normalized = min(1.0, |z_score| / z_threshold)
-        Z_SCORE_THRESHOLD = 3.0  # Значение, при котором confidence становится 1.0
+        Z_SCORE_THRESHOLD = 3.0
         normalized_conf = min(1.0, abs(cusum_conf) / Z_SCORE_THRESHOLD)
 
         self.logger.debug(
             f"[{self.role}] Confidence normalization: "
-            f"{original_conf:.3f} (raw z-score) → {normalized_conf:.3f} [0,1]"
+            f"{original_conf:.3f} (raw) → {normalized_conf:.3f} [0,1]"
         )
 
         # ═══════════════════════════════════════════════════════════
-        # 5. ПРИМЕНЕНИЕ ПОРОГА CONFIDENCE (ROLE-BASED)
+        # 5.  ✅ НОВАЯ ЛОГИКА: ok=True для любого direction != 0
         # ═══════════════════════════════════════════════════════════
 
-        # Сигнал OK только если:
-        # - есть направление (не FLAT)
-        # - нормализованная уверенность >= порога роли
-        ok = (cusum_state != 0) and (normalized_conf >= self.min_confidence)
-
-        # Определяем причину сигнала
         if cusum_state == 0:
+            # FLAT - однозначно ok=False
+            ok = False
             reason = "no_trend_signal"
         elif normalized_conf < self.min_confidence:
+            # ✅ СЛАБЫЙ СИГНАЛ - возвращаем ok=True, но помечаем
+            ok = True  # ✅ ИЗМЕНЕНО: было False!
             reason = "low_confidence"
+            self.logger.info(
+                f"[{self.role}] ⚠️ Weak signal: "
+                f"direction={cusum_state}, conf={normalized_conf:.3f} "
+                f"(below threshold {self.min_confidence:.2f}) - passing to confirmator"
+            )
         else:
+            # Сильный сигнал
+            ok = True
             reason = cusum_reason
-
-        # Увеличиваем счетчик при валидном сигнале
-        if ok:
             self.signal_count += 1
             self.logger.info(
-                f"[{self.role}] ✅ Valid signal #{self.signal_count}: "
+                f"[{self.role}] ✅ Strong signal #{self.signal_count}: "
                 f"direction={cusum_state}, conf={normalized_conf:.3f}"
             )
 
@@ -527,121 +486,53 @@ class RoleBasedOnlineTrendDetector(Detector):
             "cusum_neg": float(cusum_neg),
             "signal_count": int(self.signal_count),
             "min_confidence_threshold": float(self.min_confidence),
-            "original_cusum_conf": float(original_conf),  # ✅ Оригинальное значение
-            "normalized_conf": float(normalized_conf),  # ✅ Нормализованное значение
-            "z_score_threshold": float(Z_SCORE_THRESHOLD)  # ✅ Порог нормализации
+            "original_cusum_conf": float(original_conf),
+            "normalized_conf": float(normalized_conf),
+            "z_score_threshold": float(Z_SCORE_THRESHOLD),
+            "is_weak_signal": normalized_conf < self.min_confidence
         }
 
         signal = {
             "ok": bool(ok),
-            "direction": int(cusum_state),  # ✅ INTEGER: 1, -1, 0
-            "confidence": float(normalized_conf),  # ✅ Нормализованное значение [0, 1]
+            "direction": int(cusum_state),
+            "confidence": float(normalized_conf),
             "reason": reason,
             "metadata": metadata
         }
 
         self.logger.debug(
             f"[{self.role}] Final signal: direction={cusum_state}, "
-            f"conf={normalized_conf:.3f} (orig={original_conf:.3f}), "
-            f"ok={ok}, reason={reason}"
+            f"conf={normalized_conf:.3f}, ok={ok}, reason={reason}"
         )
 
         # ═══════════════════════════════════════════════════════════
-        # 7. ✅ ВАЛИДАЦИЯ КОНСИСТЕНТНОСТИ ok + reason
+        # 7.  ВАЛИДАЦИЯ КОНСИСТЕНТНОСТИ
         # ═══════════════════════════════════════════════════════════
-
-        # Нормализуем сигнал ПЕРЕД валидацией
         result = normalize_signal(signal)
 
-        # Множество причин, которые НЕ должны сопровождать ok=True
         INVALID_REASONS_FOR_OK_TRUE = {
             "invalid_data",
             "insufficient_data",
             "insufficient_warmup",
             "detector_error",
-            "invalid_price",
-            "outside_trading_hours",
-            "daily_limit_reached"
+            "missing_cusum_data"
         }
 
-        # Множество причин, которые ДОЛЖНЫ сопровождать ok=True
-        VALID_REASONS_FOR_OK_TRUE = {
-            "trend_confirmed",
-            "entry_confirmed",
-            "hierarchical_confirmed",
-            "three_level_confirmed"
-        }
-
-        # ✅ ПРОВЕРКА 1: ok=True но reason указывает на проблему
         if result["ok"] and result["reason"] in INVALID_REASONS_FOR_OK_TRUE:
             self.logger.error(
-                f"⚠️ [{self.role}] INCONSISTENT SIGNAL: ok=True but reason='{result['reason']}'\n"
-                f"  Direction: {result['direction']}\n"
-                f"  Confidence: {result['confidence']:.3f}\n"
-                f"  ➡️  Forcing ok=False to maintain consistency"
+                f"⚠️ [{self.role}] INCONSISTENT: ok=True but reason='{result['reason']}'"
             )
-
-            # ✅ Сохраняем оригинальную причину в metadata ПЕРЕД изменением
-            original_reason = result["reason"]
-
-            # Исправляем противоречие - создаем новый сигнал
             result = normalize_signal({
                 "ok": False,
                 "direction": 0,
                 "confidence": 0.0,
-                "reason": original_reason,  # ✅ Используем переменную, не result["reason"]
+                "reason": result["reason"],
                 "metadata": {
                     **result.get("metadata", {}),
-                    "fixed_inconsistency": True,
-                    "original_ok": True,
-                    "original_direction": result["direction"],
-                    "original_confidence": result["confidence"]
+                    "fixed_inconsistency": True
                 }
             })
 
-        # ✅ ПРОВЕРКА 2: ok=False но reason НЕ в списке error-причин
-        elif not result["ok"]:
-            current_reason = result["reason"]
-
-            # Проверяем что reason указывает на успешный сигнал
-            is_success_reason = (
-                    current_reason in VALID_REASONS_FOR_OK_TRUE or
-                    (isinstance(current_reason, str) and current_reason.startswith("z="))
-            )
-
-            # Также проверяем что это НЕ явная ошибка
-            is_not_error = current_reason not in INVALID_REASONS_FOR_OK_TRUE
-
-            if is_success_reason and is_not_error:
-                self.logger.warning(
-                    f"⚠️ [{self.role}] REVERSE INCONSISTENCY: ok=False but reason='{current_reason}'\n"
-                    f"  Direction: {result['direction']}\n"
-                    f"  Confidence: {result['confidence']:.3f}\n"
-                    f"  ➡️  Correcting reason based on actual state"
-                )
-
-                # ✅ Определяем правильную типизированную причину
-                if result["direction"] == 0:
-                    corrected_reason = "no_trend_signal"
-                elif result["confidence"] < self.min_confidence:
-                    corrected_reason = "weak_trend_signal"
-                else:
-                    corrected_reason = "detector_error"
-
-                # ✅ Создаем НОВЫЙ сигнал с исправленной причиной
-                result = normalize_signal({
-                    "ok": False,
-                    "direction": result["direction"],
-                    "confidence": result["confidence"],
-                    "reason": corrected_reason,  # ✅ Типизированное значение
-                    "metadata": {
-                        **result.get("metadata", {}),
-                        "original_reason": current_reason,  # ✅ Сохраняем в metadata
-                        "reason_corrected": True
-                    }
-                })
-
-        # ✅ ФИНАЛЬНОЕ ЛОГИРОВАНИЕ
         self.logger.debug(
             f"[{self.role}] ✅ Signal after consistency check: "
             f"ok={result['ok']}, direction={result['direction']}, "

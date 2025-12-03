@@ -252,7 +252,7 @@ class ThreeLevelHierarchicalConfirmator(Detector):
         global_conf = float(global_signal.get("confidence", 0.0))
         global_dir = int(global_signal.get("direction", 0))
 
-        # ✅ ИСПРАВЛЕНО: Используем исходный reason от детектора
+        #  Используем исходный reason от детектора
         if not global_signal.get("ok", False):
             original_reason = global_signal.get("reason", "no_global_trend")
             out = self._error_signal(
@@ -282,7 +282,7 @@ class ThreeLevelHierarchicalConfirmator(Detector):
         self.logger.info(f"🔄 Calling trend_detector.analyze()...")
         trend_signal = await self.trend_detector.analyze(data)
 
-        # ✅ ПРОВЕРКА: Валидация результата детектора
+        #  Валидация результата детектора
         if not trend_signal or not isinstance(trend_signal, dict):
             self.logger.error("❌ Trend detector returned invalid result (None or not dict)")
             out = self._error_signal(
@@ -300,57 +300,30 @@ class ThreeLevelHierarchicalConfirmator(Detector):
                          f"direction={trend_signal.get('direction')}, "
                          f"confidence={trend_signal.get('confidence'):.2f}, "
                          f"reason={trend_signal.get('reason')}")
-        # ✅ ИСПРАВЛЕНО: Обработка слабого или отсутствующего тренда
+        #  Обработка слабого или отсутствующего тренда
+        #  Обработка слабого или отсутствующего тренда
         trend_conf = float(trend_signal.get("confidence", 0.0))
         trend_dir = int(trend_signal.get("direction", 0))
         trend_ok = trend_signal.get("ok", False)
 
-        # Если confidence ниже порога → считаем слабым, но не блокируем
+        # НОВАЯ ЛОГИКА: НЕ преобразовываем слабые сигналы в FLAT
+        # Просто логируем и ПЕРЕДАЁМ в consistency check как есть
+
         if trend_dir != 0 and trend_conf < self.min_trend_confidence:
             self.logger.info(
-                f" Weak trend signal: conf={trend_conf:.2f} < threshold={self.min_trend_confidence}. "
-                f"Treating as FLAT, continuing with global direction."
+                f"⚠️ Weak trend signal: dir={trend_dir}, conf={trend_conf:.2f} "
+                f"< threshold={self.min_trend_confidence:. 2f}. "
+                f"Passing to consistency check (not converting to FLAT)."
             )
-            trend_signal = normalize_signal({
-                "ok": True,
-                "direction": 0,
-                "confidence": 0.0,
-                "reason": "no_trend_signal",
-                "metadata": {
-                    **trend_signal.get("metadata", {}),
-                    "original_confidence": trend_conf,
-                    "original_direction": trend_dir,
-                    "reason_override": "weak_confidence_below_threshold"
-                }
-            })
-            trend_dir = 0
-            trend_conf = 0.0
 
-        # Если trend_detector вернул ok=False → логируем, но продолжаем
+        # Если trend_detector вернул ok=False → логируем и продолжаем
         elif not trend_ok:
             self.logger.info(
-                f" Trend detector returned ok=False (reason={trend_signal.get('reason')}). "
-                f"Global signal is strong - continuing analysis with trend as FLAT."
+                f"⚠️ Trend detector returned ok=False (reason={trend_signal.get('reason')}).  "
+                f"Keeping dir={trend_dir}, conf={trend_conf:.2f} for consistency check."
             )
-            original_reason = trend_signal.get("reason", "no_trend_signal")
-            safe_reason = map_reason(str(original_reason))
 
-            trend_signal = normalize_signal({
-                "ok": True,
-                "direction": 0,
-                "confidence": 0.0,
-                "reason": safe_reason,
-                "metadata": {
-                    **trend_signal.get("metadata", {}),
-                    "original_ok": False,
-                    "original_reason": original_reason,
-                    "reason_override": "detector_not_ok_but_continued"
-                }
-            })
-            trend_dir = 0
-            trend_conf = 0.0
-
-        # ✅ ЕДИНАЯ ПРОВЕРКА согласованности через _check_two_level_consistency
+        #  ЕДИНАЯ ПРОВЕРКА согласованности через _check_two_level_consistency
         consistency = self._check_two_level_consistency(global_signal, trend_signal)
 
         consistent = consistency['consistent']
@@ -361,11 +334,10 @@ class ThreeLevelHierarchicalConfirmator(Detector):
             f"Consistency check: consistent={consistent}, reason={consistency_reason}, "
             f"final_dir={final_direction}"
         )
-
-        # ✅ ИСПРАВЛЕНИЕ: При несогласии возвращаем ok=False с метаданными
+        #  При несогласии возвращаем ok=False с метаданными
         if not consistent:
             if consistency_reason == 'direction_disagreement':
-                # ✅ Генерируем correlation_id
+                #  Генерируем correlation_id
                 from iqts_standards import create_correlation_id
                 correlation_id = create_correlation_id()
 
