@@ -342,14 +342,15 @@ class AdaptiveExitManager:
 
     def __init__(self,
                  global_timeframe: Timeframe = "5m",
-                 trend_timeframe: Timeframe = "1m"):
+                 trend_timeframe: Timeframe = "1m",
+                 config: Optional[Dict[str, Any]] = None):  # ✅ ДОБАВЛЕНО
 
         # Детектор сигналов на выход (с каскадной логикой)
         self.exit_detector = ExitSignalDetector(
             global_timeframe=global_timeframe,
             trend_timeframe=trend_timeframe
         )
-
+        exit_config = config.get('exit_management', {}) if config else {}
         # Параметры трейлинг стопа
         self.trailing_stop_activation = 0.015  # 1.5% прибыли
         self.trailing_stop_distance = 0.01  # 1% от пика

@@ -45,9 +45,6 @@ import config as cfg
 import os
 
 validator = SignalValidator(strict_mode=False)
-exit_manager = AdaptiveExitManager(
-    global_timeframe="5m",
-    trend_timeframe="1m")
 
 # === Components Container ===
 @dataclass
@@ -808,23 +805,21 @@ class BotLifecycleManager:
         return cast(ExchangeManagerInterface, em)
 
     async def _create_exit_manager(self, logger: logging.Logger) -> Any:
-        """✅ ДОБАВЛЕНО: Create AdaptiveExitManager"""
+        """✅ ИСПРАВЛЕНО: Create AdaptiveExitManager with config"""
         logger.info("Creating AdaptiveExitManager")
 
         try:
-            from exit_system import AdaptiveExitManager
 
-            strategy_config = self.config.get("strategy", {})
-            quality_detector_config = strategy_config.get("quality_detector", {})
+            # ✅ ЧИТАЕМ КОНФИГ
+            trading_system_cfg = self.config.get("trading_system", {})
 
             exit_manager = AdaptiveExitManager(
-                global_timeframe=cast(Literal["1m", "5m", "15m", "1h"],
-                                     quality_detector_config.get("global_timeframe", "5m")),
-                trend_timeframe=cast(Literal["1m", "5m", "15m", "1h"],
-                                    quality_detector_config.get("trend_timeframe", "1m")),
+                global_timeframe=cast(Literal["1m", "5m", "15m", "1h"], "5m"),
+                trend_timeframe=cast(Literal["1m", "5m", "15m", "1h"], "1m"),
+                config=trading_system_cfg  # ✅ ТЕПЕРЬ РАБОТАЕТ!
             )
 
-            logger.info("AdaptiveExitManager created successfully")
+            logger.info("AdaptiveExitManager created successfully with config")
             return exit_manager
 
         except ImportError as e:
@@ -912,8 +907,6 @@ class BotLifecycleManager:
                                         f"History loaded for {symbol}: "
                                         f"1m={counts.get('1m', 0)}, 5m={counts.get('5m', 0)} candles"
                                     )
-                    else:
-                        self.logger.warning(f"Неожиданный формат history_results: {type(history_results)}")
 
                     self._emit_event("HISTORY_LOADED", {"results": history_results})
                     # ✅ Устанавливаем флаг готовности истории в агрегаторе
