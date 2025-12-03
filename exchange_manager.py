@@ -1339,6 +1339,25 @@ class ExchangeManager:
 
         return triggered
 
+    def clear_stops_for_symbol(self, symbol: str) -> None:
+        """
+        Удалить все STOP ордера для символа из _active_orders.
+        Используется при открытии новой позиции.
+        """
+        try:
+            to_remove = []
+            for order_id, order in self._active_orders.items():
+                if (order["symbol"] == symbol and
+                        order["type"] in ["STOP_MARKET", "STOP"] and
+                        order["reduce_only"]):
+                    to_remove.append(order_id)
+
+            for order_id in to_remove:
+                del self._active_orders[order_id]
+                self.logger.info(f"🗑️ Removed old STOP from _active_orders: {order_id}")
+
+        except Exception as e:
+            self.logger.error(f"Error clearing stops for {symbol}: {e}")
 
     def _trigger_stop_order(self, order: ActiveOrder, execution_price: float) -> None:
         """

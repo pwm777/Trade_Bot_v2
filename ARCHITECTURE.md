@@ -120,7 +120,8 @@ BotLifecycleManager (run_bot.py) - главный координатор
     L-- MarketHistoryManager (менеджер исторических данных)
 
 ## 5. Модуль: run_bot.py
-textrun_bot.py — точка входа и оркестратор всей торговой системы
+
+run_bot.py — точка входа и оркестратор всей торговой системы
 +-- Главные обязанности:
 ¦   +-- Сборка всех компонентов через DI
 ¦   +-- Управление жизненным циклом (start → wait → graceful stop)
@@ -133,6 +134,7 @@ textrun_bot.py — точка входа и оркестратор всей то
 ¦
 +-- ComponentsContainer (dataclass)
 ¦   +-- trade_log: TradingLogger
+¦   ¦   L-- Аудит, PnL, журнал сигналов/ордеров/сделок
 ¦   +-- position_manager: PositionManagerInterface
 ¦   +-- exchange_manager: ExchangeManagerInterface
 ¦   +-- strategy: StrategyInterface (ImprovedQualityTrendSystem)
@@ -146,87 +148,262 @@ textrun_bot.py — точка входа и оркестратор всей то
 ¦   L-- created_at: datetime
 ¦
 L-- BotLifecycleManager
-    +-- Конструктор:
-    ¦     config: Dict,
-    ¦     event_handlers: List[BotLifecycleEventHandler] = [],
-    ¦     shutdown_timeout_seconds: float = 30.0
-    ¦
-    +-- Состояние:
-    ¦   +-- _shutdown_event: asyncio.Event
-    ¦   +-- _components: Optional[ComponentsContainer]
-    ¦   +-- _is_running / _stopping флаги
-    ¦   +-- _main_loop_task, _trading_task, _monitoring_task
-    ¦   L-- _stop_lock: asyncio.Lock() (защита от двойного stop)
-    ¦
-    +-- Публичные методы:
-    ¦   +-- async start() → None
-    ¦   ¦     • создаёт все компоненты (_create_components)
-    ¦   ¦     • подписывает on_candle_ready → TradingLogger + MainBotAdapter
-    ¦   ¦     • запускает три фоновые задачи:
-    ¦   ¦         – _run_main_loop()           (health-check + backtest auto-shutdown)
-    ¦   ¦         – _run_main_bot_monitoring()  (статистика каждые 60 сек)
-    ¦   ¦         – market_aggregator.start()  (основной поток данных)
-    ¦   ¦     • эмитит события LIFECYCLE_STARTING → COMPONENTS_CREATED → …
-    ¦   ¦     L-- помечает _is_running = True
-    ¦   ¦
-    ¦   +-- async stop() → None
-    ¦   ¦     • безопасно отменяет все фоновые задачи
-    ¦   ¦     • ждёт завершения с таймаутом
-    ¦   ¦     • вызывает _cleanup() (stop агрегатора, закрытие БД, etc.)
-    ¦   ¦     L-- эмитит LIFECYCLE_STOPPED
-    ¦   ¦
-    ¦   +-- async wait_for_shutdown() → None
-    ¦   ¦     • блокирует до установки _shutdown_event
-    ¦   ¦     L-- корректно обрабатывает CancelledError
-    ¦   ¦
-    ¦   +-- add_event_handler / remove_event_handler
-    ¦   L-- _emit_event(event_type, data) → рассылает всем подписчикам
-    ¦
-    +-- Создание компонентов (приватные фабрики):
-    ¦   +-- _create_logger() → logging.Logger
-    ¦   +-- _create_trade_log() → TradingLogger
-    ¦   +-- _create_async_store() → Any (опционально)
-    ¦   +-- MarketDataUtils (из trade_log.market_engine)
-    ¦   +-- _create_history_manager() → MarketHistoryManager (async engine)
-    ¦   +-- _create_strategy() → ImprovedQualityTrendSystem (singleton)
-    ¦   +-- _create_risk_manager() → EnhancedRiskManager (по конфигу)
-    ¦   +-- _create_exit_manager() → AdaptiveExitManager (по конфигу)
-    ¦   +-- _create_position_manager() → PositionManagerImpl
-    ¦   +-- _create_exchange_manager() → ExchangeManager (Binance)
-    ¦   +-- _create_market_aggregator() → MarketAggregator (через Factory)
-    ¦   L-- _create_main_bot_adapter() → MainBotAdapter
-    ¦         • оборачивает EnhancedTradingBot
-    ¦         • реализует MainBotInterface
-    ¦         • подписывает on_candle_ready цепочкой:
-    ¦               1. TradingLogger.on_candle_ready()
-    ¦               2. EnhancedTradingBot.on_candle_ready()
-    ¦
-    +-- Сигналы завершения:
-    ¦   L-- _setup_signal_handlers() → ловит SIGINT/SIGTERM → asyncio.create_task(stop())
-    ¦
-    +-- Очистка ресурсов:
-    ¦   L-- _cleanup() → graceful остановка всех компонентов (stop(), close(), disconnect_user_stream и т.д.)
-    ¦
-    L-- Свойства:
-        +-- is_running: bool
-        L-- components: Optional[ComponentsContainer]
-		
++-- Конструктор:
+¦     config: Dict,
+¦     event_handlers: List[BotLifecycleEventHandler] = [],
+¦     shutdown_timeout_seconds: float = 30.0
+¦
++-- Состояние (внутренние поля):
+¦   +-- _shutdown_event: asyncio.Event (флаг глобальной остановки)
+¦   +-- _components: Optional[ComponentsContainer]
+¦   +-- _is_running: bool — бот запущен
+¦   +-- _stopping: bool — процесс остановки инициирован
+¦   +-- _main_loop_task: Optional[asyncio.Task] — health-check + auto-shutdown BACKTEST
+¦   +-- _trading_task: Optional[asyncio.Task] — основной поток данных / торговля
+¦   +-- _monitoring_task: Optional[asyncio.Task] — периодический мониторинг компонентов
+¦   L-- _stop_lock: asyncio.Lock() — защита от повторных вызовов stop()
+¦
++-- Публичные методы:
+¦   +-- async start() → None
+¦   ¦     • эмитит LIFECYCLE_STARTING
+¦   ¦     • создаёт все компоненты через _create_components()
+¦   ¦     • подписывает on_candle_ready цепочкой:
+¦   ¦         1) TradingLogger.on_candle_ready()
+¦   ¦         2) MainBotAdapter.on_candle_ready() → EnhancedTradingBot
+¦   ¦     • запускает фоновые задачи:
+¦   ¦         – _run_main_loop()           (health-check + backtest auto-shutdown)
+¦   ¦         – _run_main_bot_monitoring() (агрегированная статистика каждые N секунд)
+¦   ¦         – market_aggregator.start()  (основной источник свечей)
+¦   ¦     • выполняет warmup истории через MarketHistoryManager (если включен)
+¦   ¦     • прогревает стратегию/бота на исторических данных (MAIN_BOT_BOOTSTRAPPED)
+¦   ¦     • эмитит цепочку событий:
+¦   ¦         L-- LIFECYCLE_STARTING → COMPONENTS_CREATED → HISTORY_LOADED → MAIN_BOT_BOOTSTRAPPED → LIFECYCLE_STARTED
+¦   ¦     L-- устанавливает _is_running = True
+¦   ¦
+¦   +-- async stop() → None
+¦   ¦     • защищён _stop_lock (реентерабельность)
+¦   ¦     • выставляет _stopping = True и _shutdown_event.set()
+¦   ¦     • отменяет фоновые задачи (_trading_task, _main_loop_task, _monitoring_task)
+¦   ¦     • ждёт их завершения с таймаутом shutdown_timeout_seconds
+¦   ¦     • при таймауте эмитит SHUTDOWN_TIMEOUT_WARNING и принудительно отменяет задачи
+¦   ¦     • вызывает *cleanup() для graceful остановки всех компонентов
+¦   ¦     • эмитит LIFECYCLE_STOPPED (или LIFECYCLE_STOP_FAILED при ошибке)
+¦   ¦     L-- сбрасывает флаги и ссылки на задачи (*is_running, *stopping, *_task)
+¦   ¦
+¦   +-- async wait_for_shutdown() → None
+¦   ¦     • блокирует до установки _shutdown_event
+¦   ¦     • используется в main()/run_backtest_mode() как "главный await"
+¦   ¦     L-- корректно обрабатывает asyncio.CancelledError
+¦   ¦
+¦   +-- add_event_handler(handler: BotLifecycleEventHandler) → None
+¦   +-- remove_event_handler(handler: BotLifecycleEventHandler) → None
+¦   L-- *emit_event(event_type: str, data: Dict) → None
+¦         • собирает BotLifecycleEvent и рассылает всем event_handlers
+¦         • основные типы событий:
+¦             L-- LIFECYCLE** / COMPONENTS** / HISTORY** / MONITORING** / BACKTEST_COMPLETED / CRITICAL_ERROR / WARNING
+¦
++-- Создание компонентов (приватные фабрики):
+¦   +-- _create_logger() → logging.Logger
+¦   ¦     • настраивает основной логгер TradingBot/бота
+¦   +-- _create_trade_log(logger) → TradingLogger
+¦   ¦     • подключение к БД/файлам для аудита
+¦   ¦     • в LIVE/DEMO режимах привязывает market_engine к бирже
+¦   +-- _create_async_store() → Any (опционально)
+¦   ¦     • асинхронное key-value хранилище (кэш / сервисные данные)
+¦   +-- MarketDataUtils (из trade_log.market_engine)
+¦   ¦     • враппер над market_engine для чтения свечей 1m/5m
+¦   ¦     • используется историческим менеджером и стратегией
+¦   +-- _create_history_manager(market_data_utils, logger) → MarketHistoryManager
+¦   ¦     • async-движок прогрева истории (live + backtest)
+¦   ¦     • следит за «текущим временем» BACKTEST и фильтрует данные до него
+¦   +-- _create_strategy(logger) → ImprovedQualityTrendSystem (singleton)
+¦   ¦     • создаёт стратегию и связывает её с history_manager / utils
+¦   +-- _create_risk_manager() → EnhancedRiskManager (по конфигу)
+¦   +-- _create_exit_manager() → AdaptiveExitManager (по конфигу, общий для стратегии/бота/PM)
+¦   +-- _create_position_manager() → PositionManagerImpl
+¦   ¦     • DI: trade_log, exit_manager, risk-параметры, execution_mode
+¦   +-- _create_exchange_manager() → ExchangeManager (Binance / DEMO / BACKTEST)
+¦   +-- _create_market_aggregator() → MarketAggregator
+¦   ¦     • читает рынок (биржа/БД) и эмитит on_candle_ready
+¦   L-- _create_main_bot_adapter() → MainBotAdapter
+¦         • оборачивает EnhancedTradingBot
+¦         • реализует MainBotInterface
+¦         • объединяет trade_bot + PositionManager + ExitManager + RiskManager
+¦         • подписывает on_candle_ready: TradingLogger → MainBotAdapter
+¦
++-- Основные циклы:
+¦   +-- async _run_main_loop() → None
+¦   ¦     • бесконечный цикл до _shutdown_event.set()
+¦   ¦     • периодически вызывает _check_components_health()
+¦   ¦     • в BACKTEST + auto_shutdown следит за market_aggregator.backtest_completed:
+¦   ¦         – при завершении: эмитит BACKTEST_COMPLETED и инициирует stop()
+¦   ¦     • любой сбой → MAIN_LOOP_ITERATION_ERROR / MAIN_LOOP_ERROR + попытка мягкого stop()
+¦   ¦
+¦   L-- async _run_main_bot_monitoring() → None
+¦         • каждые N секунд (≈60) собирает агрегированную статистику:
+¦             – main_bot.get_stats() → MONITORING_STATS
+¦             – main_bot.get_component_health() → COMPONENTS_UNHEALTHY при проблемах
+¦             – history_manager uptime + buffer_stats → HISTORY_MANAGER_STATUS
+¦         • при ошибке мониторинга эмитит MONITORING_ERROR / MONITORING_CRITICAL_ERROR
+¦
++-- Сигналы завершения:
+¦   L-- _setup_signal_handlers()
+¦         • регистрирует обработчики SIGINT / SIGTERM
+¦         • при получении сигнала создаёт задачу stop() в event loop
+¦
++-- Очистка ресурсов:
+¦   L-- async _cleanup() → None
+¦         • останавливает market_aggregator (stop/close)
+¦         • корректно завершает TradingLogger, ExchangeManager, PositionManager, HistoryManager
+¦         • закрывает async_store/подключения к БД (если есть)
+¦         L-- логирует все этапы освобождения ресурсов
+¦
+L-- Свойства:
++-- is_running: bool
+L-- components: Optional[ComponentsContainer]
+
 Дополнительные функции в модуле
-text+-- async def main() → None
-¦     • валидация config
-¦     • автоопределение BACKTEST по cfg.EXECUTION_MODE
-¦     • создание BotLifecycleManager с event_handler (логи + консоль)
-¦     • запуск → ожидание shutdown → graceful stop
++-- async def main() → None
+¦     • читает CLI аргументы (режим "backtest" через sys.argv)
+¦     • валидирует конфиг через cfg.validate_config()
+¦     • автоопределяет BACKTEST по cfg.EXECUTION_MODE
+¦     • создаёт runtime_cfg = cfg.build_runtime_config(trading_logger=None)
+¦     • формирует event_handler для BotLifecycleEvent (логгер + консольные сообщения)
+¦     • создаёт BotLifecycleManager(runtime_cfg, event_handlers=[event_handler])
+¦     • запускает цикл:
+¦           – await bot_manager.start()
+¦           – await bot_manager.wait_for_shutdown()
+¦           – при KeyboardInterrupt/Exception → лог/печать ошибки
+¦     L-- в finally: await bot_manager.stop() (graceful shutdown)
 ¦
 L-- async def run_backtest_mode() → None
-      • отдельный event_handler с красивым финальным отчётом
-      • сбор статистики из TradingLogger и MainBot
-      • вывод таблицы по символам + итоговый PnL
+• переинициализирует runtime_cfg с учётом BACKTEST (в т.ч. TradingLogger)
+• создаёт отдельный backtest_event_handler (расширенный отчёт по символам и PnL)
+• создаёт BotLifecycleManager(runtime_cfg, event_handlers=[backtest_event_handler])
+• запускает backtest: start() → wait_for_shutdown()
+• по завершении генерирует финальный отчёт:
+¦     – статистика по каждому символу (total, winrate, net_pnl_pct и т.д.)
+¦     – суммарный PnL по портфелю
+L-- всегда вызывает stop() в finally, даже при ошибках/KeyboardInterrupt
+
+Состояния жизненного цикла BotLifecycleManager
++-- INIT
+¦   • после **init**, компоненты ещё не созданы (_components = None, _is_running = False)
+¦
++-- STARTING
+¦   • вызывается start()
+¦   • эмитится LIFECYCLE_STARTING
+¦   • создаются все компоненты, прогревается история, регистрируются подписчики
+¦   L-- при успехе → переход в RUNNING
+¦
++-- RUNNING
+¦   • фоновые задачи: _run_main_loop, _run_main_bot_monitoring, market_aggregator.start
+¦   • _is_running = True, _stopping = False
+¦   • нормальная торговая работа/бэктест
+¦
++-- STOP_REQUESTED
+¦   • вызван stop() или сработал auto_shutdown / сигнал ОС
+¦   • _stopping = True, _shutdown_event.set()
+¦   L-- идёт отмена задач и переход в SHUTTING_DOWN
+¦
++-- SHUTTING_DOWN
+¦   • отмена фоновых задач + ожидание с таймаутом
+¦   • вызов _cleanup()
+¦   • эмитится LIFECYCLE_STOPPED или LIFECYCLE_STOP_FAILED
+¦   L-- после завершения → STOPPED
+¦
+L-- STOPPED
+• _is_running = False, все задачи обнулены
+• _components может быть очищен (по логике _cleanup)
+L-- готов к повторному запуску (при необходимости)
+
+Flow входа (запуск бота)
++-- CLI / **main**
+¦   +-- if **name** == "**main**":
+¦   ¦   +-- os.makedirs("data", exist_ok=True)
+¦   ¦   L-- asyncio.run(main())
+¦   ¦
+¦   L-- main()
+¦       +-- проверка аргумента "backtest":
+¦       ¦   • если sys.argv[1] == "backtest" → run_backtest_mode()
+¦       ¦   • иначе: обычный режим (LIVE/DEMO)
+¦       +-- cfg.validate_config() → RuntimeError при ошибках конфигурации
+¦       +-- auto-detect BACKTEST по cfg.EXECUTION_MODE
+¦       +-- cfg.build_runtime_config(trading_logger=None) → runtime_cfg
+¦       +-- создание event_handler для BotLifecycleEvent (лог + консоль)
+¦       +-- создание BotLifecycleManager(runtime_cfg, [event_handler])
+¦       +-- запуск жизненного цикла:
+¦       ¦   • await bot_manager.start()
+¦       ¦   • await bot_manager.wait_for_shutdown()
+¦       ¦   • обработка KeyboardInterrupt/Exception (лог/печать)
+¦       L-- в finally: await bot_manager.stop() → корректная остановка компонентов
+¦
+L-- Flow входа в BACKTEST (run_backtest_mode)
++-- main() / CLI с аргументом "backtest" или EXECUTION_MODE="BACKTEST"
++-- подготовка runtime_cfg c учётом backtest-настроек
++-- создание backtest_event_handler с расчётом отчёта по символам
++-- создание BotLifecycleManager(runtime_cfg, [backtest_event_handler])
++-- await bot_manager.start() (инициализация + прогрев истории)
++-- await bot_manager.wait_for_shutdown()
+L-- по завершении backtest_completed или сигналу ОС → stop() → отчёт → выход
+
+Flow выхода (graceful shutdown / аварийный выход)
++-- Инициаторы выхода:
+¦   +-- Пользовательский SIGINT/SIGTERM (Ctrl+C, kill)
+¦   +-- BACKTEST_COMPLETED (авто-shutdown в _run_main_loop при backtest_completed=True)
+¦   +-- CRITICAL_ERROR / MAIN_LOOP_ERROR / MONITORING_CRITICAL_ERROR
+¦   L-- внешние вызовы bot_manager.stop()
+¦
++-- Обработчик сигнала ОС (_setup_signal_handlers)
+¦   +-- при SIGINT/SIGTERM → создаёт asyncio.create_task(bot_manager.stop())
+¦   L-- выставляет _shutdown_event → wait_for_shutdown() завершается
+¦
++-- Реализация stop()
+¦   +-- защита от повторного вызова через _stop_lock и _stopping
+¦   +-- отмена _trading_task / _main_loop_task / _monitoring_task
+¦   +-- ожидание задач через asyncio.wait_for(..., timeout=shutdown_timeout)
+¦   +-- при таймауте → SHUTDOWN_TIMEOUT_WARNING + повторный cancel + gather(exceptions=True)
+¦   +-- вызов _cleanup() → остановка всех компонентов
+¦   +-- эмиссия LIFECYCLE_STOPPED (или LIFECYCLE_STOP_FAILED при ошибке)
+¦   L-- сброс внутренних флагов и задач
+¦
+L-- Аварийный путь
++-- Любая неперехваченная ошибка в _run_main_loop → MAIN_LOOP_ERROR + попытка stop()
++-- Любая критическая ошибка в мониторинге → MONITORING_CRITICAL_ERROR + _shutdown_event.set()
++-- В main()/run_backtest_mode: Exception → печать stacktrace + гарантированный stop() в finally
+
+Исключения
++-- BotLifecycleError(Exception)
+¦   +-- Базовая ошибка жизненного цикла бота
+¦   +-- Бросается при фатальных ошибках start()/stop() (например, LIFECYCLE_STOP_FAILED)
+¦   L-- Оборачивает исходное исключение для более чистого внешнего API
+¦
+L-- ComponentInitializationError(Exception)
++-- Ошибка инициализации одного из компонентов в _create_components()
++-- Примеры:
+¦   • TradingLogger.market_engine не инициализирован → нельзя создать MarketDataUtils
+¦   • невалидный конфиг risk_limits / exit_system и т.п.
++-- При возникновении:
+¦   • эмитится CRITICAL_ERROR с деталями
+¦   • start() завершается с исключением → main()/run_backtest_mode логируют и вызывают stop()
+L-- гарантирует, что бот не запустится в частично инициализированном состоянии
+
 ============================================================================
 ## 5. Модуль: trade_bot.py
 
-Абстрактные интерфейсы:
-trade_bot.py
+Это центральный компонент торговой системы, обеспечивающий координацию всех подсистем: получение данных,
+генерацию сигналов, управление позициями, риск-контроль, мониторинг и исполнение ордеров через
+ ExecutionEngine/ExchangeManager/PositionManager.
+Основное назначение модуля
+- Управление полным торговым циклом.
+- Интеграция стратегии ImprovedQualityTrendSystem.
+- Координация risk_manager и adaptive exit logic.
+- Получение рыночных данных через DataProvider.
+- Передача сигналов и ордеров в PositionManager → ExchangeManager.
+- Мониторинг системы и отправка уведомлений.
+- Ведение внутреннего состояния открытых позиций.
+- Обработка событий "новая свеча" в event-driven режиме.
+
 +-- DataProvider (ABC)
 ¦   +-- @abstractmethod async get_market_data(symbol: str, timeframes: List[str]) → Dict[str, pd.DataFrame]
 ¦   L-- @abstractmethod async get_current_price(symbol: str) → float
@@ -237,95 +414,260 @@ L-- ExecutionEngine (ABC)
     L-- @abstractmethod async get_account_info() → Dict
 
 Основные классы:
+
 +-- EnhancedTradingBot
+¦
 ¦   +-- Конструктор:
-¦   ¦     config: Dict,
-¦   ¦     data_provider: DataProvider,
-¦   ¦     execution_engine: ExecutionEngine,
-¦   ¦     trading_system: Optional[ImprovedQualityTrendSystem] = None,
-¦   ¦     risk_manager: Optional[EnhancedRiskManager] = None,
-¦   ¦     exit_manager: Optional[AdaptiveExitManager] = None,
-¦   ¦     validator: Optional[SignalValidator] = None
-¦   ¦
+¦   ¦     • config: Dict
+¦   ¦     • data_provider: DataProvider
+¦   ¦     • execution_engine: ExecutionEngine
+¦   ¦     • trading_system: Optional[ImprovedQualityTrendSystem]
+¦   ¦     • risk_manager: Optional[EnhancedRiskManager]
+¦   ¦     • exit_manager: Optional[AdaptiveExitManager]
+¦   ¦     • validator: Optional[SignalValidator]
+¦
 ¦   +-- Инициализация:
 ¦   ¦   +-- _setup_logging() → logging.Logger
 ¦   ¦   +-- _setup_monitoring() → None
-¦   ¦   L-- _validate_connections() → None (проверка data_provider + execution_engine)
-¦   ¦
-¦   +-- Компоненты системы (DI-ready):
-¦   ¦   +-- trading_system          → ImprovedQualityTrendSystem (внедрённый или созданный)
-¦   ¦   +-- exit_manager            → AdaptiveExitManager (внедрённый или созданный по конфигу)
-¦   ¦   +-- risk_manager            → EnhancedRiskManager (опционально)
-¦   ¦   +-- validator               → SignalValidator (по умолчанию strict_mode=False)
-¦   ¦   +-- monitoring_system       → EnhancedMonitoringSystem (telegram/email алерты)
-¦   ¦   L-- position_tracker        → PositionTracker (встроенный)
-¦   ¦
+¦   ¦   +-- _validate_connections() → None
+¦   ¦   L-- загрузка статуса trading_system (безопасно)
+¦
+¦   +-- DI-компоненты:
+¦   ¦   +-- trading_system          → ImprovedQualityTrendSystem
+¦   ¦   +-- exit_manager            → AdaptiveExitManager (DI или созданный внутри)
+¦   ¦   +-- risk_manager            → EnhancedRiskManager
+¦   ¦   +-- validator               → SignalValidator(strict_mode=False)
+¦   ¦   +-- monitoring_system       → EnhancedMonitoringSystem
+¦   ¦   L-- position_tracker        → PositionTracker
+¦
 ¦   +-- Управление данными:
 ¦   ¦   +-- _get_market_data() → Optional[Dict[str, pd.DataFrame]]
-¦   ¦   L-- _parse_timeframe(tf: str) → int (секунды)
-¦   ¦
-¦   +-- Главная точка входа:
+¦   ¦   +-- _parse_timeframe(tf: str) → int
+¦   ¦   L-- _basic_validate_market_data(dict) → bool
+¦
+¦   +-- Основной внешне вызываемый метод:
 ¦   ¦   L-- async on_candle_ready(symbol, candle: Dict, recent_candles: List[Dict]) → None
-¦   ¦       • определяет timeframe
-¦   ¦       • проверяет наличие активной позиции через PositionTracker
-¦   ¦       • если позиция есть → только _manage_existing_positions()
-¦   ¦       • если позиции нет → только на 5m генерирует сигнал
-¦   ¦
-¦   +-- Обработка сигналов:
+¦   ¦       • определяет timeframe (по _timeframe или длительности)
+¦   ¦       • фильтрует невалидную цену
+¦   ¦       • получает market_data через DataProvider
+¦   ¦       • проверяет реальную позицию через PositionManager
+¦   ¦       • если позиция есть → _manage_existing_positions()
+¦   ¦       • если позиции нет → генерация сигнала только на 5m
+¦
+¦   +-- Работа с сигналами:
 ¦   ¦   +-- _process_trade_signal(signal: TradeSignalIQTS) → None
-¦   ¦   ¦     • валидация через SignalValidator
-¦   ¦   ¦     • конвертация в intent-based сигнал
-¦   ¦   ¦     • вызов execution_engine.place_order()
-¦   ¦   ¦     L-- уведомление через monitoring_system
-¦   ¦   L-- _convert_iqts_signal_to_trade_signal() → Optional[Dict] (direction → intent)
-¦   ¦
-¦   +-- Управление открытыми позициями:
+¦   ¦   ¦     • валидация risk_context при stops_precomputed
+¦   ¦   ¦     • IQTS → PM-сигнал (_convert_iqts_signal_to_trade_signal)
+¦   ¦   ¦     • вызов position_manager.handle_signal()
+¦   ¦   ¦     • отправка order_req в ExchangeManager.place_order()
+¦   ¦   ¦     • логирование slippage, risk_context
+¦   ¦   ¦     • регистрация позиции в active_positions + PositionTracker
+¦   ¦   L-- _convert_iqts_signal_to_trade_signal() → Optional[Dict]
+¦
+¦   +-- Управление существующими позициями:
 ¦   ¦   +-- _manage_existing_positions(market_data) → None
-¦   ¦   ¦     • вызов AdaptiveExitManager.update_position_stops()
-¦   ¦   ¦     • при should_exit → execution_engine.close_position()
-¦   ¦   ¦     L-- обновление трейлинг-стопов
+¦   ¦   ¦     • определение current_price через ExchangeManager.get_current_price()
+¦   ¦   ¦     • проверка выполнения стоп-ордеров (DEMO/BACKTEST)
+¦   ¦   ¦     • обновление unrealized_pnl
+¦   ¦   ¦     • exit_manager.should_exit_position() → решение о выходе
+¦   ¦   ¦     • закрытие через execution_engine.close_position()
+¦   ¦   ¦     • трейлинг-логика через exit_manager.update_trailing_state()
+¦   ¦   ¦     • если SL изменился → pm.build_stop_order() → exchange.place_order()
 ¦   ¦   +-- _update_position_stop_loss(position_id, new_sl) → None
 ¦   ¦   L-- _handle_position_closed(position_id, close_price) → None
-¦   ¦
-¦   +-- Уведомления и логирование:
+¦
+¦   +-- Поддержка брокера / состояние позиций:
+¦   ¦   +-- _update_positions() → None
+¦   ¦   ¦     • сверка позиций брокера с active_positions
+¦   ¦   ¦     • автоматическое закрытие несоответствующих
+¦   ¦   L-- _calculate_trade_result(position, close_price) → TradeResult
+¦
+¦   +-- Уведомления:
 ¦   ¦   +-- _send_trade_notification(trade_signal, execution_result) → None
-¦   ¦   +-- _send_position_closed_notification(position_id, trade_result) → None
-¦   ¦   L-- _log_system_status() → None
-¦   ¦
-¦   +-- Валидация данных:
-¦   ¦   +-- _basic_validate_market_data(market_data) → bool (OHLCV, NaN, геометрия свечей)
-¦   ¦   L-- локальные проверки цены и свечей в on_candle_ready()
-¦   ¦
+¦   ¦   L-- _send_position_closed_notification(position_id, trade_result) → None
+¦
 ¦   +-- Аварийные процедуры:
-¦   ¦   +-- async _emergency_shutdown() → None (закрывает все позиции)
-¦   ¦   L-- async shutdown() → None (полная грациозная остановка, отменяет задачи)
-¦   ¦
+¦   ¦   +-- async _emergency_shutdown() → None (закрывает ВСЕ позиции)
+¦   ¦   L-- async shutdown() → None:
+¦   ¦       • отмена фоновых задач
+¦   ¦       • shutdown() трейдинговой системы
+¦   ¦       • остановка monitoring_system
+¦   ¦       • закрытие data_provider/execution_engine
+¦
 ¦   +-- Публичные методы:
 ¦   ¦   +-- async start() → None
-¦   ¦   L-- get_status() → Dict (is_running, позиции, статистика)
-¦   ¦
-¦   L-- Свойства / состояние:
+¦   ¦   L-- get_status() → Dict
+¦
+¦   +-- Состояние:
 ¦       • is_running: bool
-¦       • active_positions: Dict (исторически использовался, сейчас дублирует PositionTracker)
-¦       • position_tracker: PositionTracker
-¦       • trading_system, exit_manager, monitoring_system
+¦       • loop_count: int
+¦       • active_positions: Dict
+¦       • last_signal_time, last_trade_time: datetime
+¦       • monitoring tasks
+¦       • position_tracker
+¦       • trading_system, exit_manager, validator
 ¦
 L-- PositionTracker
-    +-- Конструктор: max_history: int = 1000
+    +-- Конструктор(max_history=1000)
+    ¦   • positions: Dict[position_id → данные позиции]
+    ¦   • closed_positions: deque (только метаданные)
+    ¦
     +-- Методы управления:
-    ¦   +-- add_position(position_id: str, position_data: Dict) → None
-    ¦   +-- get_position(position_id) → Optional[Dict]
-    ¦   +-- get_all_positions() → Dict[str, Dict]
-    ¦   +-- has_active_position(symbol: str) → bool
-    ¦   L-- close_position(position_id, close_price, realized_pnl) → None
+    ¦   +-- add_position(id, data) → None
+    ¦   +-- get_position(id) → Optional[Dict]
+    ¦   +-- get_all_positions() → Dict
+    ¦   +-- has_active_position(symbol) → bool
+    ¦   L-- close_position(id, close_price, pnl) → None
     ¦
     +-- Расчёт PnL:
-    ¦   +-- update_position_pnl(position_id, current_price) → None
-    ¦   +-- calculate_realized_pnl(position_id, close_price) → float (с учётом комиссий)
+    ¦   +-- update_position_pnl(id, current_price) → None
+    ¦   +-- calculate_realized_pnl(id, close_price) → float
     ¦   L-- get_total_unrealized_pnl() → float
     ¦
-    L-- История закрытых позиций:
-        L-- get_closed_positions(limit: int = 100) → List[Dict] (deque с maxlen)
+    L-- История:
+        +-- get_closed_positions(limit=100)
+        L-- кольцевой буфер closed_positions (maxlen)
+
+
+Общая архитектура обработки
+
+Поток данных и сигналов
+1. MarketAggregator вызывает:  
+   → on_candle_ready(symbol, candle, recent_candles)
+2. EnhancedTradingBot валидирует свечу, определяет TF.  
+3. Загружает market_data из DataProvider для всех TF.  
+4. Проверяет наличие открытой позиции (PositionManager → позиция).  
+
+Два режима:
+**A) Есть открытая позиция:**  
+→ только управление: _manage_existing_positions()
+
+**B) Нет позиции и свеча 5m:**  
+→ generate_signal() → _process_trade_signal()
+
+---
+
+4. Обработка входящего IQTS сигнала
+
+Конвертация IQTS → PositionManager-сигнала
+Метод: _convert_iqts_signal_to_trade_signal()
+
+Преобразует:
+- direction → intent (LONG_OPEN / SHORT_OPEN)  
+- добавляет correlation_id  
+- прокидывает risk_context (size, SL, TP)  
+- decision_price обязателен  
+
+Обработка через PositionManager
+Метод: _process_trade_signal()
+Flow:
+1. Валидация risk_context (если stops_precomputed=True)
+2. Конвертация IQTS → PM-сигнал
+3. PM.handle_signal() → OrderReq
+4. ExchangeManager.place_order(OrderReq)
+5. Логирование slippage, сохранение в PositionTracker
+
+---
+
+Управление позициями
+
+Основная логика (_manage_existing_positions)
+- Получение current_price через ExchangeManager.get_current_price()  
+- Проверка и исполнение стоп-ордеров (Backtest/Demo)  
+- Обновление unrealized PnL через PositionTracker  
+- ExitManager.should_exit_position():  
+  → каскад жёстких условий, TP/SL, trailing exit  
+- При необходимости закрытие позиции через ExecutionEngine  
+- Trailing SL через ExitManager.update_trailing_state()
+
+Если SL пересчитан:  
+→ PositionManager.build_stop_order() → ExchangeManager.place_order()
+
+---
+
+Управление ордерами и позициями через PositionManager
+
+EnhancedTradingBot **не создаёт** ордера напрямую.  
+Вся логика открытия/закрытия/стопов делегирована:
+
+IQTS → PM.handle_signal() → OrderReq → ExchangeManager
+
+PositionManager:
+- создаёт Entry/Exit/Stop ордера  
+- ведёт in-memory и БД состояние позиций  
+- отправляет события PositionEvent  
+- обеспечивает целостность стопов и trailing
+
+---
+
+Структура внутреннего состояния EnhancedTradingBot
+
+active_positions[position_id] содержит:
+- signal (исходный IQTS сигнал)  
+- execution_result (результат ордера)  
+- opened_at / closed_at  
+- exit_tracking (peak, trailing flags)  
+- risk_context (копия исходного risk_context)  
+- stops_precomputed (bool)
+
+PositionTracker.positions содержит:
+- объект позиции с ключевыми полями (entry, dir, size, pnl)
+
+PositionTracker.closed_positions:
+- deque фиксированной длины для метаданных закрытых позиций  
+- предотвращает утечки памяти
+
+---
+
+Валидация рыночных данных
+
+_local `_basic_validate_market_data` проверяет:
+- наличие всех OHLCV колонок  
+- отсутствие NaN  
+- high ≥ max(open, close)  
+- low ≤ min(open, close)  
+- значения > 0  
+Используется при _get_market_data() и on_candle_ready()
+
+---
+
+Нотификации и мониторинг
+
+EnhancedMonitoringSystem обеспечивает:
+- Telegram-уведомления  
+- Email-уведомления  
+- Отчёты о PnL, трейдах и аномалиях  
+
+Бот вызывает:
+- _send_trade_notification  
+- _send_position_closed_notification  
+- мониторинг через monitoring_system.monitor_enhanced_performance()
+
+---
+
+Безопасное завершение работы
+
+Методы:
+- _emergency_shutdown — закрытие всех позиций в форс-мажоре  
+- shutdown — корректный выход:
+  - отмена фоновых задач  
+  - остановка trading_system  
+  - закрытие data_provider и execution_engine  
+  - финальная статистика  
+
+---
+
+Key особенности
+
+- Полная DI-поддержка trading_system, exit_manager, risk_manager.  
+- Новая логика разделения входа и управления:  
+  → вход только на 5m, трейлинг/выход — на всех ТФ.  
+- Trailing SL делегирован AdaptiveExitManager.  
+- PositionTracker не хранит тяжёлые объекты закрытых позиций.  
+- Полная поддержка Direction enum и числовых значений.  
+- Прямая интеграция с PositionManager для всех ордеров.
+
+
 ======================================================================================
 		
 ## 6. Модуль: ImprovedQualityTrendSystem.py
@@ -1270,304 +1612,926 @@ L-- Совместимость с существующими модулями
 
 ## 14. Модуль: exchange_manager.py
 
-Типы данных:
-exchange_manager.py — универсальный транспортный слой исполнения ордеров
-+-- Роль в системе:
-    +-- Единая точка отправки OrderReq → получение OrderUpd
-    +-- Поддержка трёх режимов: LIVE / DEMO / BACKTEST без изменения интерфейса
-    +-- Эмуляция исполнения в DEMO/BACKTEST (MARKET = мгновенно, STOP = по цене триггера)
-    +-- Точное отслеживание активных стоп-ордеров (включая reduce_only)
-    +-- Источник истины для статуса ордеров и connection_state
-    L-- Интеграция с PositionManager и AdaptiveExitManager через callback
-+
-+-- Основной класс
-+
+ExchangeManager v2 — универсальный менеджер исполнения ордеров.
+Поддерживает режимы LIVE / DEMO / BACKTEST с единым интерфейсом.
+Отвечает за приём OrderReq, валидацию, исполнение/эмуляцию ордеров, мониторинг STOP/TP и генерацию OrderUpd/ExchangeEvent.
+
+Структура:
+
++-- ExchangeManagerError(Exception)
+¦   +-- Базовая ошибка ExchangeManager
+¦
++-- InvalidOrderError(ExchangeManagerError)
+¦   L-- Ошибка валидации ордера (неверные поля, значения, инварианты)
+¦
++-- ConnectionError(ExchangeManagerError)
+¦   L-- Ошибка соединения с биржей / user-data stream
+¦
++-- ExchangeApiError(ExchangeManagerError)
+¦   +-- error_code: Optional[str]
+¦   L-- Ошибка уровня биржевого API (коды/сообщения биржи)
+¦
++-- ActiveOrder (dataclass)
+¦   +-- client_order_id: str
+¦   +-- symbol: str
+¦   +-- side: Literal["BUY","SELL"]
+¦   +-- type: Literal["MARKET","LIMIT","STOP_MARKET","STOP","TAKE_PROFIT","TAKE_PROFIT_MARKET"]
+¦   +-- qty: Decimal
+¦   +-- price: Optional[Decimal]
+¦   +-- stop_price: Optional[Decimal]
+¦   +-- filled_qty: Decimal
+¦   +-- status: str ("NEW","WORKING","FILLED","REJECTED","CANCELED")
+¦   +-- correlation_id: Optional[str]
+¦   +-- timestamp_ms: int
+¦   +-- reduce_only: bool
+¦   +-- exchange_order_id: Optional[str]
+¦   L-- trigger_price: Optional[Decimal] (цена триггера для STOP/TP)
+¦
++-- ConnectionState (dataclass)
+¦   +-- status: Literal["connected","disconnected","connecting","error"]
+¦   +-- last_heartbeat: Optional[int]
+¦   +-- reconnect_count: int
+¦   +-- error_message: Optional[str]
+¦   L-- connected_at: Optional[int]
+¦
 L-- ExchangeManager
     +-- Конструктор:
-          base_url: str (не используется в DEMO/BACKTEST)
-          on_order_update: Callable[[OrderUpd], None] ← главный callback в бот
-          trade_log: Optional[TradingLogger]
-          demo_mode: bool = True
-          execution_mode: "LIVE"|"DEMO"|"BACKTEST"
-          symbols_meta: Dict (для округления цены/qty)
-    +
-    +-- Внутреннее состояние:
-          _active_orders: Dict[client_order_id, ActiveOrder]          → все активные ордера
-          _orders_by_symbol: defaultdict[set]                        → быстрый поиск по символу
-          _connection_state: ConnectionState                           → статус соединения
-          _stats: Dict                                                → счётчики (orders_sent, active_stops и т.д.)
-          _lock: threading.RLock                                      → потокобезопасность
-    +
-    +-- Публичные методы исполнения
-          L-- async place_order(order_req: OrderReq) → str (client_order_id)
-                • Валидация полей
-                • Округление price/qty по symbols_meta
-                • Создание ActiveOrder
-                • В DEMO/BACKTEST:
-                    – MARKET → мгновенный FILL
-                    – LIMIT → NEW (не исполняется)
-                    – STOP_MARKET / TAKE_PROFIT_MARKET → ждёт триггера
-                • В LIVE → будет HTTP + WS (пока заглушка)
-                • Эмит OrderUpd("NEW") → "FILLED"/"PARTIALLY_FILLED"
-    +
-    +-- Управление стоп-ордерами
-          L-- async check_stop_orders(current_prices: Dict[str, float]) → None
-                • Вызывается извне (в DEMO/BACKTEST — каждый тик из MainBot)
-                • Проверяет все STOP/TAKE_PROFIT по текущей цене
-                • При триггере → мгновенный FILL по текущей цене
-                • reduce_only ордера уменьшают позицию (логика в PositionManager)
-    +
-    +-- Обработка обновлений
-          L-- handle_order_update(update: OrderUpd) → None
-                • Обновляет ActiveOrder (status, filled_qty)
-                • Удаляет при FULL FILL / CANCELED
-                • Эмитит ExchangeEvent("ORDER_UPDATE_RECEIVED")
-                • Вызывает внешний callback on_order_update
-    +
-    +-- Диагностика и мониторинг
-          +-- get_active_orders(symbol?) → List[Dict] (с reduce_only)
-          +-- get_connection_state() → Dict (в DEMO всегда "CONNECTED")
-          +-- get_stats() → Dict (включая avg_latency, uptime)
-          L-- reset_for_backtest() → полная очистка перед новым прогоном
-    +
-    L-- Система событий
-          +-- add_event_handler(handler: ExchangeEventHandler)
-          L-- _emit_event(event: ExchangeEvent)
-+
-+-- Внутренние типы
-¦   +-- ActiveOrder (dataclass) — полное состояние ордера
-¦   +-- ConnectionState (dataclass) — статус соединения
-¦   L-- ExchangeEvent — тип события (ORDER_PLACED, ORDER_UPDATE_RECEIVED и т.д.)
+    ¦   +-- __init__(
+    ¦       base_url: str,
+    ¦       on_order_update: Callable[[OrderUpd], None],
+    ¦       trade_log: Optional[Any] = None,
+    ¦       *,
+    ¦       demo_mode: bool = True,
+    ¦       is_testnet: bool = False,
+    ¦       logger_instance: Optional[logging.Logger] = None,
+    ¦       metrics: Optional[Any] = None,
+    ¦       event_handlers: Optional[List[ExchangeEventHandler]] = None,
+    ¦       ws_url: Optional[str] = None,
+    ¦       execution_mode: str = "DEMO",
+    ¦       timeout_seconds: Optional[int] = None,
+    ¦       symbols_meta: Optional[Dict[str, Dict[str, Any]]] = None
+    ¦   )
+    ¦   • Режимы: execution_mode ∈ {"LIVE","DEMO","BACKTEST"}
+    ¦   • demo_mode / is_testnet для эмуляции
+    ¦   • on_order_update — обязательный callback для OrderUpd
+    ¦   • trade_log — источник последних цен/метаданных (fallback)
+    ¦   • symbols_meta — биржевые ограничения (tick_size, min_notional, precision)
+    ¦   • execution_mode управляет:
+    ¦     - _is_backtest_mode
+    ¦     - _use_sync_stop_check (STOP монитор из бота или из фонового треда)
+    ¦   • Инициализация:
+    ¦     - self._active_orders: Dict[client_order_id → ActiveOrder]
+    ¦     - self._orders_by_symbol: Dict[symbol → Set[order_ids]]
+    ¦     - self._price_feed: Optional[PriceFeed]
+    ¦     - self._stats: счётчики/метрики
+    ¦     - self._event_handlers: List[ExchangeEventHandler]
+    ¦     - self._connection_state: ConnectionState
+    ¦     - DEMO: _demo_latency_ms, _demo_slippage_pct, _demo_stop_slippage_pct
+    ¦     - BACKTEST/DEMO: _use_sync_stop_check управляет запуском фонового stop monitor
+    ¦
+    +-- Получение аккаунта:
+    ¦   +-- get_account_info() → Dict
+    ¦       • LIVE: заглушка (ожидается реальная реализация через API)
+    ¦       • DEMO/BACKTEST: возвращает фиктивный аккаунт (балансы, total_balance_usdt)
+    ¦
+    +-- Метаданные символов:
+    ¦   +-- _get_default_symbols_meta() → Dict[str, Dict[str, Any]]
+    ¦       • tick_size, step_size, min_notional, precision для ETHUSDT/BTCUSDT/BNBUSDT
+    ¦       • вызывается только если symbols_meta не передан явно
+    ¦
+    +-- Event system:
+    ¦   +-- add_event_handler(handler: ExchangeEventHandler) → None
+    ¦   +-- remove_event_handler(handler: ExchangeEventHandler) → None
+    ¦   L-- _emit_event(event: ExchangeEvent) → None
+    ¦       • вызывает всех подписчиков, логирует ошибки обработчиков
+    ¦
+    +-- Основной интерфейс размещения ордеров:
+    ¦   +-- place_order(order_req: OrderReq) → Dict[str, Any]
+    ¦   ¦   • Единая точка входа для OrderReq (MARKET/LIMIT/STOP/TP)
+    ¦   ¦   • Шаги:
+    ¦   ¦     1) Нормализация типа и stop_price/price (STOP семейство)
+    ¦   ¦     2) Валидация _validate_order_req()
+    ¦   ¦     3) Если STOP/TP → регистрация через _place_order_demo()
+    ¦   ¦     4) Для MARKET/LIMIT:
+    ¦   ¦        - выбор цены исполнения (fill_price) по приоритетам:
+    ¦   ¦          • price (LIMIT)
+    ¦   ¦          • _price_feed (close)
+    ¦   ¦          • risk_context.entry_price/decision_price
+    ¦   ¦          • fallback из trade_log._last_candle
+    ¦   ¦        - если price недоступна → REJECTED (no_price_available)
+    ¦   ¦     5) Проверка ценового инварианта SL/TP:
+    ¦   ¦        - LONG: SL < Entry < TP
+    ¦   ¦        - SHORT: TP < Entry < SL
+    ¦   ¦        → при нарушении: REJECTED (price_invariant_violation)
+    ¦   ¦     6) Проверка min_notional по symbols_meta
+    ¦   ¦     7) Расчёт commission с округлением (0.04%, 6 знаков)
+    ¦   ¦     8) Вычисление validation_hash по risk_context (_compute_validation_hash)
+    ¦   ¦     9) Генерация correlation_id (если отсутствует)
+    ¦   ¦    10) Формирование OrderUpd (status=FILLED) и вызов on_order_update
+    ¦   ¦    11) Обновление статистики _stats и возврат ACK-ответа (Dict)
+    ¦   ¦
+    ¦   +-- _compute_validation_hash(risk_context: Dict[str, Any]) → str
+    ¦   ¦   • SHA256 от канонизированного JSON risk_context (без validation_hash)
+    ¦   ¦   • используется для проверки консистентности risk_context ↔ исполнение
+    ¦   ¦
+    ¦   +-- cancel_order(client_order_id: str) → Dict[str, Any]
+    ¦   ¦   • Если нет ордера → REJECTED (not found)
+    ¦   ¦   • DEMO: _cancel_order_demo()
+    ¦   ¦   L-- LIVE: _cancel_order_live() (пока заглушка → DEMO)
+    ¦   ¦
+    ¦   +-- _cancel_order_demo(client_order_id: str) → Dict[str, Any]
+    ¦       • Посылает OrderUpd(status="CANCELED"), удаляет из _active_orders
+    ¦       • Обновляет статистику orders_canceled
+    ¦
+    +-- DEMO/BACKTEST режим:
+    ¦   +-- _place_order_demo(req: OrderReq) → Dict[str, Any]
+    ¦   ¦   • Универсальное размещение:
+    ¦   ¦     - STOP/TP: регистрация ActiveOrder с trigger_price = stop_price
+    ¦   ¦     - trailing update:
+    ¦   ¦       • по correlation_id с маркерами ("trail","update","trailing")
+    ¦   ¦       • вызывает update_stop_order(...) без создания дублей
+    ¦   ¦     - MARKET: таймер → _demo_fill_order()
+    ¦   ¦     - LIMIT: статус WORKING через _demo_send_working_update()
+    ¦   ¦
+    ¦   +-- _demo_send_working_update(order: ActiveOrder) → None
+    ¦   ¦   • Отправляет OrderUpd(status="WORKING")
+    ¦   ¦
+    ¦   +-- _calculate_commission(price: Decimal, qty: Decimal, is_maker: bool) → Decimal
+    ¦   ¦   • maker: 0.02%, taker: 0.04%
+    ¦   ¦   • логирует расчёт и возвращает комиссию в USDT
+    ¦   ¦
+    ¦   +-- _demo_fill_order(client_order_id: str) → None
+    ¦   ¦   • Унифицированное исполнение:
+    ¦   ¦     - STOP (trigger_price != None): fill по trigger_price
+    ¦   ¦       • BACKTEST: без slippage
+    ¦   ¦       • DEMO: небольшой slippage (demo_stop_slippage_pct)
+    ¦   ¦     - MARKET: текущая цена +/– slippage (demo_slippage_pct)
+    ¦   ¦     - LIMIT: по заявленной price (без slippage)
+    ¦   ¦     • вызывает _calculate_commission(), _send_order_update(FILLED)
+    ¦   ¦     • удаляет ордер через _remove_active_order()
+    ¦   ¦
+    ¦   L-- _demo_reject_order(order: ActiveOrder, reason: str) → None
+    ¦       • Отправляет OrderUpd(status="REJECTED"), очищает активный ордер
+    ¦
+    +-- STOP мониторинг:
+    ¦   +-- check_stops_on_price_update(symbol: str, current_price: float) → None
+    ¦   ¦   • Синхронная проверка для BACKTEST/DEMO/LIVE
+    ¦   ¦   • Вызывается извне (ботом) при закрытии свечи
+    ¦   ¦   • Логика:
+    ¦   ¦     - перебирает активные STOP/STOP_MARKET для symbol
+    ¦   ¦     - _check_stop_trigger_with_price(order, current_price)
+    ¦   ¦     - при срабатывании:
+    ¦   ¦       • безопасно удаляет ордер из _active_orders
+    ¦   ¦       • вызывает _trigger_stop_order(order, execution_price=stop_price)
+    ¦   ¦
+    ¦   +-- _check_stop_trigger_with_price(order: ActiveOrder, current_price: float) → bool
+    ¦   ¦   • Использует high/low из текущей свечи (price_feed) или current_price
+    ¦   ¦   • Учитывает:
+    ¦   ¦     - is_closing_long / is_closing_short (side + reduce_only)
+    ¦   ¦     - STOP vs TAKE_PROFIT
+    ¦   ¦     - tolerance (0.01%) для float
+    ¦   ¦   • Логирует подробности при срабатывании
+    ¦   ¦
+    ¦   +-- _ensure_stop_monitor_running() → None
+    ¦   ¦   • Запускает фоновый монитор _stop_monitor_loop() (если demo_mode и не sync-check)
+    ¦   ¦
+    ¦   +-- _stop_monitor_loop() → None
+    ¦   ¦   • Фоновый цикл:
+    ¦   ¦     - перебирает STOP/TP ордера
+    ¦   ¦     - _check_stop_trigger(order) → при True:
+    ¦   ¦       • _remove_active_order()
+    ¦   ¦       • _trigger_stop_order(order, execution_price=stop_price)
+    ¦   ¦
+    ¦   +-- _check_stop_trigger(order: ActiveOrder) → bool
+    ¦   ¦   • STOP/TP по текущему close (через price_feed)
+    ¦   ¦   • учитывает reduce_only, BUY/SELL, STOP/TP логику
+    ¦   ¦   • логирует каждые N проверок (для мониторинга)
+    ¦   ¦
+    ¦   L-- _trigger_stop_order(order: ActiveOrder, execution_price: float) → None
+    ¦       • Прямое исполнение STOP:
+    ¦       • Расчёт fill_price, filled_qty, commission (0.04%)
+    ¦       • Формирование OrderUpd(FILLED, reduce_only=True)
+    ¦       • Прямой вызов on_order_update()
+    ¦       • Удаление ордера и обновление статистики
+    ¦
+    +-- Управление STOP ордерами:
+    ¦   L-- update_stop_order(symbol: str, new_stop_price: Decimal, correlation_id: str) → None
+    ¦       • Обновляет существующий STOP/TP для symbol
+    ¦       • Обновляет stop_price + correlation_id
+    ¦       • Если не найден → InvalidOrderError (нет initial стопа)
+    ¦
+    +-- LIVE режим (заглушки):
+    ¦   +-- _place_order_live(req: OrderReq) → Dict[str, Any]
+    ¦   ¦   • Логирует попытку
+    ¦   ¦   • Пока переадресует в _place_order_demo()
+    ¦   ¦
+    ¦   +-- _cancel_order_live(client_order_id: str) → Dict[str, Any]
+    ¦   ¦   • Аналогично, пока → _cancel_order_demo()
+    ¦   ¦
+    ¦   +-- connect_user_stream() → None
+    ¦   ¦   • DEMO: помечает статус "connected"
+    ¦   ¦   • LIVE: заглушка, выбрасывает ConnectionError
+    ¦   ¦
+    ¦   L-- disconnect_user_stream() → None
+    ¦       • DEMO: останавливает stop monitor, обновляет статус
+    ¦       • LIVE: заглушка
+    ¦
+    +-- Источник цен и валидация:
+    ¦   +-- get_current_price(symbol: str) → Optional[float]
+    ¦   ¦   • Унифицированный доступ к цене через _price_feed(symbol)
+    ¦   ¦   • Поддерживает dict с "close" или float
+    ¦   ¦
+    ¦   +-- set_price_feed_callback(cb: PriceFeed) → None
+    ¦   ¦   • Устанавливает колбэк для DEMO/STOP мониторинга
+    ¦   ¦
+    ¦   L-- _validate_order_req(req: OrderReq) → None
+    ¦       • Проверка обязательных полей (client_order_id, symbol, side, type, qty)
+    ¦       • side ∈ {"BUY","SELL"}
+    ¦       • type ∈ {"MARKET","LIMIT","STOP_MARKET","STOP","TAKE_PROFIT","TAKE_PROFIT_MARKET"}
+    ¦       • LIMIT: требует price > 0
+    ¦       • STOP/TP: требуют stop_price > 0
+    ¦       • reduce_only, если задан — строго bool
+    ¦       • При нарушении → InvalidOrderError
+    ¦
+    +-- Вспомогательные методы:
+    ¦   +-- _send_order_update(update: OrderUpd) → None
+    ¦   ¦   • Вызывает on_order_update(update)
+    ¦   ¦   • Эмитит ExchangeEvent("ORDER_UPDATE_RECEIVED") через _emit_event
+    ¦   ¦
+    ¦   +-- _remove_active_order(client_order_id: str) → None
+    ¦   ¦   • Удаляет ордер из _active_orders и _orders_by_symbol
+    ¦   ¦   • Корректирует счётчики active_stops
+    ¦   ¦   • Очищает вспомогательные счётчики (например, _stop_check_counter)
+    ¦   ¦
+    ¦   +-- get_connection_state() → Dict[str, Any]
+    ¦   ¦   • DEMO: всегда "CONNECTED" (для health-check)
+    ¦   ¦   • LIVE: asdict(ConnectionState)
+    ¦   ¦
+    ¦   +-- get_stats() → Dict[str, Any]
+    ¦   ¦   • Возвращает:
+    ¦   ¦     - orders_sent, orders_filled, orders_rejected, orders_canceled
+    ¦   ¦     - active_stops, active_orders_count
+    ¦   ¦     - avg_latency_ms, connection_state, demo_mode, uptime_seconds
+    ¦   ¦
+    ¦   +-- _get_uptime_seconds() → int
+    ¦   ¦   • По connected_at в ConnectionState
+    ¦   ¦
+    ¦   L-- reset_for_backtest() → None
+    ¦       • Останавливает stop monitor
+    ¦       • Очищает _active_orders / _orders_by_symbol
+    ¦       • Сбрасывает _stats и _connection_state
+    ¦
+    L-- get_active_orders(symbol: Optional[str] = None) → List[Dict[str, Any]]
+        • Возвращает список активных ордеров (фильтр по symbol)
+        • Включает reduce_only, stop_price, status и др.
 
-Ключевые особенности:
-+-- Поддержка трех режимов: LIVE/DEMO/BACKTEST
-+-- Унифицированный интерфейс для всех типов ордеров
-+-- Потокобезопасность через threading.RLock
-+-- Интеллектуальный STOP мониторинг с синхронной проверкой
-+-- Реалистичная эмуляция комиссий и slippage
-+-- Event система для отслеживания состояния
-L-- Полная интеграция с iqts_standards
 
-Интеграция в систему:
+---------------------------------------------------------------------
+Flow входа (ордер):
 
-BotLifecycleManager > _create_exchange_manager() > ExchangeManager
-    v
-EnhancedTradingBot > ExecutionEngineFromExchangeManager > ExchangeManager
-    v
-PositionManager > ExchangeManager (для исполнения ордеров)
+1) Trading/PositionManager формирует OrderReq и вызывает:
+   → ExchangeManager.place_order(order_req)
 
-+-- Flow исполнения ордера (ОБНОВЛЕНО):
-¦   +-- 1. TradeSignalIQTS > TradeSignal (intent-based)
-¦   +-- 2. PositionManager.handle_signal() > OrderReq
-¦   +-- 3. ExchangeManager.place_order(OrderReq)
-¦   +-- 4. Обработка результата с position_id
-¦   L-- 5. Интеграция с TradingLogger
+2) place_order:
+   • нормализует тип ордера и stop_price
+   • валидирует OrderReq через _validate_order_req()
+   • увеличивает счётчик orders_sent
 
-STOP ордера в BACKTEST:
-EnhancedTradingBot._manage_existing_positions()
-    > check_stops_on_price_update(symbol, current_price)
-    > _check_stop_trigger_with_price()
-    > _trigger_stop_order() > on_order_update()
+3) Если ордер STOP/TP:
+   • регистрируется через _place_order_demo()
+   • создаётся ActiveOrder с trigger_price = stop_price
+   • отправляется OrderUpd(status="NEW"/"WORKING")
+   • ордер ожидает триггера (price-feed + STOP монитор / sync-check)
 
-Комиссии и slippage:
-+-- MARKET ордера: 0.1% slippage + 0.04% taker fee
-+-- LIMIT ордера: 0% slippage + 0.02% maker fee  
-+-- STOP ордера: 0.01% slippage + 0.04% taker fee
-L-- BACKTEST режим: минимальный slippage для точности
+4) Если ордер MARKET/LIMIT:
+   • определяется fill_price:
+     - LIMIT: price
+     - MARKET: price_feed(symbol).close, fallback: risk_context / trade_log
+   • проверяется инвариант SL/TP для risk_context
+   • проверяется min_notional по symbols_meta
+   • рассчитывается комиссия (0.04%) и validation_hash
+   • формируется OrderUpd(FILLED) и вызывается on_order_update()
+   • обновляется статистика orders_filled
 
-Статистика и мониторинг:
-+-- orders_sent/filled/rejected/canceled
-+-- active_orders_count, active_stops
-+-- latency_ms, reconnect_count
-+-- connection_state, uptime_seconds
-L-- demo_mode, execution_mode
+
+---------------------------------------------------------------------
+Flow выхода (исполнение / STOP / отмена):
+
+1) Исполнение MARKET/LIMIT:
+   • place_order → мгновенный OrderUpd(FILLED)
+   • on_order_update() обновляет PositionManager/бота
+   • статистика: orders_filled++
+
+2) Исполнение STOP/TP:
+   • STOP зарегистрирован в _active_orders как ActiveOrder с trigger_price
+   • Варианты триггера:
+     a) check_stops_on_price_update(symbol, current_price)
+        - вызывается ботом при закрытии свечи
+        - _check_stop_trigger_with_price(order, current_price) → True?
+        - при True: _remove_active_order() → _trigger_stop_order()
+     b) фоновый _stop_monitor_loop() (если включён)
+        - использует _check_stop_trigger(order) по price_feed
+   • _trigger_stop_order():
+     - формирует OrderUpd(FILLED, reduce_only=True)
+     - вызывает on_order_update()
+     - обновляет статистику orders_filled
+
+3) Trailing обновления:
+   • PositionManager/ExitManager формируют новый STOP с тем же symbol
+   • _place_order_demo():
+     - по correlation_id, содержащему "trail"/"update"/"trailing"
+       → update_stop_order(symbol, new_stop_price, correlation_id)
+     - без создания дублирующих STOP ордеров
+
+4) Отмена ордера:
+   • cancel_order(client_order_id)
+     - DEMO: _cancel_order_demo()
+       → OrderUpd(CANCELED) + _remove_active_order()
+     - LIVE: _cancel_order_live() (пока fallback → DEMO)
+     - обновляет orders_canceled
+
+
+---------------------------------------------------------------------
+Состояния и статистика:
+
+1) Основные внутренние структуры:
+   • _active_orders: Dict[client_order_id → ActiveOrder]
+   • _orders_by_symbol: Dict[symbol → Set[client_order_id]]
+   • _price_feed: PriceFeed (callable(symbol) → candle/price)
+   • _connection_state: ConnectionState
+   • _event_handlers: List[ExchangeEventHandler]
+   • _is_backtest_mode: bool
+   • _use_sync_stop_check: bool (STOP монитор внутри/снаружи)
+   • _stop_monitor_active / _stop_monitor_thread: состояние фонового мониторинга
+
+2) Статистика _stats:
+   • orders_sent, orders_filled, orders_rejected, orders_canceled
+   • reconnects_count
+   • total_latency_ms, latency_samples, avg_latency_ms
+   • active_stops
+   • last_order_ts
+
+3) Диагностика:
+   • get_connection_state() → словарь статуса (DEMO: всегда CONNECTED)
+   • get_stats() → агрегированный срез по всем счётчикам
+   • get_active_orders(symbol) → текущее состояние ордеров по символу
+
+4) Reset для бэктеста:
+   • reset_for_backtest():
+     - останавливает stop monitor
+     - очищает активные ордера и статистику
+     - сбрасывает ConnectionState
+
+
+---------------------------------------------------------------------
+Исключения и обработка ошибок:
+
+1) Классы ошибок:
+   • ExchangeManagerError — базовая ошибка модуля
+   • InvalidOrderError — любая проблема с OrderReq:
+     - отсутствующие/некорректные поля
+     - неверный тип ордера/side
+     - qty/price/stop_price <= 0
+     - отсутствие STOP/price для соответствующих типов
+   • ConnectionError — проблемы подключения к user stream / бирже
+   • ExchangeApiError — ошибка стороннего API (содержит error_code)
+
+2) Основные места генерации ошибок:
+   • _validate_order_req() → InvalidOrderError
+   • update_stop_order() → InvalidOrderError, если нет активного STOP для symbol
+   • connect_user_stream() в LIVE режиме → ConnectionError (пока не реализовано)
+   • place_order():
+     - price_invariant_violation (SL/TP инварианты)
+     - min_notional_violation
+     - execution_error (любая непредвиденная ошибка внутри try)
+   • _compute_validation_hash(), _trigger_stop_order(), _demo_fill_order()
+     - логируют ошибку и возвращают безопасный REJECTED/cleanup
+
+3) Стратегия обработки:
+   • Любые исключения внутри place_order / cancel_order:
+     - ловятся, логируются, возвращается Dict с status="REJECTED"
+   • Ошибки в on_order_update callback:
+     - логируются, но не прерывают внутреннюю очистку состояния
+   • Ошибки в STOP мониторинге:
+     - логируются, цикл продолжает работу или делает паузу (sleep)
+
 =================================================================
 
 ## 15. Модуль: position_manager.py
-Типы данных:
-position_manager.py — единый владелец состояния позиций, PnL и исполнения ордеров
-+-- Роль в системе:
-    +-- Source of Truth для всех активных позиций
-    +-- Преобразование TradeSignalIQTS → OrderReq (с учётом risk_context)
-    +-- Управление стоп-лоссами (включая trailing)
-    +-- Ведение статистики и дедупликации сигналов
-    +-- Интеграция с ExchangeManager (DI) и AdaptiveExitManager
-    L-- Запись в БД через TradingLogger (trade_log)
-+
-+-- Основной класс
-+
-L-- PositionManager
-    +-- Конструктор:
-          symbols_meta: Dict (tick_size, step_size, min_notional и т.д.)
-          db_dsn: str
-          trade_log: TradingLogger
-          price_feed: Optional[PriceFeed]
-          execution_mode: "LIVE"|"DEMO"|"BACKTEST"
-          db_engine: Optional[Engine]
-          signal_validator: Optional[SignalValidator] (DI)
-    +
-    +-- DI-внедрение:
-          L-- set_exchange_manager(em: ExchangeManagerInterface) → обязательно после создания
-          L-- exit_manager: Optional[AdaptiveExitManager] → может быть внедрён позже
-    +
-    +-- Внутреннее состояние:
-          _positions: Dict[str, PositionSnapshot]          → активные позиции
-          _pending_orders: Dict[str, PendingOrder]         → ожидающие исполнения
-          _active_stop_orders: Dict[str, Dict]             → отслеживание стопов (включая trailing)
-          _processed_correlations: deque(maxlen=5000)      → защита от дублей
-          _position_ids: Dict[str, int]                    → кэш id из БД positions
-          _stats: PMStats                                  → счётчики сигналов, ордеров, PnL
-    +
-    +-- Генерация ID:
-          L-- _generate_unique_order_id() → "entry_ETHUSDT_1732023456789_42"
-    +
-    +-- Обработка входящих сигналов
-          L-- handle_signal(signal: TradeSignalIQTS) → List[OrderReq] | None
-                • Дедупликация по correlation_id + validation_hash
-                • Валидация через SignalValidator (если передан)
-                • Проверка на уже открытую позицию (has_active_position)
-                • Расчёт размера позиции из risk_context.position_size
-                • Округление qty по step_size, price по tick_size
-                • Создание entry-ордера (MARKET или LIMIT)
-                • Создание initial stop-loss (STOP_MARKET, reduce_only=True)
-                • При trailing_enabled → создание/обновление trailing stop
-                L-- Все ордера регистрируются в _pending_orders и _active_stop_orders
-    +
-    +-- Управление стоп-лоссами и trailing stop
-          +-- _build_initial_stop_order(signal, entry_price, qty, correlation_id) → OrderReq
-          +-- _build_trailing_stop_order(...) → OrderReq
-          +-- _update_active_stop_tracking(symbol, stop_info)
-          L-- _get_current_stop_price(symbol) → приоритет: ExchangeManager → кэш PM
-    +
-    +-- Обработка обновлений от биржи
-          L-- handle_order_update(update: OrderUpd) → None
-                • Обновление статуса pending_orders
-                • При FULL FILL → создание PositionSnapshot
-                • При стоп-триггере → закрытие позиции, расчёт realized PnL
-                • Удаление из _active_stop_orders при отмене/исполнении
-    +
-    +-- Управление жизненным циклом позиции
-          +-- open_position(signal, entry_fill) → PositionSnapshot
-          +-- close_position(position_id, exit_price, reason) → TradeResult
-          +-- update_position_pnl(symbol, current_price) → обновление unrealized PnL
-          L-- get_position(symbol) → PositionSnapshot | None
-    +
-    +-- Утилиты для расчёта размера
-          +-- _calculate_order_quantity(symbol, usdt_amount) → Decimal (с округлением)
-          +-- _round_price(price, symbol) / _round_qty(qty, symbol)
-          L-- _check_min_notional(symbol, qty, price)
-    +
-    +-- Система событий
-          L-- add_event_handler(handler: EventHandler)
-          L-- _emit_event(event: PositionEvent)
-                → POSITION_OPENED, POSITION_CLOSED, ORDER_PLACED, STOP_UPDATED и т.д.
-    +
-    L-- Статистика и отладка
-          +-- get_stats() → Dict (сигналы, ордера, PnL, дубли и т.д.)
-          +-- get_active_stops() → Dict всех активных стопов
-          L-- has_active_position(symbol) → bool
-		  
-Интеграция в поток данных:
-TradeSignal > PositionManager.handle_signal() > OrderReq > ExchangeManager.place_order()
-    v
-OrderUpd (fill) > PositionManager.update_on_fill() > PositionSnapshot > TradingLogger
-    v
-STOP trigger > PositionManager.on_stop_triggered() > ExchangeManager.check_stops_on_price_update()
 
-Особенности реализации:
-+-- Единый владелец состояния позиций и PnL
-+-- Поддержка всех режимов: LIVE / DEMO / BACKTEST
-+-- Автоматический расчёт размера позиции на основе риск-контекста
-+-- Встроенный трейлинг-стоп с конфигурируемыми параметрами
-+-- Квантование цен и объёмов согласно биржевым правилам
-+-- Управление cooldown между сигналами
-+-- Полная потокобезопасность через threading.RLock
-+-- Event-система для оповещения подписчиков
-+-- Валидация сигналов и защита от дубликатов
-+-- Автоматическое закрытие стоп-ордеров при выходе из позиции
-+-- Сохранение всех операций в БД через TradingLogger
-L-- Поддержка fee_total_usdt для точного расчёта PnL
+Единый владелец состояния позиций и PnL. 
+Концентрирует всю логику: обработку торговых сигналов, построение ордеров, учёт исполнений, управление стопами и взаимодействие с БД через trade_log.
+
+### Основные обязанности модуля:
++ Преобразование TradeSignalIQTS → OrderReq.
++ Ведение in-memory состояния позиций.
++ Создание, модификация и фиксация Entry / Exit / Stop-ордеров.
++ Синхронизация с ExchangeManager (проставление/отмена стопов).
++ Учёт комиссий, PnL, закрытие сделок и обновление БД.
++ Эмит событий PositionEvent в EventBus.
+
+### Структура PositionManager
+
++-- PositionManager
+¦   +-- handle_signal()  
+¦   +-- update_on_fill()  
+¦   +-- build_entry_order()  
+¦   +-- build_exit_order()  
+¦   +-- build_stop_order()  
+¦   +-- quantize_price(), quantize_qty()  
+¦   +-- get_position(), get_open_positions_snapshot()  
+¦   +-- get_stats(), reset_for_backtest()  
+¦   +-- set_exchange_manager()  
+¦   +-- add_event_handler(), _emit_event()  
+¦   +-- _process_entry_fill(), _process_exit_fill()  
+¦   +-- _handle_open_signal(), _handle_close_signal(), _handle_wait_signal()  
+¦   +-- _save_position_to_db(), _init_position_ids_cache()  
+¦   L-- _get_current_stop_price(), _update_active_stop_tracking()
+
+Дополнительные внутренние объекты:
++-- SymbolMeta
++-- PendingOrder
++-- PMStats
+
+### Ключевая логика
+
+1) Обработка сигналов  
+   - Проверка корреляции (dedupe).  
+   - Валидация через встроенный SignalValidator или базовую схему.  
+   - Распределение по intent:
+     • LONG_OPEN / SHORT_OPEN → _handle_open_signal  
+     • LONG_CLOSE / SHORT_CLOSE → _handle_close_signal  
+     • WAIT → trailing stop update через AdaptiveExitManager  
+     • HOLD → игнор  
+   - Каждый OrderReq регистрируется в trade_log, затем эмитится PositionEvent.
+
+2) Открытие позиций (Entry)  
+   - Для Entry обязательно наличие risk_context.position_size.  
+   - decision_price берётся из сигнала.  
+   - Строится MARKET-ордер.  
+   - PendingOrder хранится до FILLED.  
+   - После FILLED:
+     • создаётся PositionSnapshot  
+     • сохраняется в БД (create_position)  
+     • создаётся initial STOP (если приходил risk_context.initial_stop_loss)  
+     • стоп отправляется через ExchangeManager, фиксируется в _active_stop_orders.
+
+3) Закрытие позиций (Exit)  
+   - Полное или частичное закрытие.  
+   - PnL считает по Decimal, с учётом fee_total_usdt.  
+   - Причина закрытия определяется в порядке приоритетов:
+     • is_trailing_stop = True  
+     • STOP_MARKET / STOP → stop loss  
+     • иначе → SIGNAL_EXIT  
+   - При полном закрытии:
+     • позиция обновляется в памяти → FLAT  
+     • закрытие позиции в БД (close_position)  
+     • стопы отменяются (async)  
+     • PositionEvent POSITION_CLOSED.
+
+4) Trailing stop (WAIT)  
+   - WAIT-сигнал обязан содержать metadata.trailing_update_request.  
+   - Через exit_manager.calculate_trailing_stop() вычисляется новый стоп.  
+   - Если стоп изменился → build_stop_order(is_trailing=True)  
+   - Стоп обновляется на бирже (create/update), кэшируется в _active_stop_orders.
+
+5) Управление стоп-ордерами  
+   - Active stop всегда один на символ.  
+   - _get_current_stop_price() использует ExchangeManager как источник истины, fallback — локальный кэш.  
+   - При любом FILLED стопе PM удаляет трекинг и эмитит STOP_ORDER_FILLED.
+
+6) Работа с pending_orders  
+   - Все Entry/Exit/Stop заносятся в _pending_orders.  
+   - После FILLED — удаляются.  
+   - Метаданные pending_orders используются для определения is_trailing_stop, direction, risk_context.
+
+7) Хранение состояния и БД  
+   - В памяти: self._positions, self._active_stop_orders, _symbol_states, _position_ids.  
+   - В БД через trade_log:
+     • create_order_from_req  
+     • update_order_on_upd  
+     • create_position  
+     • update_position  
+     • close_position  
+
+8) Режимы работы (execution_mode)  
+   - LIVE / DEMO / BACKTEST  
+   - В DEMO/BACKTEST используется виртуальный баланс, расширенная логика сброса состояния (reset_for_backtest).
+
+9) Quantize и биржевые ограничения  
+   - quantize_price и quantize_qty учитывают tick_size / step_size символа.  
+   - Проверка min_notional через is_min_notional_met.
+
+### Основные данные
+В памяти для каждого символа:
+- статус позиции  
+- side (LONG/SHORT)  
+- qty (Decimal)  
+- avg_entry_price (Decimal)  
+- unrealized/realized pnl  
+- fee_total_usdt  
+- active_stop (цена, сторона, correlation_id)  
+- trailing state (last update, max pnl, count, timestamps)
+
+### Главный поток работы
+1. Поступает сигнал → handle_signal  
+2. Создаётся и сохраняется ордер  
+3. Когда поступает fill → update_on_fill  
+4. Обработчик entry/exit формирует позицию или закрывает её  
+5. Генерируются события, обновляются стопы  
+6. Вся критическая информация фиксируется в БД через trade_log
+
+
 =================================================================
 ## 16. Модуль: exit_system.py
-Типы данных:
-exit_system.py — адаптивная система управления выходом из позиции (AdaptiveExitManager)
-+-- Роль в системе:
-    +-- Основной источник решений о закрытии позиции
-    +-- Динамическое управление стоп-лоссом (breakeven + trailing)
-    +-- Упреждающий выход по каскадному развороту тренда (1m → 5m)
-    +-- Полная интеграция с PositionManager (DI)
-    L-- Заменяет старый жёсткий ExitManager
-+
-+-- Основные классы
-+
-+-- ExitDecision (TypedDict)
-    +-- should_exit: bool
-    +-- reason: str
-    +-- urgency: "high"|"medium"|"low"
-    +-- confidence: float [0.0–1.0]
-    +-- pnl_pct: float
-    +-- type: "reversal"|"weakening"|"trailing"|"breakeven"
-    +-- new_stop_loss / new_take_profit: Optional[float]
-    +-- trailing_type, stop_distance_pct
-    L-- details: Dict (полные сигналы детекторов)
-+
+
+Модуль отвечает за принятие решений по выходу из позиции:
+- каскадный анализ сигналов (1m → 5m),
+- "жёсткие" выходы (SL/TP/время удержания),
+- защита прибыли (break-even, trailing stop),
+- расчёт адаптивного трейлинг-стопа и обновление стоп-цен.
+
+Структура:
+
++-- ExitDecision (TypedDict, total=False)
+¦   +-- should_exit: bool
+¦   +-- reason: str
+¦   +-- urgency: str
+¦   +-- confidence: float
+¦   +-- details: Dict[str, Any]
+¦   +-- pnl_pct: float
+¦   +-- type: str
+¦   +-- new_stop_loss: Optional[float]
+¦   +-- new_take_profit: Optional[float]
+¦   +-- trailing_type: Optional[str]
+¦   L-- stop_distance_pct: Optional[float]
+¦
 +-- ExitSignalDetector
-    |   Каскадный детектор разворота (младшие ТФ → старшие)
-    |
-    +-- Конструктор:
-    ¦     global_timeframe="5m"
-    ¦     trend_timeframe="1m"
+¦   +-- __init__(global_timeframe: Timeframe = "5m",
+¦   ¦           trend_timeframe: Timeframe = "1m")
+¦   ¦   • global_timeframe  → "старший" ТФ (5m)
+¦   ¦   • trend_timeframe   → "младший" ТФ (1m)
+¦   ¦   • global_detector   → MLGlobalTrendDetector (глобальный тренд)
+¦   ¦   • trend_detector    → RoleBasedOnlineTrendDetector (локальный тренд)
+¦   ¦   • cascading_thresholds:
+¦   ¦     - both_levels_sum
+¦   ¦     - global_hint
+¦   ¦     - lower_tf_min
+¦   ¦     - trend_min
+¦   ¦   • classic_thresholds:
+¦   ¦     - high_global_reversal, high_trend_weak
+¦   ¦     - high_global_hint, medium_trend_weak
+¦   ¦     - medium_trend_hint, low_total
+¦   ¦   • logger
+¦   ¦
+¦   +-- async analyze_exit_signal(
+¦   ¦       data: Dict[Timeframe, pd.DataFrame],
+¦   ¦       position_direction: Direction
+¦   ¦   ) → Dict
+¦   ¦   • validate_market_data(data)
+¦   ¦   • global_signal = global_detector.analyze(data)
+¦   ¦   • trend_signal  = trend_detector.analyze(data)
+¦   ¦   • exit_signals:
+¦   ¦     - global_reversal (полный разворот 5m)
+¦   ¦     - trend_weakening (ослабление тренда 1m)
+¦   ¦     - trend_reversal  (полный разворот 1m)
+¦   ¦   • комбинирует через _combine_exit_signals(...)
+¦   ¦   • возвращает словарь, совместимый с ExitDecision
+¦   ¦
+¦   +-- _check_reversal(signal: DetectorSignal,
+¦   ¦                  position_direction: Direction) → Dict[str, Any]
+¦   ¦   • ok? если нет → detected=False
+¦   ¦   • direction (1/-1/0), confidence
+¦   ¦   • pos_dir = normalize_direction_v2(position_direction)
+¦   ¦   • is_reversal:
+¦   ¦     - BUY позиция, а сигнал SELL
+¦   ¦     - SELL позиция, а сигнал BUY
+¦   ¦   • при развороте:
+¦   ¦     - detected=True
+¦   ¦     - confidence = signal_confidence
+¦   ¦
+¦   +-- _check_weakening(signal: DetectorSignal,
+¦   ¦                   position_direction: Direction) → Dict
+¦   ¦   • Тренд в нашу сторону, но слабый
+¦   ¦   • is_same_direction = (position_direction == signal_direction)
+¦   ¦   • is_weak = (confidence < 0.65) или not ok
+¦   ¦   • is_weakening = is_same_direction and is_weak
+¦   ¦   • при ослаблении:
+¦   ¦     - detected=True
+¦   ¦     - confidence = 1 - signal_confidence
+¦   ¦
+¦   +-- _check_cascading_reversal(signals: Dict,
+¦   ¦                            position_direction: Direction) → Dict
+¦   ¦   • КАСКАДНЫЙ РАЗВОРОТ (младший → старший):
+¦   ¦     1) trend_rev or trend_weak detected
+¦   ¦     2) global_reversal detected
+¦   ¦     3) trend_confidence + global_confidence ≥ both_levels_sum
+¦   ¦     4) global_hint (глобальный ≥ global_hint)
+¦   ¦     5) lower_tf_min (тренд ≥ lower_tf_min)
+¦   ¦   • При выполнении:
+¦   ¦     - detected=True
+¦   ¦     - urgency='high'
+¦   ¦     - reason='cascading_reversal'
+¦   ¦     - confidence = средняя по двум уровням
+¦   ¦     - details: расшифровка каскадного разворота
+¦   ¦
+¦   L-- _combine_exit_signals(signals: Dict,
+¦       ¦                    position_direction: Direction) → Dict
+¦       ¦   • Приоритеты:
+¦       ¦     0) _check_cascading_reversal() → HIGH
+¦       ¦     1) global_reversal (5m, high_global_reversal) → HIGH
+¦       ¦     2) trend_weakening + global_hint → HIGH/MEDIUM
+¦       ¦     3) low_total по взвешенной уверенности → LOW
+¦       ¦   • Возвращает словарь:
+¦       ¦     - should_exit, reason, urgency, confidence, details
+¦       L     - используется как ExitDecision (без новых стоп-полей)
+¦
+L-- AdaptiveExitManager
+    +-- __init__(global_timeframe: Timeframe = "5m",
+    ¦           trend_timeframe: Timeframe = "1m")
+    ¦   • exit_detector = ExitSignalDetector(...)
+    ¦   • trailing_stop_activation = 0.015 (1.5% прибыли)
+    ¦   • trailing_stop_distance  = 0.01  (1% от пика)
+    ¦   • breakeven_activation    = 0.008 (0.8% прибыли)
+    ¦   • max_hold_time_base      = 2 часа
+    ¦   • logger
     ¦
-    +-- Детекторы:
-    ¦     • global_detector → MLGlobalTrendDetector (LightGBM 5m модель)
-    ¦     • trend_detector  → RoleBasedOnlineTrendDetector (1m CUSUM + роль)
+    +-- _calculate_pnl_pct(entry_price: float,
+    ¦                     current_price: float,
+    ¦                     direction: Direction) → float
+    ¦   • Для BUY:  (current - entry) / entry
+    ¦   • Для SELL: (entry - current) / entry
     ¦
-    +-- Пороги (cascading_thresholds):
-    ¦     both_levels_sum ≥ 0.80      → HIGH (каскадный разворот)
-    ¦     global_hint ≥ 0.50          → намёк от 5m
-    ¦     lower_tf_min ≥ 0.55         → сильный сигнал младшего ТФ
-    ¦     trend_min ≥ 0.40            → минимальный сигнал 1m
+    +-- async should_exit_position(
+    ¦       position: Dict,
+    ¦       market_data: Dict[Timeframe, pd.DataFrame],
+    ¦       current_price: float
+    ¦   ) → Tuple[bool, str, ExitDecision]
+    ¦   • Строгая валидация:
+    ¦     - position: dict
+    ¦     - position['signal']: dict
+    ¦     - обязательные поля в signal:
+    ¦       ['direction','entry_price','stop_loss','take_profit']
+    ¦   • Извлекает:
+    ¦     - opened_at, direction, entry_price, stop_loss, take_profit
+    ¦   • pnl_pct = _calculate_pnl_pct(...)
+    ¦   • LAYER 1: _check_hard_exits(...) → hard_exit
+    ¦     - stop_loss_hit / take_profit_hit
+    ¦     - max_hold_time (адаптивный)
+    ¦   • LAYER 2: exit_detector.analyze_exit_signal(...) → signal_exit
+    ¦     - urgency ∈ {high, medium, low}
+    ¦     - high  → всегда выходим (profit/loss)
+    ¦     - medium → выходим только при прибыли (pnl_pct > 0)
+    ¦     - low → игнорируем
+    ¦   • LAYER 3: _check_profit_protection(...) → profit_exit
+    ¦     - break-even / trailing_stop
+    ¦   • Возвращает:
+    ¦     - (True, reason, ExitDecision)  при любом сработавшем условии
+    ¦     - (False, "no_exit_condition", ExitDecision) иначе
     ¦
-    L-- async analyze_exit_signal(data: Dict[TF, pd.DataFrame], position_direction) → Dict
-          • 0. Каскадный разворот (приоритет)
-          1. Глобальный разворот (HIGH)
-          2. Локальный + глобальный намёк
-          3. Ослабление тренда (MEDIUM)
-          4. Разворот младших ТФ
-          5. Общая уверенность (LOW)
-+
-L-- AdaptiveExitManager (главный класс, внедряется в EnhancedTradingBot)
-    +-- Конструктор:
-          global_timeframe="5m", trend_timeframe="1m"
-          breakeven_activation=0.005   # 0.5%
-          trailing_activation=0.015    # 1.5%
-          trailing_distance=0.01       # 1.0%
-    +
-    +-- Состояние позиции:
-          position["exit_tracking"] = {
-              "peak_price": float,
-              "breakeven_moved": bool,
-              "trailing_active": bool
-          }
-    +
-    +-- Основной метод:
-          L-- update_position_stops(position: Dict, current_price: float, market_data: Dict) → Dict
-                • Сначала: ExitSignalDetector.analyze_exit_signal() → should_exit?
-                • Если да → возврат ExitDecision(should_exit=True, ...)
-                • Если нет → расчёт trailing/breakeven:
-                    – update_trailing_state() → new_stop_loss?
-                    – calculate_trailing_stop() → адаптивный trailing
-                • Возврат: new_stop_loss, changed, reason
-    +
-    +-- Управление trailing stop
-          +-- update_trailing_state() → централизованное обновление peak_price, breakeven, trailing_active
-          +-- calculate_trailing_stop() → адаптивный % в зависимости от волатильности (ATR)
-          L-- _get_trailing_config_for_symbol() → fallback на дефолты (совместимость с PositionManager)
-    +
-    L-- Вспомогательные методы:
-          • _check_reversal(), _check_weakening()
-          • _combine_exit_signals()
-          • _get_current_stop_price() → совместимость с PositionManager
+    +-- _check_hard_exits(
+    ¦       direction: Direction,
+    ¦       current_price: float,
+    ¦       stop_loss: float,
+    ¦       take_profit: float,
+    ¦       opened_at: datetime,
+    ¦       pnl_pct: float
+    ¦   ) → Dict
+    ¦   • Жёсткие условия:
+    ¦     1) Стоп-лосс:
+    ¦        - BUY:  current_price <= stop_loss
+    ¦        - SELL: current_price >= stop_loss
+    ¦     2) Тейк-профит:
+    ¦        - BUY:  current_price >= take_profit
+    ¦        - SELL: current_price <= take_profit
+    ¦     3) max_hold_time (адаптивно от pnl_pct):
+    ¦        - base           = 2h
+    ¦        - pnl > +2%      → 1.5 * base
+    ¦        - pnl < -0.5%    → 0.7 * base
+    ¦        - hold_time > max_hold_time → should_exit=True
+    ¦   • Возвращает словарь ('should_exit','reason','type'='hard', ...)
+    ¦
+    +-- _check_profit_protection(
+    ¦       direction: Direction,
+    ¦       current_price: float,
+    ¦       entry_price: float,
+    ¦       pnl_pct: float,
+    ¦       position: Dict
+    ¦   ) → Dict
+    ¦   • Работает только при pnl_pct > 0
+    ¦   • Инициализирует position['exit_tracking'], если отсутствует:
+    ¦     - peak_price
+    ¦     - breakeven_moved
+    ¦     - trailing_active
+    ¦   • Обновляет peak_price по направлению:
+    ¦     - BUY  → max(peak, current)
+    ¦     - SELL → min(peak, current)
+    ¦   • Break-even:
+    ¦     - при pnl_pct ≥ breakeven_activation:
+    ¦       • breakeven_moved = True
+    ¦       • стоп переносится ближе к entry (через update_position_stops)
+    ¦   • Trailing stop:
+    ¦     - при pnl_pct ≥ trailing_stop_activation:
+    ¦       • trailing_active = True
+    ¦       • trailing_stop рассчитывается от peak_price
+    ¦       • при пробое trailing_stop → should_exit=True (trailing_stop_hit)
+    ¦   • Возвращает словарь ('should_exit','reason','type'='protection', ...)
+    ¦
+    +-- update_position_stops(
+    ¦       position: Dict,
+    ¦       current_price: float
+    ¦   ) → Dict
+    ¦   • Использует:
+    ¦     - signal.direction, entry_price, original_stop_loss
+    ¦     - position['exit_tracking']
+    ¦   • pnl_pct = _calculate_pnl_pct(...)
+    ¦   • new_stop_loss = original_stop_loss
+    ¦   • Break-even:
+    ¦     - при pnl_pct ≥ breakeven_activation и breakeven_moved=True:
+    ¦       • BUY:  new_stop_loss = entry * 1.002
+    ¦       • SELL: new_stop_loss = entry * 0.998
+    ¦   • Trailing:
+    ¦     - при trailing_active=True:
+    ¦       • BUY:  new_stop_loss = max(new_stop_loss, peak*(1 - trailing_dist))
+    ¦       • SELL: new_stop_loss = min(new_stop_loss, peak*(1 + trailing_dist))
+    ¦   • Возвращает:
+    ¦     - {'stop_loss': new_stop_loss,
+    ¦        'updated': new_stop_loss != original_stop_loss,
+    ¦        'reason': 'trailing' или 'breakeven'}
+    ¦
+    +-- calculate_trailing_stop(
+    ¦       current_price: float,
+    ¦       entry_price: float,
+    ¦       side: str,              # "LONG" / "SHORT"
+    ¦       max_pnl_percent: float,
+    ¦       current_stop_price: Optional[float] = None,
+    ¦       symbol: str = "UNKNOWN"
+    ¦   ) → Dict[str, Any]
+    ¦   • Жёсткая валидация входных параметров:
+    ¦     - current_price > 0, entry_price > 0
+    ¦     - side ∈ {"LONG","SHORT"}
+    ¦   • trailing_pct       = trailing_stop_distance * 100
+    ¦   • min_distance_pct   = 0.1
+    ¦   • stop_pnl_threshold = max(0, max_pnl_percent - trailing_pct)
+    ¦   • Для side="LONG":
+    ¦     - new_stop = entry * (1 + stop_pnl_threshold/100)
+    ¦     - new_stop > current_stop_price (если задан)
+    ¦     - new_stop < current_price * (1 - min_distance_pct/100)
+    ¦   • Для side="SHORT":
+    ¦     - new_stop = entry * (1 + stop_pnl_threshold/100)
+    ¦     - new_stop < current_stop_price (если задан)
+    ¦     - new_stop > current_price * (1 + min_distance_pct/100)
+    ¦   • Возвращает при успехе:
+    ¦     - new_stop_price, beneficial=True, reason, stop_distance_pct,
+    ¦       trailing_pct, distance_from_entry_pct, entry_price, current_price,
+    ¦       new_stop_loss, new_take_profit=None, trailing_type="adaptive_trailing"
+    ¦   • При ошибках:
+    ¦     - validation_error / calculation_error, beneficial=False
+    ¦
+    +-- update_trailing_state(
+    ¦       position: Dict,
+    ¦       current_price: float
+    ¦   ) → Dict[str, Any]
+    ¦   • Централизованное управление:
+    ¦     - peak_price
+    ¦     - breakeven_moved
+    ¦     - trailing_active
+    ¦   • Инициализирует exit_tracking при отсутствии
+    ¦   • Обновляет peak_price по направлению
+    ¦   • Считает pnl_pct
+    ¦   • При breakeven/trailing условиях:
+    ¦     - изменяет new_stop_loss
+    ¦     - выставляет reason = 'breakeven_adjust' или 'trailing_adjust'
+    ¦   • Возвращает:
+    ¦     - {"new_stop_loss", "changed", "reason", "tracking", "pnl_pct"}
+    ¦
+    L-- _get_trailing_config_for_symbol(symbol: str) → Dict[str, Any]
+        • Пытается загрузить get_trailing_stop_config(symbol) из config.py
+        • При ошибке:
+        •   - логирует предупреждение
+        •   - возвращает дефолты:
+        •     enabled, trailing_percent, min_profit_percent,
+        •     activation_delay_candles, max_updates_per_position,
+        •     price_change_threshold_percent, min_stop_distance_pct
+
+
+---------------------------------------------------------------------
+Flow входа (анализ выхода / обновление стопов):
+
+1) EnhancedTradingBot / PositionManager передаёт:
+   • позицию (position: Dict с полями signal, opened_at, exit_tracking и др.)
+   • market_data: Dict[Timeframe, DataFrame] для 1m/5m
+   • current_price: float (текущая рыночная цена)
+
+2) Для принятия решения о закрытии:
+   → AdaptiveExitManager.should_exit_position(position, market_data, current_price)
+   • LAYER 1: _check_hard_exits(...)
+     - мгновенный выход по SL/TP/времени удержания
+   • LAYER 2: exit_detector.analyze_exit_signal(...)
+     - каскадная логика (1m/5m), HIGH/MEDIUM/LOW urgency
+   • LAYER 3: _check_profit_protection(...)
+     - защита прибыли: break-even и trailing stop
+
+3) Для обновления стоп-цен без закрытия:
+   → AdaptiveExitManager.update_trailing_state(position, current_price)
+   → AdaptiveExitManager.update_position_stops(position, current_price)
+   • возвращают new_stop_loss / updated флаги
+   • далее PositionManager/ExchangeManager обновляют STOP-ордер
+
+
+---------------------------------------------------------------------
+Flow выхода (решение об exit):
+
+1) should_exit_position(..) возвращает:
+   • should_exit: bool
+   • exit_reason: str
+   • decision: ExitDecision (включая pnl_pct и детали)
+
+2) При should_exit=True:
+   • Если reason ∈ {'stop_loss_hit','take_profit_hit','max_hold_time'}:
+     - тип: 'hard'
+     - приоритет: максимальный
+   • Если reason начинается с 'signal_exit_...':
+     - тип: 'signal'
+     - HIGH → немедленный выход (даже с убытком)
+     - MEDIUM → выход только при положительном PnL
+   • Если reason ∈ {'trailing_stop_hit'}:
+     - тип: 'protection'
+     - выход ради фиксации прибыли
+
+3) Торговая система использует решение:
+   • закрывает позицию через PositionManager/ExchangeManager
+   • обновляет статистику и логирование (PnL, причина выхода)
+
+
+---------------------------------------------------------------------
+Состояния:
+
+1) ExitSignalDetector:
+   • global_timeframe / trend_timeframe
+   • global_detector (MLGlobalTrendDetector)
+   • trend_detector (RoleBasedOnlineTrendDetector)
+   • cascading_thresholds / classic_thresholds
+   • logger
+
+2) AdaptiveExitManager:
+   • exit_detector
+   • trailing_stop_activation / trailing_stop_distance
+   • breakeven_activation
+   • max_hold_time_base
+   • logger
+
+3) Внутри position (используется модулем):
+   • signal:
+     - direction, entry_price, stop_loss, take_profit
+   • opened_at: datetime
+   • exit_tracking:
+     - peak_price
+     - breakeven_moved (bool)
+     - trailing_active (bool)
+
+
+---------------------------------------------------------------------
+Исключения и обработка ошибок:
+
+1) Явные классы исключений не определены в модуле, но:
+
+   • calculate_trailing_stop(...)
+     - при некорректных входных:
+       - current_price ≤ 0, entry_price ≤ 0
+       - side not in {"LONG","SHORT"}
+       → ValueError внутри try/except
+       → возвращается dict:
+         - beneficial=False
+         - reason='validation_error: ...'
+         - error=строка ошибки
+
+     - при любых неожиданных ошибках:
+       → логирует с exc_info
+       → возвращает dict:
+         - beneficial=False
+         - reason='calculation_error: ...'
+
+2) should_exit_position(...):
+   • при некорректной position/signal:
+     - логирует error
+     - возвращает:
+       - should_exit=False
+       - reason='invalid_position' / 'invalid_signal' / 'missing_signal_fields'
+       - ExitDecision с соответствующим reason и details
+
+3) validate_market_data(..) в analyze_exit_signal():
+   • при невалидных входных данных:
+     - возвращает заглушку:
+       - should_exit=False
+       - reason='invalid_data'
+       - confidence=0.0
+
+4) _get_trailing_config_for_symbol(symbol):
+   • при ошибке импорта или вызова config.get_trailing_stop_config:
+     - логирует warning
+     - использует безопасные дефолтные значения
+
 		  
 =================================================================================
 ## 17. Модуль: signal_validator.py

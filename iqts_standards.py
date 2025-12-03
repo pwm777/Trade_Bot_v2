@@ -751,8 +751,9 @@ class PositionManagerInterface(Protocol):
 
     def get_stats(self) -> Dict[str, Any]: ...
 
-
-# Добавить в ExchangeManagerInterface (iqts_standards.py, после строки 444):
+    def set_exchange_manager(self, exchange_manager: Any) -> None:
+        """Установить ссылку на ExchangeManager для работы со стоп-ордерами."""
+        ...
 
 @runtime_checkable
 class ExchangeManagerInterface(Protocol):
@@ -772,6 +773,15 @@ class ExchangeManagerInterface(Protocol):
     ) -> None: ...
 
     def get_active_orders(self, symbol: str) -> List[Dict[str, Any]]: ...
+
+    def clear_stops_for_symbol(self, symbol: str) -> None:
+        """
+        Удалить все STOP ордера для символа из внутреннего состояния.
+        Вызывается при закрытии позиции.
+        Args:
+            symbol: Торговый символ (например, 'ETHUSDT')
+        """
+        ...
 
 class ExchangeEvent(TypedDict, total=False):
     """События биржи"""

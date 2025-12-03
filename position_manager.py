@@ -523,10 +523,6 @@ class PositionManager:
                     else:
                         result = cancel_method(order_id)
 
-                    if not isinstance(result, dict):
-                        self.logger.warning(f"Invalid cancel result: {result}")
-                        continue
-
                     status = result.get("status", "UNKNOWN")
 
                     if status == "CANCELED":
@@ -737,11 +733,10 @@ class PositionManager:
         Создаёт новую позицию и сохраняет её в БД.
         """
         try:
-
             filled_qty = fill["filled_qty"]
             avg_price_raw = fill.get("avg_price")
             side = "LONG" if fill["side"] == "BUY" else "SHORT"
-            commission_raw = fill.get("commission", Decimal('0'))
+            commission_raw = fill.get("commission", Decimal("0"))
 
             if not avg_price_raw or filled_qty <= 0:
                 self.logger.warning(f"Invalid fill data in entry: {fill}")
@@ -751,13 +746,19 @@ class PositionManager:
             avg_price_float = float(avg_price_raw)
             commission_float = float(commission_raw)
 
-            # ✅ ДОБАВЛЕНО: Конвертируем в Decimal для внутреннего использования
-            filled_qty_decimal = Decimal(str(filled_qty)) if not isinstance(filled_qty, Decimal) else filled_qty
-            avg_price_decimal = Decimal(str(avg_price_raw)) if not isinstance(avg_price_raw, Decimal) else avg_price_raw
-            commission_decimal = Decimal(str(commission_raw)) if not isinstance(commission_raw, Decimal) else commission_raw
+            # Внутри — работаем в Decimal
+            filled_qty_decimal = (
+                Decimal(str(filled_qty)) if not isinstance(filled_qty, Decimal) else filled_qty
+            )
+            avg_price_decimal = (
+                Decimal(str(avg_price_raw)) if not isinstance(avg_price_raw, Decimal) else avg_price_raw
+            )
+            commission_decimal = (
+                Decimal(str(commission_raw)) if not isinstance(commission_raw, Decimal) else commission_raw
+            )
 
             self.logger.warning(
-                f"🟢 _process_entry_fill CALLED:\n"
+                "🟢 _process_entry_fill CALLED:\n"
                 f"  symbol: {symbol}\n"
                 f"  filled_qty: {filled_qty}\n"
                 f"  avg_price: {avg_price_float:.8f}\n"
@@ -765,20 +766,50 @@ class PositionManager:
                 f"  side: {side}"
             )
 
-            #  Создаём новую позицию с правильными типами
+            # 🔴 СНАЧАЛА пытаемся убрать старый STOP по символу (локальный трекинг + биржа)
+            old_stop_info: Optional[Dict[str, Any]] = self._active_stop_orders.get(symbol)
+            old_client_order_id: Optional[str] = None
+
+            if old_stop_info:
+                old_client_order_id = old_stop_info.get("client_order_id")
+                if old_client_order_id:
+                    self.logger.warning(
+                        f"🗑️ Removing old STOP before creating new position: "
+                        f"{symbol} client_order_id={old_client_order_id}"
+                    )
+
+            # 1) Убираем локальный трекинг
+            if symbol in self._active_stop_orders:
+                self._remove_active_stop_tracking(symbol)
+
+            # 2) Отменяем стоп в ExchangeManager (если есть)
+            if old_client_order_id and self.exchange_manager:
+                try:
+                    cancel_result = self.exchange_manager.cancel_order(old_client_order_id)
+                    self.logger.info(
+                        f"🧹 Exchange STOP cancelled: {symbol} client_order_id={old_client_order_id} "
+                        f"status={cancel_result.get('status', 'UNKNOWN')}"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to cancel STOP on exchange for {symbol} ({old_client_order_id}): {e}",
+                        exc_info=True,
+                    )
+
+            # ✅ Создаём новую позицию с правильными типами
             position = PositionSnapshot(
                 symbol=symbol,
                 status="OPEN",
-                side=cast(Literal["LONG", "SHORT"], side),  # ← Явное приведение типа
-                qty=filled_qty_decimal,                     # ← Decimal
-                avg_entry_price=avg_price_decimal,          # ← Decimal
+                side=cast(Literal["LONG", "SHORT"], side),
+                qty=filled_qty_decimal,
+                avg_entry_price=avg_price_decimal,
                 market_price=avg_price_float,
-                realized_pnl_usdt=Decimal('0'),
-                unrealized_pnl_usdt=Decimal('0'),
+                realized_pnl_usdt=Decimal("0"),
+                unrealized_pnl_usdt=Decimal("0"),
                 created_ts=get_current_timestamp_ms(),
                 updated_ts=get_current_timestamp_ms(),
                 correlation_id=fill.get("client_order_id"),
-                fee_total_usdt=commission_decimal           # ← Decimal вместо float
+                fee_total_usdt=commission_decimal,
             )
 
             # Сохраняем в памяти
@@ -792,100 +823,96 @@ class PositionManager:
             # СОЗДАНИЕ INITIAL STOP ОРДЕРА
             # ════════════════════════════════════════════════════════════
 
-            client_order_id = fill.get('client_order_id')
-            # ✅ ДИАГНОСТИКА #1
-            self.logger.warning(
-                f"🔍 _process_entry_fill DIAGNOSTIC:\n"
-                f"  symbol: {symbol}\n"
-                f"  client_order_id: {client_order_id}\n"
-                f"  in _pending_orders: {client_order_id in self._pending_orders if client_order_id else False}"
-            )
+            client_order_id = fill.get("client_order_id")
 
             if client_order_id and client_order_id in self._pending_orders:
                 pending_order = self._pending_orders[client_order_id]
-                # ✅ ДИАГНОСТИКА #2
-                self.logger.warning(
-                    f"🔍 ENTRY FILL METADATA CHECK:\n"
-                    f"  has metadata: {pending_order.metadata is not None}\n"
-                    f"  metadata keys: {list(pending_order.metadata.keys()) if pending_order.metadata else []}\n"
-                    f"  stops_precomputed: {pending_order.metadata.get('stops_precomputed') if pending_order.metadata else 'N/A'}\n"
-                    f"  has risk_context: {'risk_context' in (pending_order.metadata or {})}"
-                )
 
                 if pending_order.metadata:
-                    stops_precomputed = pending_order.metadata.get('stops_precomputed', False)
-                    risk_context = pending_order.metadata.get('risk_context')
+                    risk_context = pending_order.metadata.get("risk_context")
 
-                    if stops_precomputed and risk_context:
-                        initial_stop_loss = risk_context.get('initial_stop_loss')
+                    if risk_context:
+                        initial_stop_loss = risk_context.get("initial_stop_loss")
 
                         if initial_stop_loss:
                             try:
-                                stop_price = self.quantize_price(symbol, Decimal(str(initial_stop_loss)))
+                                stop_price = self.quantize_price(
+                                    symbol, Decimal(str(initial_stop_loss))
+                                )
 
                                 # Временный сигнал для build_stop_order
-                                temp_signal = {
-                                    'symbol': symbol,
-                                    'direction': pending_order.metadata.get('direction', 1 if side == 'LONG' else -1),
-                                    'entry_price': avg_price_float,
-                                    'metadata': pending_order.metadata
-                                }
+                                temp_signal: TradeSignalIQTS = cast(
+                                    TradeSignalIQTS,
+                                    {
+                                        "symbol": symbol,
+                                        "direction": pending_order.metadata.get(
+                                            "direction", 1 if side == "LONG" else -1
+                                        ),
+                                        "entry_price": avg_price_float,
+                                        "metadata": pending_order.metadata,
+                                    },
+                                )
 
                                 # Создаём STOP ордер
                                 stop_order = self.build_stop_order(
                                     signal=temp_signal,
                                     position=position,
                                     new_stop_price=stop_price,
-                                    is_trailing=False
+                                    is_trailing=False,
                                 )
                                 if stop_order and self.exchange_manager:
-                                    # ✅ СОХРАНЯЕМ в БД ПЕРЕД отправкой на биржу
-                                    if hasattr(self, 'trade_log') and self.trade_log:
+                                    # Принудительно очищаем старые стопы из EM перед созданием нового
+                                    self.exchange_manager.clear_stops_for_symbol(symbol)
+                                    if hasattr(self, "trade_log") and self.trade_log:
                                         stop_position_id = self._position_ids.get(symbol)
                                         if stop_position_id:
-                                            success = self.trade_log.create_order_from_req(stop_order,
-                                                                                           position_id=stop_position_id)
+                                            success = self.trade_log.create_order_from_req(
+                                                stop_order,
+                                                position_id=stop_position_id,
+                                            )
                                             if success:
                                                 self.logger.info(
-                                                    f"✅ Initial stop saved to DB: position_id={stop_position_id}")
+                                                    f"✅ Initial stop saved to DB: "
+                                                    f"position_id={stop_position_id}"
+                                                )
 
-                                    # Отправляем на биржу
-                                    result = self.exchange_manager.place_order(stop_order)
+                                    # 2) Отправляем в ExchangeManager (если доступен)
+                                    if self.exchange_manager:
+                                        result = self.exchange_manager.place_order(stop_order)
+                                        self.logger.info(
+                                            "✅ Initial STOP order created: "
+                                            f"{symbol} @ {float(stop_price):.2f} "
+                                            f"(status={result.get('status')})"
+                                        )
 
-                                    self.logger.info(
-                                        f"✅ Initial STOP order created: {symbol} @ {float(stop_price):.2f} "
-                                        f"(status={result.get('status')})"
-                                    )
-                                if stop_order and self.exchange_manager:
-                                    result = self.exchange_manager.place_order(stop_order)
-
-                                    self.logger.info(
-                                        f"✅ Initial STOP order created: {symbol} @ {float(stop_price):.2f} "
-                                        f"(status={result.get('status')})"
-                                    )
                             except Exception as e:
-                                self.logger.error(f"Failed to create initial STOP order: {e}", exc_info=True)
+                                self.logger.error(
+                                    f"Failed to create initial STOP order: {e}", exc_info=True
+                                )
 
             # Логирование
             self.logger.info(
-                f"Position opened: {symbol} {side} {float(filled_qty_decimal)} @ {avg_price_float:.4f} "
+                "Position opened: "
+                f"{symbol} {side} {float(filled_qty_decimal)} @ {avg_price_float:.4f} "
                 f"entry_fee={commission_float:.6f} USDT"
             )
 
             # Эмит события
-            self._emit_event(PositionEvent(
-                event_type="POSITION_OPENED",
-                symbol=symbol,
-                timestamp_ms=get_current_timestamp_ms(),
-                correlation_id=fill.get("trade_id"),
-                position_data={
-                    "side": side,
-                    "qty": float(filled_qty_decimal),
-                    "entry_price": avg_price_float,
-                    "entry_fee": commission_float,
-                    "correlation_id": fill.get("client_order_id")
-                }
-            ))
+            self._emit_event(
+                PositionEvent(
+                    event_type="POSITION_OPENED",
+                    symbol=symbol,
+                    timestamp_ms=get_current_timestamp_ms(),
+                    correlation_id=fill.get("trade_id"),
+                    position_data={
+                        "side": side,
+                        "qty": float(filled_qty_decimal),
+                        "entry_price": avg_price_float,
+                        "entry_fee": commission_float,
+                        "correlation_id": fill.get("client_order_id"),
+                    },
+                )
+            )
 
         except Exception as e:
             self.logger.error(f"Error processing entry fill for {symbol}: {e}")
@@ -972,14 +999,6 @@ class PositionManager:
                 f"PnL calculation for SHORT: ({entry_price_float:.8f} - {avg_price_float:.8f}) "
                 f"* {float(filled_qty_decimal):.4f} = {float(pnl_decimal):.2f}"
             )
-
-        else:
-            # ✅ FALLBACK: Неизвестный direction
-            self.logger.error(
-                f"❌ Unknown position direction for {symbol}: {position_direction} "
-                f"(position_side={position_side})"
-            )
-            pnl_decimal = Decimal('0')
 
         # Ensure both fees are Decimal
         existing_entry_fee_raw = current_position.get("fee_total_usdt")
@@ -1103,12 +1122,17 @@ class PositionManager:
                     if symbol in self._position_ids:
                         del self._position_ids[symbol]
 
-                    # Проверяем async/sync
-                    cancel_method = self._cancel_stops_for_symbol
-                    if asyncio.iscoroutinefunction(cancel_method):
-                        asyncio.create_task(cancel_method(symbol))
-                    else:
-                        cancel_method(symbol)
+                    # ✅ СИНХРОННАЯ очистка стопов при закрытии
+                    if self.exchange_manager and hasattr(self.exchange_manager, 'clear_stops_for_symbol'):
+                        try:
+                            self.exchange_manager.clear_stops_for_symbol(symbol)
+                            self.logger.info(f"🗑️ Cleared all stops for {symbol} after position close")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to clear stops for {symbol}: {e}")
+
+                    # Удаляем из локального tracking
+                    if hasattr(self, '_remove_active_stop_tracking'):
+                        self._remove_active_stop_tracking(symbol)
                 else:
                     self.logger.error(
                         f"Cannot close position in DB: position_id not found for {symbol}"
@@ -1722,13 +1746,11 @@ class PositionManager:
                          is_trailing: bool = False) -> Optional[OrderReq]:  # ✅ ДОБАВЛЕН параметр
         """
         Построить стоп-ордер (трейлинг-обновление или initial stop).
-
         Args:
             signal: Торговый сигнал
             position: Текущая позиция
             new_stop_price: Новая цена стопа
             is_trailing: True если это trailing stop, False если initial stop
-
         Returns:
             OrderReq или None
         """

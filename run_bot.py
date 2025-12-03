@@ -442,8 +442,8 @@ class BotLifecycleManager:
                 logger.info("🔗 Injected exit_manager into PositionManager")
 
             # Связка execution engine
-            position_manager.execution_engine = exchange_manager
-            logger.info("✅ execution_engine linked to PositionManager")
+            position_manager.set_exchange_manager(exchange_manager)
+            logger.info("ExchangeManager linked to PositionManager via PositionManager.set_exchange_manager()")
 
             # --- Market Aggregator ---
             market_aggregator = await self._create_market_aggregator(
