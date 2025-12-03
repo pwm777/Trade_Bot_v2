@@ -311,13 +311,25 @@ class EnhancedTradingBot:
             self.logger.error(f"Failed to get market_data: {e}")
             return
 
-        # 4. Определяем, есть ли РЕАЛЬНО открытая позиция
+        # 4.  Определяем, есть ли РЕАЛЬНО открытая позиция
         has_executed_position = False
+
         try:
-            if hasattr(self, "position_tracker") and self.position_tracker is not None:
-                has_executed_position = self.position_tracker.has_active_position(symbol)
+            # ✅ ПРАВИЛЬНО: Проверяем через PositionManager
+            position_manager = getattr(self.execution_engine, 'position_manager', None)
+
+            if position_manager:
+                position = position_manager.get_position(symbol)
+                if position and position.get('status') not in ('FLAT', 'CLOSED'):
+                    has_executed_position = True
+                    self.logger.debug(f"Active position found in PositionManager: {symbol}")
+            else:
+                # Fallback на PositionTracker
+                if hasattr(self, "position_tracker") and self.position_tracker:
+                    has_executed_position = self.position_tracker.has_active_position(symbol)
+
         except Exception as e:
-            self.logger.error(f"Error checking active position for {symbol}: {e}")
+            self.logger.error(f"Error checking position: {e}")
             has_executed_position = False
 
         # =================================================================
@@ -1495,6 +1507,7 @@ class PositionTracker:
         self.positions[position_id] = {
             **position_data,
             'symbol': symbol,
+            'status': 'OPEN',
             'unrealized_pnl': 0.0,
             'last_update': datetime.now(),
             'last_price': signal.get('entry_price', 0.0)

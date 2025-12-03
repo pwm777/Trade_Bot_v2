@@ -789,6 +789,52 @@ class PositionManager:
             # Сохраняем в БД
             self._save_position_to_db(position, is_new=True)
 
+            # ════════════════════════════════════════════════════════════
+            # СОЗДАНИЕ INITIAL STOP ОРДЕРА
+            # ════════════════════════════════════════════════════════════
+
+            client_order_id = fill.get('client_order_id')
+
+            if client_order_id and client_order_id in self._pending_orders:
+                pending_order = self._pending_orders[client_order_id]
+
+                if pending_order.metadata:
+                    stops_precomputed = pending_order.metadata.get('stops_precomputed', False)
+                    risk_context = pending_order.metadata.get('risk_context')
+
+                    if stops_precomputed and risk_context:
+                        initial_stop_loss = risk_context.get('initial_stop_loss')
+
+                        if initial_stop_loss:
+                            try:
+                                stop_price = self.quantize_price(symbol, Decimal(str(initial_stop_loss)))
+
+                                # Временный сигнал для build_stop_order
+                                temp_signal = {
+                                    'symbol': symbol,
+                                    'direction': pending_order.metadata.get('direction', 1 if side == 'LONG' else -1),
+                                    'entry_price': avg_price_float,
+                                    'metadata': pending_order.metadata
+                                }
+
+                                # Создаём STOP ордер
+                                stop_order = self.build_stop_order(
+                                    signal=temp_signal,
+                                    position=position,
+                                    new_stop_price=stop_price,
+                                    is_trailing=False
+                                )
+
+                                if stop_order and self.exchange_manager:
+                                    result = self.exchange_manager.place_order(stop_order)
+
+                                    self.logger.info(
+                                        f"✅ Initial STOP order created: {symbol} @ {float(stop_price):.2f} "
+                                        f"(status={result.get('status')})"
+                                    )
+                            except Exception as e:
+                                self.logger.error(f"Failed to create initial STOP order: {e}", exc_info=True)
+
             # Логирование
             self.logger.info(
                 f"Position opened: {symbol} {side} {float(filled_qty_decimal)} @ {avg_price_float:.4f} "
@@ -1527,7 +1573,9 @@ class PositionManager:
                     "signal_intent": signal.get("intent"),
                     "decision_price": float(decision_price),
                     "created_at": get_current_timestamp_ms(),
-                    "stops_precomputed": signal.get("stops_precomputed", False)
+                    "stops_precomputed": signal.get("stops_precomputed", False),
+                    "risk_context": signal.get("risk_context"),
+                    "direction": signal.get("direction")
                 }
             )
 
