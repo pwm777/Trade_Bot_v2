@@ -145,7 +145,7 @@ class ThreeLevelHierarchicalConfirmator(Detector):
         self.logger.addHandler(console_handler)
 
         # Отключаем propagation чтобы избежать дублирования
-        self.logger.propagate = False
+        self.logger.propagate = True
 
     def get_required_bars(self) -> Dict[Timeframe, int]:
         """Объединенные требования от всех трех детекторов"""
@@ -583,19 +583,15 @@ class ThreeLevelHierarchicalConfirmator(Detector):
 
     # Строки 498-512
 
-    def _check_two_level_consistency(
-            self,
-            global_signal: DetectorSignal,
-            trend_signal: DetectorSignal
-    ) -> Dict[str, Any]:
+    def _check_two_level_consistency(self, global_signal, trend_signal):
         """
         Проверяет согласованность между глобальным и трендовым детекторами.
 
         Логика:
-        1. FLAT на глобальном уровне (direction=0) - всегда валиден
-        2. Направления совпадают - согласованы
-        3. Trend=FLAT, но global сильный - может быть согласован (с пониженной уверенностью)
-        4. Направления противоположны - несогласованы
+        1.  FLAT на глобальном уровне → не входим (нет тренда)
+        2.  Направления СОВПАДАЮТ → ВХОДИМ!  (идеальная ситуация)
+        3. Global тренд, Trend FLAT → ЖДЁМ подтверждения
+        4. Направления ПРОТИВОПОЛОЖНЫ → ЖДЁМ разрешения конфликта
         """
         global_dir = int(global_signal.get('direction', 0))
         trend_dir = int(trend_signal.get('direction', 0))
@@ -607,11 +603,11 @@ class ThreeLevelHierarchicalConfirmator(Detector):
         # ═══════════════════════════════════════════════════════════
         if global_dir == 0:
             self.logger.info(
-                f"🔵 Global FLAT detected (conf={global_conf:.2f}). "
-                f"Trend direction ({trend_dir}) is informational only."
+                f"🔵 Global FLAT detected (conf={global_conf:.2f}).  "
+                f"No trend - no entry."
             )
             return {
-                'consistent': True,
+                'consistent': True,  # Формально согласовано (оба не входим)
                 'reason': 'global_flat_confirmed',
                 'final_direction': 0,
                 'global_direction': global_dir,
@@ -621,14 +617,15 @@ class ThreeLevelHierarchicalConfirmator(Detector):
             }
 
         # ═══════════════════════════════════════════════════════════
-        # ПРИОРИТЕТ 2: Направления совпадают (включая оба FLAT)
+        # ПРИОРИТЕТ 2: Направления СОВПАДАЮТ (оба BUY или оба SELL)
         # ═══════════════════════════════════════════════════════════
         if global_dir == trend_dir:
             self.logger.info(
-                f"✅ Directions MATCH: global={global_dir}, trend={trend_dir}"
+                f"✅ Directions MATCH: global={global_dir}, trend={trend_dir} "
+                f"(conf: global={global_conf:.2f}, trend={trend_conf:.2f})"
             )
             return {
-                'consistent': True,
+                'consistent': True,  # ✅ СОГЛАСОВАНЫ - РАЗРЕШАЕМ ВХОД!
                 'reason': 'directions_aligned',
                 'final_direction': global_dir,
                 'global_direction': global_dir,
@@ -638,47 +635,38 @@ class ThreeLevelHierarchicalConfirmator(Detector):
             }
 
         # ═══════════════════════════════════════════════════════════
-        # ПРИОРИТЕТ 3: Global тренд, Trend = FLAT
+        # ПРИОРИТЕТ 3: Global тренд, Trend FLAT
         # ═══════════════════════════════════════════════════════════
         if global_dir != 0 and trend_dir == 0:
-            # Проверяем силу глобального сигнала
-            if global_conf >= self.min_global_confidence:
-                self.logger.info(
-                    f"⚡ Strong global trend (dir={global_dir}, conf={global_conf:.2f}) "
-                    f"with FLAT local trend - accepting with reduced confidence"
-                )
-                return {
-                    'consistent': True,
-                    'reason': 'strong_global_overrides_flat_trend',
-                    'final_direction': global_dir,
-                    'global_direction': global_dir,
-                    'trend_direction': trend_dir,
-                    'global_confidence': global_conf,
-                    'trend_confidence': trend_conf,
-                    'adjusted_confidence': global_conf * 0.8  # Снижение на 20%
-                }
-            else:
-                self.logger.warning(
-                    f"⚠️ Weak global trend (conf={global_conf:.2f}) + FLAT local trend"
-                )
-                return {
-                    'consistent': False,
-                    'reason': 'weak_signals',
-                    'final_direction': 0,
-                    'global_direction': global_dir,
-                    'trend_direction': trend_dir,
-                    'global_confidence': global_conf,
-                    'trend_confidence': trend_conf
-                }
+            self.logger.info(
+                f"⏳ Global trend detected: dir={global_dir}, conf={global_conf:.2f}, "
+                f"but NO local 1m confirmation (trend=FLAT, conf={trend_conf:.2f})"
+            )
+            self.logger.info(
+                f"⏸️  WAITING for 1m trend to confirm {global_dir} direction"
+            )
+            return {
+                'consistent': False,  # ❌ НЕ СОГЛАСОВАНЫ - БЛОКИРУЕМ!
+                'reason': 'awaiting_local_confirmation',
+                'final_direction': 0,
+                'global_direction': global_dir,
+                'trend_direction': trend_dir,
+                'global_confidence': global_conf,
+                'trend_confidence': trend_conf
+            }
 
         # ═══════════════════════════════════════════════════════════
-        # ПРИОРИТЕТ 4: Направления противоположны (BUY vs SELL)
+        # ПРИОРИТЕТ 4: Направления ПРОТИВОПОЛОЖНЫ (BUY vs SELL)
         # ═══════════════════════════════════════════════════════════
         self.logger.warning(
-            f"❌ Directions OPPOSITE: global={global_dir}, trend={trend_dir}"
+            f"❌ Directions OPPOSITE: global={global_dir} (conf={global_conf:.2f}), "
+            f"trend={trend_dir} (conf={trend_conf:.2f})"
+        )
+        self.logger.info(
+            f"⏳ WAITING for conflict resolution (trends to align or global to change)"
         )
         return {
-            'consistent': False,
+            'consistent': False,  # ❌ НЕ СОГЛАСОВАНЫ - БЛОКИРУЕМ!
             'reason': 'direction_disagreement',
             'final_direction': 0,
             'global_direction': global_dir,

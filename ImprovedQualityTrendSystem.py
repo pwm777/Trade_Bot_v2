@@ -62,7 +62,7 @@ class ImprovedQualityTrendSystem(TradingSystemInterface):
             self.logger.addHandler(console_handler)
 
             # Отключаем propagation чтобы избежать дублирования
-            self.logger.propagate = False
+            self.logger.propagate = True
 
         self.data_provider = data_provider
         self._last_reset_date = datetime.now().date()
