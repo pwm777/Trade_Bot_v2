@@ -382,7 +382,6 @@ def get_default_config():
             'quality_detector': {
                 'global_timeframe': '5m',
                 'trend_timeframe': '1m',
-                'entry_timeframe': '1m',
                 'max_daily_trades': 15,
                 'min_volume_ratio': 1.3,
                 'max_volatility_ratio': 1.4,
@@ -402,8 +401,8 @@ def get_default_config():
                 'atr_periods': 14,
 
                 # ✅ ИСПРАВЛЕНО: Уменьшен SL, увеличен TP
-                'stop_atr_multiplier': 0.5,  # SL ~0.2% (было 2.0)
-                'tp_atr_multiplier': 2.5  # TP ~1.0% (было 3. 0)
+                'stop_atr_multiplier': 1.1,  # SL ~0.4% (было 2.0)
+                'tp_atr_multiplier': 1.5  # TP ~1.0% (было 3. 0)
             },
 
             # ✅ НОВОЕ: Конфигурация Exit Manager

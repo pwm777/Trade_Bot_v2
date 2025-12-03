@@ -754,6 +754,9 @@ class PositionManagerInterface(Protocol):
     def set_exchange_manager(self, exchange_manager: Any) -> None:
         """Установить ссылку на ExchangeManager для работы со стоп-ордерами."""
         ...
+    def reset_for_backtest(self) -> None:
+        """Очистить состояние перед запуском backtest (in-memory + БД)."""
+        ...
 
 @runtime_checkable
 class ExchangeManagerInterface(Protocol):
@@ -774,13 +777,10 @@ class ExchangeManagerInterface(Protocol):
 
     def get_active_orders(self, symbol: str) -> List[Dict[str, Any]]: ...
 
-    def clear_stops_for_symbol(self, symbol: str) -> None:
-        """
-        Удалить все STOP ордера для символа из внутреннего состояния.
-        Вызывается при закрытии позиции.
-        Args:
-            symbol: Торговый символ (например, 'ETHUSDT')
-        """
+    def clear_stops_for_symbol(self, symbol: str) -> None:...
+
+    def reset_for_backtest(self) -> None:
+        """Очистить состояние перед запуском backtest (активные ордера, статистика)."""
         ...
 
 class ExchangeEvent(TypedDict, total=False):

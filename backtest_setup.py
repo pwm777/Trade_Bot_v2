@@ -258,6 +258,7 @@ async def build_backtest_config() -> dict:
         "symbols": test_symbols,
         "trading_symbols": test_symbols,
         "enable_trading": True,
+
         "backtest": {
             "start_time_ms": int(start_ts),
             "end_time_ms": int(end_ts),
@@ -265,13 +266,54 @@ async def build_backtest_config() -> dict:
             "data_source": "database",
             "auto_shutdown": True,
             "period_description": f"Complete historical range ({duration_days:.1f} days)",
-            "timeframe": tf or "auto",  # для прозрачности в логах
+            "timeframe": tf or "auto",
         },
+
         "strategy": {
             "name": "CornEMA",
             "parameters": strategy_params,
             "history_window": 50
+        },
+
+        # ✅ ДОБАВЬТЕ ЭТО:
+        "trading_system": {
+            "account_balance": 100000,
+            "max_daily_trades": 15,
+            "max_daily_loss": 0.02,
+
+            "quality_detector": {
+                "global_timeframe": "5m",
+                "trend_timeframe": "1m",
+                "max_daily_trades": 15,
+                "min_volume_ratio": 1.3,
+            "max_volatility_ratio": 1.4,
+
+            "global_detector": {
+                "timeframe": "5m",
+                "model_path": "models/ml_global_5m_lgbm.joblib",
+                "use_fallback": False,
+                "name": "ml_global_5m"
+            }
+        },
+
+        "risk_management": {
+            "max_position_risk": 0.02,
+            "max_daily_loss": 0.05,
+            "atr_periods": 14,
+            "stop_atr_multiplier": 0.5,  # SL ~0.2%
+            "tp_atr_multiplier": 2.5  # TP ~1.0%
+        },
+
+        # ✅ КЛЮЧЕВАЯ СЕКЦИЯ!
+        "exit_management": {
+            "trailing_stop_activation": 0.015,  # 1.5%
+            "trailing_stop_distance": 0.01,  # 1. 0%
+            "breakeven_activation": 0.008,  # 0.8%
+            "max_hold_time_hours": 6,  # 6 часов
+            "min_bars_before_signal_exit": 10,  # 10 баров (50 мин)
+            "min_profit_for_early_exit": 0.008  # 0.8%
         }
+    }
     })
 
     return runtime_cfg

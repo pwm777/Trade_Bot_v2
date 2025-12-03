@@ -40,7 +40,6 @@ from market_aggregator import MarketAggregatorFactory
 from ImprovedQualityTrendSystem import ImprovedQualityTrendSystem
 from signal_validator import SignalValidator
 from trading_logger import TradingLogger
-from exit_system import AdaptiveExitManager
 import config as cfg
 import os
 
@@ -809,14 +808,39 @@ class BotLifecycleManager:
         logger.info("Creating AdaptiveExitManager")
 
         try:
+            from exit_system import AdaptiveExitManager
+
+            # ✅ ДИАГНОСТИКА #1: Проверяем self.config
+            print("\n" + "=" * 70)
+            print("🔍 run_bot.py: _create_exit_manager() DIAGNOSTIC")
+            print("=" * 70)
+            print(f"✅ self.config type: {type(self.config)}")
+            print(f"✅ self.config is not None: {self.config is not None}")
+
+            if self.config:
+                print(f"✅ self.config keys: {list(self.config.keys())}")
 
             # ✅ ЧИТАЕМ КОНФИГ
             trading_system_cfg = self.config.get("trading_system", {})
 
+            print(f"\n✅ trading_system_cfg type: {type(trading_system_cfg)}")
+            print(f"✅ trading_system_cfg is not None: {trading_system_cfg is not None}")
+
+            if trading_system_cfg:
+                print(f"✅ trading_system_cfg keys: {list(trading_system_cfg.keys())}")
+                print(f"✅ 'exit_management' in trading_system_cfg: {'exit_management' in trading_system_cfg}")
+
+                if 'exit_management' in trading_system_cfg:
+                    print(f"✅ exit_management = {trading_system_cfg['exit_management']}")
+            else:
+                print("⚠️ trading_system_cfg is EMPTY!")
+
+            print("=" * 70 + "\n")
+
             exit_manager = AdaptiveExitManager(
                 global_timeframe=cast(Literal["1m", "5m", "15m", "1h"], "5m"),
                 trend_timeframe=cast(Literal["1m", "5m", "15m", "1h"], "1m"),
-                config=trading_system_cfg  # ✅ ТЕПЕРЬ РАБОТАЕТ!
+                config=trading_system_cfg  # ✅ ПЕРЕДАЁМ
             )
 
             logger.info("AdaptiveExitManager created successfully with config")
@@ -2263,8 +2287,31 @@ async def run_backtest_mode():
 
     try:
         print("🚀 Starting backtest...")
+
+        # ✅ ДОБАВЬТЕ ЭТО: Создаём компоненты для доступа к PM/EM
+        print("🔧 Creating bot components...")
+        await bot_manager._create_components()
+
+        # ✅ ОЧИСТКА СОСТОЯНИЯ ПЕРЕД BACKTEST
+        if bot_manager._components:
+            print("🧹 Resetting components for backtest...")
+
+            # 1. Очистка PositionManager
+            if hasattr(bot_manager._components, 'position_manager') and bot_manager._components.position_manager:
+                bot_manager._components.position_manager.reset_for_backtest()
+                print("✅ PositionManager reset completed")
+
+            # 2. Очистка ExchangeManager
+            if hasattr(bot_manager._components, 'exchange_manager') and bot_manager._components.exchange_manager:
+                bot_manager._components.exchange_manager.reset_for_backtest()
+                print("✅ ExchangeManager reset completed")
+
+            print("✅ All components reset for backtest")
+
+        # ✅ ТЕПЕРЬ запускаем backtest
         await bot_manager.start()
         await bot_manager.wait_for_shutdown()
+
     except KeyboardInterrupt:
         print("\nℹ️  Received interrupt signal")
     except Exception as e:
@@ -2275,7 +2322,6 @@ async def run_backtest_mode():
         print("🔄 Shutting down...")
         await bot_manager.stop()
         print("✅ Shutdown complete")
-
 
 if __name__ == "__main__":
 

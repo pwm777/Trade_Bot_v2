@@ -962,6 +962,21 @@ class TradingLogger:
             self.logger.error(f"Error getting orders for position {position_id}: {e}")
             return []
 
+    def clear_trading_tables_for_backtest(self) -> None:
+        """Очистка торговых таблиц перед новым backtest"""
+        try:
+            with self.trades_engine.begin() as conn:
+                conn.execute(text("DELETE FROM trades"))
+                conn.execute(text("DELETE FROM positions"))
+                conn.execute(text("DELETE FROM orders"))
+                conn.execute(text("DELETE FROM positions_risk_audit"))
+
+            self.logger.info("✅ Trading tables cleared for backtest")
+
+        except Exception as e:
+            self.logger.error(f"Error clearing trading tables: {e}")
+            raise
+
     def _create_trade_record_from_position(self, position, gross_pnl_usdt: Decimal = None,
                                            gross_pnl_pct: Decimal = None):
         """Создать trade record из закрытой позиции."""

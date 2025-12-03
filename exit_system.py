@@ -343,25 +343,82 @@ class AdaptiveExitManager:
     def __init__(self,
                  global_timeframe: Timeframe = "5m",
                  trend_timeframe: Timeframe = "1m",
-                 config: Optional[Dict[str, Any]] = None):  # ✅ ДОБАВЛЕНО
+                 config: Optional[Dict[str, Any]] = None):
+
+        # ✅ ОТЛАДОЧНЫЙ ПРИНТ #1: Проверка что config пришёл
+        print("\n" + "=" * 70)
+        print("🔧 AdaptiveExitManager.__init__() CALLED")
+        print("=" * 70)
+        print(f"✅ config parameter received: {config is not None}")
+        print(f"✅ config type: {type(config)}")
+
+        # ✅ ИСПРАВЛЕНО: Проверяем is not None вместо if config
+        if config is not None:
+            print(f"✅ config keys: {list(config.keys())}")
+            print(f"✅ 'exit_management' in config: {'exit_management' in config}")
+
+            # ✅ ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА
+            if 'exit_management' in config:
+                print(f"✅ exit_management content: {config['exit_management']}")
+            else:
+                print("⚠️ 'exit_management' NOT FOUND in config!")
+        else:
+            print("⚠️ config is None - using default values!")
 
         # Детектор сигналов на выход (с каскадной логикой)
         self.exit_detector = ExitSignalDetector(
             global_timeframe=global_timeframe,
             trend_timeframe=trend_timeframe
         )
+
+        # ✅ ЧИТАЕМ КОНФИГ
         exit_config = config.get('exit_management', {}) if config else {}
+
+        # ✅ ОТЛАДОЧНЫЙ ПРИНТ #2: Что внутри exit_management
+        print(f"\n📋 exit_management config:")
+        if exit_config:
+            for key, value in exit_config.items():
+                print(f"  {key}: {value}")
+        else:
+            print("  ⚠️ exit_management section is EMPTY or missing!")
+
         # Параметры трейлинг стопа
-        self.trailing_stop_activation = 0.015  # 1.5% прибыли
-        self.trailing_stop_distance = 0.01  # 1% от пика
+        self.trailing_stop_activation = exit_config.get('trailing_stop_activation', 0.015)
+        self.trailing_stop_distance = exit_config.get('trailing_stop_distance', 0.01)
 
         # Параметры защиты прибыли
-        self.breakeven_activation = 0.008  # 0.8% прибыли
+        self.breakeven_activation = exit_config.get('breakeven_activation', 0.008)
 
-        # Максимальное время удержания (адаптивное)
-        self.max_hold_time_base = timedelta(hours=2)
+        # Максимальное время удержания
+        max_hold_hours = exit_config.get('max_hold_time_hours', 2)
+        self.max_hold_time_base = timedelta(hours=max_hold_hours)
+
+        # ✅ НОВЫЕ ПАРАМЕТРЫ
+        self.min_bars_before_signal_exit = exit_config.get('min_bars_before_signal_exit', 10)
+        self.min_profit_for_early_exit = exit_config.get('min_profit_for_early_exit', 0.008)
+
+        # ✅ ОТЛАДОЧНЫЙ ПРИНТ #3: Итоговые значения
+        print(f"\n📊 FINAL VALUES:")
+        print(f"  trailing_stop_activation: {self.trailing_stop_activation * 100:.1f}%")
+        print(f"  trailing_stop_distance: {self.trailing_stop_distance * 100:.1f}%")
+        print(f"  breakeven_activation: {self.breakeven_activation * 100:.1f}%")
+        print(f"  max_hold_time: {max_hold_hours} hours")
+        print(f"  min_bars_before_signal_exit: {self.min_bars_before_signal_exit}")
+        print(f"  min_profit_for_early_exit: {self.min_profit_for_early_exit * 100:.1f}%")
+        print("=" * 70 + "\n")
 
         self.logger = logging.getLogger(self.__class__.__name__)
+
+        # ✅ ЛОГИРОВАНИЕ В LOGGER
+        self.logger.info(
+            f"AdaptiveExitManager initialized:\n"
+            f"  trailing_activation: {self.trailing_stop_activation * 100:.1f}%\n"
+            f"  trailing_distance: {self.trailing_stop_distance * 100:.1f}%\n"
+            f"  breakeven_activation: {self.breakeven_activation * 100:.1f}%\n"
+            f"  max_hold_time: {max_hold_hours} hours\n"
+            f"  min_bars_before_signal_exit: {self.min_bars_before_signal_exit}\n"
+            f"  min_profit_for_early_exit: {self.min_profit_for_early_exit * 100:.1f}%"
+        )
 
     def _calculate_pnl_pct(self,
                            entry_price: float,

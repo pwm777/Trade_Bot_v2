@@ -71,7 +71,7 @@ from iqts_detectors import (
 
 class ThreeLevelHierarchicalConfirmator(Detector):
     """
-    3-уровневый иерархический конфирматор
+    2-уровневый иерархический конфирматор
     Глобальный тренд (5m) → Локальный тренд (1m)
     """
 

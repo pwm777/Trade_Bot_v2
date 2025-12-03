@@ -137,10 +137,7 @@ class EnhancedTradingBot:
         trend_tf = cast(
             Literal["1m", "5m", "15m", "1h"],
             quality_config.get('trend_timeframe', '1m')
-        )
-        entry_tf = cast(
-            Literal["1m", "5m", "15m", "1h"],
-            quality_config.get('entry_timeframe', '1m')
+
         )
 
         if exit_manager is not None:
@@ -148,7 +145,7 @@ class EnhancedTradingBot:
             self.exit_manager = exit_manager
             self.logger.info(
                 f"✅ AdaptiveExitManager injected via DI: "
-                f"global={global_tf}, trend={trend_tf}, entry={entry_tf}"
+                f"global={global_tf}, trend={trend_tf}, "
             )
         else:
             # Старое поведение: создаём свой экземпляр
@@ -158,7 +155,7 @@ class EnhancedTradingBot:
             )
             self.logger.info(
                 f"✅ AdaptiveExitManager created: "
-                f"global={global_tf}, trend={trend_tf}, entry={entry_tf}"
+                f"global={global_tf}, trend={trend_tf}, "
             )
 
         # Система мониторинга
