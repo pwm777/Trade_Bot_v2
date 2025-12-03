@@ -390,7 +390,7 @@ def get_default_config():
                 # ⚠️ ДОБАВЬТЕ КОНФИГ ДЛЯ ГЛОБАЛЬНОГО ДЕТЕКТОРА
                 'global_detector': {
                     'timeframe': '5m',
-                    'model_path': 'models/ml_global_5m_lgbm.joblib',
+                    'model_path': 'models/ml_global_5m_lgbm. joblib',
                     'use_fallback': False,
                     'name': 'ml_global_5m'
                 }
@@ -400,22 +400,33 @@ def get_default_config():
                 'max_position_risk': 0.02,
                 'max_daily_loss': 0.05,
                 'atr_periods': 14,
-                'stop_atr_multiplier': 2.0,
-                'tp_atr_multiplier': 3.0
-            }
-        },
 
+                # ✅ ИСПРАВЛЕНО: Уменьшен SL, увеличен TP
+                'stop_atr_multiplier': 0.5,  # SL ~0.2% (было 2.0)
+                'tp_atr_multiplier': 2.5  # TP ~1.0% (было 3. 0)
+            },
 
-        'monitoring': {
-            'enabled': True,
-            'telegram': {'enabled': False},
-            'email': {'enabled': False}
-        },
-
-        'logging': {
-            'file_enabled': True,
-            'file_path': 'enhanced_trading_bot.log'
+            # ✅ НОВОЕ: Конфигурация Exit Manager
+            'exit_management': {
+                'trailing_stop_activation': 0.015,  # 1.5% для активации trailing
+            'trailing_stop_distance': 0.01,  # 1% от пика
+            'breakeven_activation': 0.008,  # 0.8% для breakeven
+            'max_hold_time_hours': 6,  # 6 часов максимум (было 2)
+            'min_bars_before_signal_exit': 10,  # 10 баров (50 мин) минимум
+            'min_profit_for_early_exit': 0.008  # 0.8% для раннего выхода
         }
+    },
+
+    'monitoring': {
+        'enabled': True,
+        'telegram': {'enabled': False},
+        'email': {'enabled': False}
+    },
+
+    'logging': {
+        'file_enabled': True,
+        'file_path': 'enhanced_trading_bot.log'
+    }
     }
 
 async def build_runtime_config(trading_logger: Optional[Any] = None) -> Dict[str, Any]:
