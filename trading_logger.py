@@ -1010,7 +1010,7 @@ class TradingLogger:
                 "fee_total": position.get("fee_total_usdt"),
                 "duration_seconds": duration_seconds,
                 "reason": position.get("reason_entry", "SIGNAL"),
-                "exit_reason": position.get("reason_exit", "SIGNAL"),
+                "exit_reason": position.get("reason_exit", "UNKNOWN"),
                 "bars_in_trade": bars_in_trade
             }
 

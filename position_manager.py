@@ -824,7 +824,23 @@ class PositionManager:
                                     new_stop_price=stop_price,
                                     is_trailing=False
                                 )
+                                if stop_order and self.exchange_manager:
+                                    # ✅ СОХРАНЯЕМ в БД ПЕРЕД отправкой на биржу
+                                    if hasattr(self, 'trade_log') and self.trade_log:
+                                        stop_position_id = self._position_ids.get(symbol)
+                                        if stop_position_id:
+                                            self.trade_log.create_order_from_req(stop_order,
+                                                                                 position_id=stop_position_id)
+                                            self.logger.debug(
+                                                f"Initial stop order saved to DB: position_id={stop_position_id}")
 
+                                    # Отправляем на биржу
+                                    result = self.exchange_manager.place_order(stop_order)
+
+                                    self.logger.info(
+                                        f"✅ Initial STOP order created: {symbol} @ {float(stop_price):.2f} "
+                                        f"(status={result.get('status')})"
+                                    )
                                 if stop_order and self.exchange_manager:
                                     result = self.exchange_manager.place_order(stop_order)
 
@@ -858,8 +874,6 @@ class PositionManager:
 
         except Exception as e:
             self.logger.error(f"Error processing entry fill for {symbol}: {e}")
-
-
 
     def _process_exit_fill(
             self,
@@ -1054,10 +1068,22 @@ class PositionManager:
                         self.logger.error(f"Failed to load position_id from DB for {symbol}: {e}")
 
                 if position_id:
+                    # Вычисляем gross_pnl_pct для передачи
+                    gross_pnl_pct = (
+                        (float(pnl_decimal) / float(position_size_usdt) * 100)
+                        if position_size_usdt > 0
+                        else Decimal("0")
+                    )
+
                     self.trade_log.close_position(
                         position_id=position_id,
                         exit_price=avg_price_raw,
-                        exit_reason=exit_reason
+                        exit_reason=exit_reason,
+                        exit_fee=exit_fee_decimal,
+                        gross_pnl_usdt=pnl_decimal,
+                        gross_pnl_pct=gross_pnl_pct,
+                        net_pnl_usdt=realized_pnl_decimal,
+                        net_pnl_pct=pnl_percent
                     )
                     if symbol in self._position_ids:
                         del self._position_ids[symbol]
