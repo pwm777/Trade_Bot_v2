@@ -15,7 +15,7 @@ from datetime import datetime, UTC
 import warnings
 import logging
 import traceback
-
+import time
 try:
     import msvcrt
 except ImportError:
@@ -995,11 +995,17 @@ class AdvancedLabelingTool:
         total_bars = len(df)
         all_results = []
 
-        logger.info(f"🔍 BinSeg Windowed: {total_bars} баров, окно={window_size}, шаг={step_size}")
+        # === РАСЧЁТ КОЛИЧЕСТВА ОКОН ===
+        estimated_windows = max(1, (total_bars - window_size) // step_size + 1)
+
+        logger.info(
+            f"🔍 BinSeg Windowed: {total_bars} баров, окно={window_size}, "
+            f"шаг={step_size}, ожидается окон: ~{estimated_windows}")
 
         # === ИТЕРАЦИЯ ПО ОКНАМ ===
         window_start = 0
         window_num = 0
+        start_time = time.time()
 
         while window_start < total_bars:
             window_num += 1
@@ -1027,6 +1033,24 @@ class AdvancedLabelingTool:
             target_start_global = window_start + target_start_local
             target_end_global = window_start + target_end_local
 
+            # === ПРОГРЕСС-БАР ===
+            elapsed = time.time() - start_time
+            if window_num > 1:
+                avg_time_per_window = elapsed / (window_num - 1)
+                remaining_windows = max(0, estimated_windows - window_num)
+                eta_seconds = avg_time_per_window * remaining_windows
+                eta_min = int(eta_seconds // 60)
+                eta_sec = int(eta_seconds % 60)
+
+                print(
+                    f"\r⏳ Окно {window_num}/{estimated_windows} "
+                    f"({100 * window_num // estimated_windows}%) | "
+                    f"Прошло: {int(elapsed // 60)}m {int(elapsed % 60)}s | "
+                    f"ETA: {eta_min}m {eta_sec}s      ",
+                    end="",
+                    flush=True
+                )
+
             logger.info(
                 f"📊 Окно {window_num}: [{window_start}:{window_end}] "
                 f"| Целевая зона: [{target_start_global}:{target_end_global}]"
@@ -1046,13 +1070,17 @@ class AdvancedLabelingTool:
             # === СДВИГ ОКНА ===
             window_start += step_size
 
+        print()  # newline after progress bar
+
         # === ПОСТОБРАБОТКА ===
         if all_results:
             all_results.sort(key=lambda x: x['extreme_index'])
             all_results = self._filter_consecutive_same_type(all_results)
 
+        total_time = time.time() - start_time
         logger.info(
-            f"✅ BinSeg Windowed: обработано {window_num} окон, "
+            f"✅ BinSeg Windowed: обработано {window_num} окон за "
+            f"{int(total_time // 60)}m {int(total_time % 60)}s, "
             f"найдено {len(all_results)} уникальных сигналов"
         )
 
@@ -1101,53 +1129,56 @@ class AdvancedLabelingTool:
         best_score = -np.inf
 
         max_reasonable_bkps = n // 100
-        if max_reasonable_bkps < min(candidate_n_bkps):
-            logger.debug(f"⏭️  Окно {window_num}: max_bkps={max_reasonable_bkps} < {min(candidate_n_bkps)}")
-            return []
+        # === КЭШИРОВАНИЕ FITTED АЛГОРИТМОВ ===
+        fitted_algos = {}
 
         for signal_name, signal_data in signals.items():
             if len(signal_data) < 50:
                 continue
 
             for model in models:
-                algo = None
                 try:
                     algo = rpt.Binseg(model=model, min_size=5, jump=2).fit(signal_data)
+                    fitted_algos[(signal_name, model)] = algo
                 except Exception as err:
                     logger.debug(f"BinSeg fit error (окно {window_num}): {signal_name}, {model}: {err}")
                     continue
 
-                for n_bkps in candidate_n_bkps:
-                    if n_bkps >= max_reasonable_bkps:
-                        continue
+        # === ПЕРЕБОР УЖЕ FITTED АЛГОРИТМОВ ===
+        for (signal_name, model), algo in fitted_algos.items():
+            for n_bkps in candidate_n_bkps:
+                if n_bkps >= max_reasonable_bkps:
+                    continue
 
-                    try:
-                        changepoints = algo.predict(n_bkps=n_bkps)
-                    except Exception:
-                        continue
+                try:
+                    changepoints = algo.predict(n_bkps=n_bkps)
+                except Exception:
+                    continue
 
-                    changepoints = [int(cp) for cp in changepoints if 5 < cp < n - 5]
+                changepoints = [int(cp) for cp in changepoints if 5 < cp < n - 5]
 
-                    if len(changepoints) < 3:
-                        continue
+                if len(changepoints) < 3:
+                    continue
 
-                    score = self._evaluate_segmentation_improved(window_df, changepoints, signal_name)
-                    potential_signals = self._count_potential_signals(window_df, changepoints)
-                    score += min(potential_signals * self.config.binseg_potential_bonus,
-                                 self.config.binseg_potential_bonus_cap)
+                score = self._evaluate_segmentation_improved(window_df, changepoints, signal_name)
+                potential_signals = self._count_potential_signals(window_df, changepoints)
+                score += min(potential_signals * self.config.binseg_potential_bonus,
+                             self.config.binseg_potential_bonus_cap)
 
-                    if score > best_score:
-                        best_score = score
-                        best_result = {
-                            "signal": signal_name,
-                            "model": model,
-                            "n_bkps": n_bkps,
-                            "changepoints": changepoints,
-                            "score": score,
-                        }
+                if score > best_score:
+                    best_score = score
+                    best_result = {
+                        "signal": signal_name,
+                        "model": model,
+                        "n_bkps": n_bkps,
+                        "changepoints": changepoints,
+                        "score": score,
+                    }
 
-                if algo is not None:
-                    del algo
+        # === ОЧИСТКА ПАМЯТИ ===
+        for algo in fitted_algos.values():
+            del algo
+        fitted_algos.clear()
 
         if best_result is None:
             logger.debug(f"⏭️  Окно {window_num}: не найдено changepoints")
