@@ -147,6 +147,13 @@ class LabelingConfig:
     symbol: str = "ETHUSDT"
     timeframe: str = "5m"
 
+    # === BinSeg: отдельные пороги, чтобы можно было делать разметку "пожирнее" ===
+    binseg_min_trend_strength: float = 0.0015      # было жёстко 0.002 (0.2%), стало 0.15%
+    binseg_trend_ratio: float = 0.25               # было 0.3 (30%), стало 25%
+    binseg_min_segment_len: int = 10               # защита от совсем микросегментов
+    binseg_potential_bonus: float = 0.02           # бонус к score за potential_signals
+    binseg_potential_bonus_cap: float = 0.30       # максимум бонуса (было 0.1)
+
     # PELT Online
     pelt_window: int = 1000
     pelt_pen: float = 1
@@ -1039,7 +1046,10 @@ class AdvancedLabelingTool:
 
                         # Бонус за большее количество валидных сигналов
                         potential_signals = self._count_potential_signals(df, changepoints)
-                        score += min(potential_signals * 0.01, 0.1)  # Бонус до 0.1
+
+                        bonus_k = getattr(self.config, "binseg_potential_bonus", 0.02)
+                        bonus_cap = getattr(self.config, "binseg_potential_bonus_cap", 0.30)
+                        score += min(potential_signals * bonus_k, bonus_cap)
 
                         if score > best_score:
                             best_score = score
@@ -1099,91 +1109,161 @@ class AdvancedLabelingTool:
 
         return results
 
-    def _convert_changepoints_to_signals_improved(self, df: pd.DataFrame, changepoints: List[int]) -> List[Dict]:
+    def _convert_changepoints_to_signals_improved(
+        self,
+        df: pd.DataFrame,
+        changepoints: List[int]
+    ) -> List[Dict]:
         """
-        Улучшенное преобразование с лучшей логикой определения BUY/SELL
+        Улучшенное преобразование changepoints → BUY/SELL c более мягкими фильтрами,
+        чтобы получить больше примеров.
+
+        - Менее строгие пороги по силе тренда (используем config.binseg_min_trend_strength, если есть)
+        - Не отбрасываем сигналы при early_rejection, а понижаем confidence и ставим is_high_quality = 0
         """
-        results = []
+        results: List[Dict] = []
 
-        for i in range(1, len(changepoints) - 1):
-            current_cp = changepoints[i]  # Точка разрыва
-            prev_cp = changepoints[i - 1]  # Начало предыдущего тренда
-            next_cp = changepoints[i + 1]  # Конец текущего тренда
+        if df.empty or not changepoints:
+            return results
 
-            if current_cp >= len(df) or next_cp >= len(df) or prev_cp >= len(df):
+        # --- 0. Нормализуем точки разрыва ---
+        n = len(df)
+        # в разумных пределах и без дубликатов
+        cps = sorted(
+            {int(cp) for cp in changepoints
+             if isinstance(cp, (int, np.integer)) and 0 < int(cp) < n - 1}
+        )
+        if len(cps) < 3:
+            return results
+
+        # Базовый порог силы тренда (можно переопределить в конфиге)
+        min_trend_strength = float(
+            getattr(self.config, "binseg_min_trend_strength", 0.001)  # ~0.1%
+        )
+
+        def trend_dir(x: float) -> int:
+            """
+            +1 — восходящий тренд, -1 — нисходящий, 0 — флет/шум вокруг нуля.
+            """
+            if x > min_trend_strength:
+                return 1
+            if x < -min_trend_strength:
+                return -1
+            return 0
+
+        close = df["close"].values
+        ts = df["ts"].values
+
+        for i in range(1, len(cps) - 1):
+            prev_cp = cps[i - 1]
+            cur_cp = cps[i]
+            next_cp = cps[i + 1]
+
+            # sanity-check
+            if not (0 < prev_cp < cur_cp < next_cp < n):
                 continue
 
-            # 🔍 УЛУЧШЕННЫЙ АНАЛИЗ ТРЕНДОВ
-            # Предыдущий тренд (2/3 сегмента для надежности)
-            prev_segment_len = current_cp - prev_cp
-            analysis_start = prev_cp + prev_segment_len // 3  # Игнорируем начало сегмента
-            price_prev_start = df['close'].iloc[analysis_start]
-            price_prev_end = df['close'].iloc[current_cp - 1]
+            # --- 1. Сегменты до и после changepoint ---
+            prev_segment_len = cur_cp - prev_cp
+            curr_segment_len = next_cp - cur_cp
+
+            # Слишком короткие сегменты пропускаем — там шум
+            if prev_segment_len < 5 or curr_segment_len < 5:
+                continue
+
+            # Предыдущий тренд: берём "середину → конец" сегмента, чтобы убрать шум начала
+            prev_start = prev_cp + prev_segment_len // 3
+            if prev_start >= cur_cp:
+                prev_start = prev_cp
+
+            price_prev_start = float(close[prev_start])
+            price_prev_end = float(close[cur_cp - 1])
+            if price_prev_start <= 0:
+                continue
             prev_trend = (price_prev_end - price_prev_start) / price_prev_start
 
-            # Текущий тренд (2/3 сегмента)
-            current_segment_len = next_cp - current_cp
-            analysis_end = current_cp + (2 * current_segment_len) // 3
-            if analysis_end >= len(df):
-                analysis_end = len(df) - 1
+            # Текущий тренд: от changepoint до 2/3 следующего сегмента
+            curr_end = cur_cp + (2 * curr_segment_len) // 3
+            if curr_end >= n:
+                curr_end = n - 1
+            if curr_end <= cur_cp:
+                continue
 
-            price_current_start = df['close'].iloc[current_cp]
-            price_current_end = df['close'].iloc[analysis_end]
-            current_trend = (price_current_end - price_current_start) / price_current_start
+            price_curr_start = float(close[cur_cp])
+            price_curr_end = float(close[curr_end])
+            if price_curr_start <= 0:
+                continue
+            curr_trend = (price_curr_end - price_curr_start) / price_curr_start
 
-            # 🎯 УЛУЧШЕННЫЕ КРИТЕРИИ:
-            min_trend_strength = 0.001  # 0.1% минимальное изменение
+            prev_dir = trend_dir(prev_trend)
+            curr_dir = trend_dir(curr_trend)
 
-            # Коэффициент относительной силы: раньше 0.3, теперь 0.2 —
-            # допускаем, что новый тренд может быть не сильно сильнее предыдущего, но всё равно значим.
-            relative_strength_factor = 0.2
+            # Если оба реально флетовые — смысла нет
+            if prev_dir == 0 and curr_dir == 0:
+                continue
 
-            # СИГНАЛ BUY: падение → рост
-            if (
-                prev_trend < -min_trend_strength and
-                current_trend > min_trend_strength and
-                abs(current_trend) > abs(prev_trend) * relative_strength_factor
-            ):
-                rev_type = "BUY"
-                confidence = min(abs(current_trend) * 15 + abs(prev_trend) * 10, 0.95)
+            # --- 2. Определяем тип разворота ---
+            rev_type: Optional[str] = None
 
-            # СИГНАЛ SELL: рост → падение
-            elif (
-                prev_trend > min_trend_strength and
-                current_trend < -min_trend_strength and
-                abs(current_trend) > abs(prev_trend) * relative_strength_factor
-            ):
+            # Классический разворот: вверх → вниз / вниз → вверх
+            if prev_dir > 0 and curr_dir < 0:
                 rev_type = "SELL"
-                confidence = min(abs(current_trend) * 15 + abs(prev_trend) * 10, 0.95)
+            elif prev_dir < 0 and curr_dir > 0:
+                rev_type = "BUY"
 
-            else:
+            # Начало тренда из флета
+            elif prev_dir == 0 and curr_dir != 0:
+                rev_type = "BUY" if curr_dir > 0 else "SELL"
+
+            # Конец тренда в условный флет — считаем вероятным разворотом
+            elif curr_dir == 0 and prev_dir != 0:
+                rev_type = "SELL" if prev_dir > 0 else "BUY"
+
+            if rev_type is None:
                 continue
 
-            # 🚀 ВХОД НА СЛЕДУЮЩЕЙ СВЕЧЕ
-            entry_index = current_cp + 1
-            if entry_index >= len(df):
+            # --- 3. Вход: следующая свеча после changepoint ---
+            entry_index = cur_cp + 1
+            if entry_index >= n:
                 continue
 
-            # ✅ ПОДТВЕРЖДЕНИЕ СИГНАЛА
+            # --- 4. Базовая уверенность по модулю трендов ---
+            # Берём суммарную силу движения двух сегментов, нормируем в [0.3; 0.99]
+            base_conf = min(abs(prev_trend) + abs(curr_trend), 0.02) / 0.02  # 0..1
+            # Лёгкий бонус за явный разворот (смена знака)
+            if prev_dir * curr_dir == -1:
+                base_conf *= 1.1
+            base_conf = float(np.clip(base_conf, 0.3, 0.99))
+
+            # --- 5. Умное подтверждение (НЕ режем сигналы, только корректируем качество) ---
             confirmation = self._smart_confirmation_system(df, entry_index, rev_type)
+            conf_idx = int(confirmation.get("confirmation_index", entry_index))
+            if conf_idx >= n:
+                conf_idx = n - 1
 
-            if confirmation['early_rejection']:
-                continue
+            confidence = base_conf + float(confirmation.get("confidence_boost", 0.0))
+            confidence = float(np.clip(confidence, 0.1, 0.99))
 
-            conf_idx = confirmation['confirmation_index']
-            if conf_idx >= len(df):
-                conf_idx = len(df) - 1
+            is_high_quality = 1
+            if confirmation.get("early_rejection"):
+                # Раньше такие сигналы просто отбрасывались.
+                # Теперь оставляем их как "слабые":
+                #   - режем уверенность
+                #   - помечаем is_high_quality = 0
+                confidence = float(max(0.1, confidence * 0.5))
+                is_high_quality = 0
 
             results.append({
-                'index': entry_index,
-                'type': rev_type,
-                'confidence': confidence,
-                'extreme_index': current_cp,
-                'extreme_timestamp': int(df['ts'].iloc[current_cp]),
-                'confirmation_index': conf_idx,
-                'confirmation_timestamp': int(df['ts'].iloc[conf_idx]),
-                'method': 'BINSEG',
-                'reversal_label': 1 if rev_type == 'BUY' else 2,
+                "index": int(entry_index),
+                "type": rev_type,
+                "confidence": confidence,
+                "extreme_index": int(cur_cp),
+                "extreme_timestamp": int(ts[cur_cp]),
+                "confirmation_index": int(conf_idx),
+                "confirmation_timestamp": int(ts[conf_idx]),
+                "method": "BINSEG",
+                "reversal_label": 1 if rev_type == "BUY" else 2,
+                "is_high_quality": is_high_quality,
             })
 
         return results
