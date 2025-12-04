@@ -17,7 +17,6 @@ import logging
 import traceback
 import time
 
-# msvcrt is Windows-only, make import conditional
 try:
     import msvcrt
 except ImportError:
@@ -968,144 +967,186 @@ class AdvancedLabelingTool:
 
     def _binseg_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        Улучшенный BinSeg с лучшей настройкой параметров.
-        Для больших датасетов (100k+ свечей) используем большие n_bkps.
+        BinSeg-разметка без зависаний:
+        - один fit на (signal_type, model) → много predict(n_bkps)
+        - ограничение длины ряда
+        - без rbf (только l2), чтобы не уходить в своп
         """
         if not RUPTURES_AVAILABLE:
             logger.warning("⚠️ Библиотека ruptures недоступна")
             return []
 
-        # Подготовка данных (без ограничения размера)
-        close_vals = df['close'].astype(float).values
+        # ⚡ Ограничение размера ряда: на практике 50–60k баров достаточно
+        MAX_SAMPLES = 60_000
+        if len(df) > MAX_SAMPLES:
+            logger.info(f"⚡ Сокращаем данные с {len(df)} до {MAX_SAMPLES} samples (последние бары)")
+            df = df.iloc[-MAX_SAMPLES:].copy()
 
-        # 🎯 ИСПОЛЬЗУЕМ РАЗНЫЕ ТИПЫ СИГНАЛОВ ДЛЯ ЛУЧШЕГО ОБНАРУЖЕНИЯ
-        signals = {}
+        if len(df) < 500:
+            logger.warning(f"⚠️ Недостаточно данных для BinSeg: {len(df)}")
+            return []
 
-        # 1. Логарифмические доходности (основной сигнал)
+        close_vals = df["close"].astype(float).values
+
+        # 1. Строим разные сигналы
         log_prices = np.log(np.clip(close_vals, 1e-12, None))
         returns = np.diff(log_prices)
         returns = np.insert(returns, 0, 0)
-        signals['returns'] = returns
 
-        # 2. Нормализованные цены (дополнительный сигнал)
-        price_mean = np.mean(close_vals)
-        price_std = np.std(close_vals)
+        price_mean = float(np.mean(close_vals))
+        price_std = float(np.std(close_vals)) if np.std(close_vals) > 0 else 0.0
+
+        signals: Dict[str, np.ndarray] = {}
+        signals["returns"] = returns.astype(np.float32)
+
         if price_std > 0:
             normalized_prices = (close_vals - price_mean) / price_std
-            signals['normalized'] = normalized_prices
+            signals["normalized"] = normalized_prices.astype(np.float32)
 
-        # 3. Волатильность (для обнаружения изменений в волатильности)
-        volatility = np.abs(returns) * 100  # Процентная волатильность
-        signals['volatility'] = volatility
+        volatility = (np.abs(returns) * 100.0).astype(np.float32)
+        signals["volatility"] = volatility
 
-        # Для больших данных используем большие n_bkps
-        candidate_n_bkps = [200, 300, 400, 500, 600, 800]
-        total_iterations = len(signals) * 2 * len(candidate_n_bkps)  # 3*2*6 = 36
+        # 2. Кандидаты по количеству разрывов (подбираем "структуру")
+        candidate_n_bkps = [12, 18, 25, 35, 50]
+
+        # 3. Модели: используем только l2 (rbf отключаем, чтобы не ловить OOM/своп)
+        models = ["l2"]
+
+        total_iterations = len(signals) * len(models) * len(candidate_n_bkps)
         current_iteration = 0
         start_time = time.time()
 
-        print(f"🔍 BinSeg: анализ {len(df)} свечей | Итераций: {total_iterations} | Ожидайте 1-3 часа...")
-        print(f"⏳ Прогресс: 0/{total_iterations} (0%) | Время: 0м 0с | Осталось: ~? ", end="", flush=True)
+        print(
+            f"🔍 BinSeg: анализ {len(df)} свечей | Итераций: {total_iterations} | "
+            f"Ожидайте 20–40 минут...",
+            flush=True,
+        )
 
-        # 🎯 РАСШИРЕННЫЙ ПОДБОР ПАРАМЕТРОВ
-        best_result = None
+        best_result: Optional[Dict[str, Any]] = None
         best_score = -np.inf
 
-        # Тестируем разные комбинации
         for signal_name, signal_data in signals.items():
-            for n_bkps in candidate_n_bkps:
-                for model in ["l2", "rbf"]:  # Только работающие модели
-                    try:
-                        # Обновление прогресса
-                        current_iteration += 1
-                        elapsed = time.time() - start_time
-                        avg_time = elapsed / current_iteration
-                        remaining = avg_time * (total_iterations - current_iteration)
+            signal_len = len(signal_data)
+            if signal_len < 200:
+                continue
 
-                        print(f"\r⏳ Прогресс: {current_iteration}/{total_iterations} "
-                              f"({current_iteration * 100 // total_iterations}%) | "
-                              f"Время: {int(elapsed // 60)}м {int(elapsed % 60)}с | "
-                              f"Осталось: ~{int(remaining // 60)}м {int(remaining % 60)}с",
-                              end="", flush=True)
+            # максимум changepoints — не чаще, чем каждые 3 бара
+            max_n_bkps_allowed = max(3, signal_len // 3)
 
-                        if n_bkps >= len(signal_data) // 3:
-                            continue
+            for model in models:
+                # Один fit на связку (signal_name, model)
+                try:
+                    algo = rpt.Binseg(model=model, min_size=15, jump=8).fit(signal_data)
+                except MemoryError:
+                    logger.error(
+                        f"❌ BinSeg: MemoryError при fit для {signal_name}, model={model} "
+                        f"(len={signal_len}) — пропускаем"
+                    )
+                    continue
+                except Exception as err:
+                    logger.warning(
+                        f"❌ BinSeg: ошибка fit для {signal_name}, model={model}: {err}"
+                    )
+                    continue
 
-                        # Запускаем BinSeg
-                        algo = rpt.Binseg(model=model, min_size=15, jump=8).fit(signal_data)
-                        changepoints = algo.predict(n_bkps=n_bkps)
+                for n_bkps in candidate_n_bkps:
+                    current_iteration += 1
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / max(current_iteration, 1)
+                    remaining = avg_time * max(total_iterations - current_iteration, 0)
 
-                        # Фильтруем корректные точки
-                        changepoints = [cp for cp in changepoints if 15 < cp < len(df) - 15]
+                    print(
+                        f"\r⏳ Прогресс: {current_iteration}/{total_iterations} "
+                        f"({current_iteration * 100 // total_iterations}%) | "
+                        f"Время: {int(elapsed // 60)}м {int(elapsed % 60)}с | "
+                        f"Осталось: ~{int(remaining // 60)}м {int(remaining % 60)}с",
+                        end="",
+                        flush=True,
+                    )
 
-                        if len(changepoints) < 3:  # Нужно минимум 3 точки для анализа
-                            continue
-
-                        # Оцениваем качество разбиения
-                        score = self._evaluate_segmentation_improved(df, changepoints, signal_name)
-
-                        # Бонус за большее количество валидных сигналов
-                        potential_signals = self._count_potential_signals(df, changepoints)
-
-                        bonus_k = getattr(self.config, "binseg_potential_bonus", 0.02)
-                        bonus_cap = getattr(self.config, "binseg_potential_bonus_cap", 0.30)
-                        score += min(potential_signals * bonus_k, bonus_cap)
-
-                        if score > best_score:
-                            best_score = score
-                            changepoints_clean = [int(cp) for cp in changepoints if isinstance(cp, (int, np.integer))]
-
-                            if len(changepoints_clean) < 3:  # Минимум 3 точки
-                                continue
-
-                            best_result = {
-                                'signal': signal_name,
-                                'model': model,
-                                'n_bkps': n_bkps,
-                                'changepoints': changepoints_clean,  # ← Гарантированно List[int]
-                                'score': score,
-                                'potential_signals': potential_signals
-                            }
-
-                    except Exception as err:
+                    if n_bkps >= max_n_bkps_allowed:
                         continue
 
-        # Завершаем прогресс-бар
-        print()
+                    try:
+                        changepoints = algo.predict(n_bkps=int(n_bkps))
+                    except MemoryError:
+                        logger.error(
+                            f"\n❌ BinSeg: MemoryError при predict n_bkps={n_bkps} "
+                            f"для {signal_name}, model={model} — пропускаем эту комбинацию"
+                        )
+                        continue
+                    except Exception as err:
+                        logger.debug(
+                            f"\nBinSeg: ошибка predict для {signal_name}, "
+                            f"model={model}, n_bkps={n_bkps}: {err}"
+                        )
+                        continue
+
+                    # фильтруем края
+                    changepoints = [cp for cp in changepoints if 15 < cp < len(df) - 15]
+                    if len(changepoints) < 3:
+                        continue
+
+                    # качество сегментации
+                    score = self._evaluate_segmentation_improved(
+                        df, changepoints, signal_name
+                    )
+
+                    potential_signals = self._count_potential_signals(df, changepoints)
+                    score += min(potential_signals * 0.01, 0.1)
+
+                    if score > best_score:
+                        best_score = score
+                        clean_cps = [
+                            int(cp)
+                            for cp in changepoints
+                            if isinstance(cp, (int, np.integer))
+                        ]
+                        if len(clean_cps) < 3:
+                            continue
+
+                        best_result = {
+                            "signal": signal_name,
+                            "model": model,
+                            "n_bkps": n_bkps,
+                            "changepoints": clean_cps,
+                            "score": score,
+                            "potential_signals": potential_signals,
+                        }
+
+        print()  # перенос строки после прогресса
 
         if not best_result:
             logger.warning("❌ BinSeg не смог найти точки разрыва")
             return []
 
-        changepoints = best_result['changepoints']
-
-        # Проверка валидности changepoints
-        if not changepoints or not isinstance(changepoints, list):
-            logger.warning("❌ BinSeg: невалидные точки разрыва")
-            return []
-
-        # Дополнительная фильтрация: только int
-        changepoints = [int(cp) for cp in changepoints if isinstance(cp, (int, np.integer))]
-
+        changepoints = best_result["changepoints"]
         if not changepoints:
-            logger.warning("❌ BinSeg: нет валидных точек разрыва после фильтрации")
+            logger.warning("❌ BinSeg: пустой список changepoints")
             return []
-        print(
-            f"✅ Лучшая конфигурация: {best_result['signal']}, model={best_result['model']}, n_bkps={best_result['n_bkps']}")
-        print(
-            f"📊 Найдено точек разрыва: {len(changepoints)}, потенциальных сигналов: {best_result['potential_signals']}")
 
-        # Преобразование точек разрыва в торговые сигналы
+        print(
+            f"✅ Лучшая конфигурация: {best_result['signal']}, "
+            f"model={best_result['model']}, n_bkps={best_result['n_bkps']}"
+        )
+        print(
+            f"📊 Найдено точек разрыва: {len(changepoints)}, "
+            f"потенциальных сигналов: {best_result['potential_signals']}"
+        )
+
         results = self._convert_changepoints_to_signals_improved(df, changepoints)
-
         logger.info(f"📊 BinSeg найдено {len(results)} сигналов")
 
-        # 📊 СТАТИСТИКА СИГНАЛОВ
         if results:
-            buy_count = sum(1 for r in results if r['type'] == 'BUY')
-            sell_count = sum(1 for r in results if r['type'] == 'SELL')
-            avg_confidence = np.mean([r['confidence'] for r in results])
-            print(f"📈 Итоги: {buy_count} BUY, {sell_count} SELL, средняя уверенность: {avg_confidence:.2f}")
+            buy_count = sum(1 for r in results if r["type"] == "BUY")
+            sell_count = sum(1 for r in results if r["type"] == "SELL")
+            avg_conf = float(
+                np.mean([r["confidence"] for r in results])
+            ) if results else 0.0
+            print(
+                f"📈 Итоги: {buy_count} BUY, {sell_count} SELL, "
+                f"средняя уверенность: {avg_conf:.2f}"
+            )
 
         return results
 
@@ -1437,147 +1478,188 @@ class AdvancedLabelingTool:
 
         return results
 
+    def _infer_bars_per_day(self) -> int:
+        """Попытка определить количество баров в сутках по данным из candles таблицы."""
+        # Загружаем пару записей для оценки шага
+        try:
+            with self.engine.connect() as conn:
+                sample = pd.read_sql_query(
+                    text("""
+                        SELECT ts FROM candles_5m 
+                        WHERE symbol = :symbol 
+                        ORDER BY ts DESC 
+                        LIMIT 100
+                    """),
+                    conn,
+                    params={"symbol": self.config.symbol}
+                )
+            if len(sample) < 2:
+                return 288  # fallback на 5-минутки
+            diffs = sample['ts'].diff().dropna().astype(float)
+            step_ms = np.median(diffs)
+            if not np.isfinite(step_ms) or step_ms <= 0:
+                return 288
+            bars_per_day = int(round(24 * 3600 * 1000 / step_ms))
+            return max(bars_per_day, 1)
+        except Exception as e:
+            self.logger.warning(f"Не удалось определить bars_per_day: {e}")
+            return 288
+
     def _pelt_offline_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        Оптимизированная PELT-разметка с заменой на Binseg и защитой от зависаний.
-        Вход — следующая свеча после экстремума (как у EXTREMUM).
+        Автоматическая разметка через PELT: ~5 сделок в сутки (цель настраивается через config.pelt_target_daily).
+        Возвращает список сигналов в формате [{index, type, confidence, extreme_index, extreme_timestamp, ...}].
+        Без интерактивного ввода — fully automated.
         """
+        prev_start:int = 0
+        end:int = 0
+        start:int = 0
+
         if not RUPTURES_AVAILABLE:
-            logger.warning("⚠️ Библиотека ruptures недоступна")
+            self.logger.warning("⚠️ ruptures недоступен — PELT OFFLINE отключен")
             return []
 
-        if len(df) < 500:
-            logger.warning(f"⚠️ Недостаточно данных для PELT Offline: {len(df)}")
+        if len(df) < 50:
+            self.logger.warning("⚠️ Недостаточно данных (<50 баров) для PELT")
             return []
 
-        logger.info(f"📊 PELT Offline (Binseg): анализ {len(df)} свечей...")
+        # === Параметры из конфига или дефолты ===
+        target_daily = float(getattr(self.config, 'pelt_target_daily', 5.0))
+        min_size = int(getattr(self.config, 'pelt_min_size', 4))
+        jump = int(getattr(self.config, 'pelt_jump', 5))
 
-        # ⚡ Ограничение размера для скорости
-        MAX_SAMPLES = 5000
-        if len(df) > MAX_SAMPLES:
-            logger.info(f"⚡ Сокращение данных с {len(df)} → {MAX_SAMPLES}")
-            df = df.iloc[-MAX_SAMPLES:].copy()
+        self.logger.info(f"🎯 PELT OFFLINE: цель {target_daily:.1f} сделок/сутки, min_size={min_size}, jump={jump}")
 
-        # === 1. Подготовка сигнала ===
-        try:
-            # Используем логарифм цен — устойчиво к масштабу и look-ahead
-            close_vals = df['close'].astype(float).values
-            signal = np.log(np.clip(close_vals, 1e-12, None))
-        except Exception as e:
-            logger.error(f"❌ Ошибка подготовки сигнала: {e}")
-            return []
+        # === Подготовка сигнала ===
+        close_vals = df['close'].values.astype(float)
+        signal = np.log(np.clip(close_vals, 1e-12, None))
 
-        # === 2. Интерактивный выбор целевого количества сигналов ===
-        print("\n" + "=" * 60)
-        print("🎯 НАСТРОЙКА BINSEG: Целевое количество сигналов")
-        print("=" * 60)
-        print("Выберите стратегию:")
-        print("   📊 [1] Консервативная:  3–5 / день  (~600–1000)")
-        print("   📊 [2] Сбалансированная: 10–15 / день (~2000–3000) ← рекомендуется")
-        print("   📊 [3] Агрессивная:     20–30 / день (~4000–6000)")
-        print("   ⚙️  [4] Своё значение")
-
-        choice = input("\nВаш выбор [2]: ").strip()
-        if choice == '1':
-            target_signals_daily = 4.0
-        elif choice == '3':
-            target_signals_daily = 25.0
-        elif choice == '4':
-            try:
-                val = input("Количество сигналов в день [12]: ").strip()
-                target_signals_daily = float(val) if val else 12.0
-                if not (1 <= target_signals_daily <= 50):
-                    print("⚠️ Диапазон 1–50. Установлено 12.")
-                    target_signals_daily = 12.0
-            except ValueError:
-                print("⚠️ Неверный формат. Установлено 12.")
-                target_signals_daily = 12.0
-        else:
-            target_signals_daily = 12.0
-
-        print(f"✅ Выбрано: ~{target_signals_daily:.1f} сигналов/день")
-
-        # === 3. Расчёт целевого числа changepoints ===
-        bars_per_day = 288  # 5m
         n_samples = len(signal)
-        expected_signals = target_signals_daily * (n_samples / bars_per_day)
+        bars_per_day = self._infer_bars_per_day()
+        target_total = target_daily * (n_samples / bars_per_day)
 
-        # Эмпирический коэффициент: changepoints ≈ 2.55 × сигналы (из практики)
-        SIGNAL_TO_CHANGEPOINT_RATIO = 2.55
-        target_changepoints = int(expected_signals * SIGNAL_TO_CHANGEPOINT_RATIO)
+        # === Подбор penalty (автоматически, без input) ===
+        start_pen, end_pen = 1e-4, 1e-1
+        n_steps = 20
+        pens = np.logspace(np.log10(start_pen), np.log10(end_pen), num=n_steps)
+        target_low = int(target_total * 0.8)
+        target_high = int(target_total * 1.2)
+        best_penalty = None
+        best_changepoints = None
+        closest_distance = float('inf')
 
-        print(f"🎯 Цель: {target_changepoints} changepoints (≈ {expected_signals:.0f} сигналов)")
+        self.logger.info(f"🔍 Подбираем penalty для ~{target_total:.1f} change points ({target_daily:.1f}/день)")
+        for pen in pens:
+            try:
+                algo = rpt.Pelt(model="l2", min_size=min_size, jump=jump).fit(signal)
+                changepoints = algo.predict(pen=pen)
+                changepoints = [cp for cp in changepoints if cp < len(df)]
+                n_cp = max(len(changepoints) - 1, 0)  # исключаем последнюю точку за пределами
+                dist = abs(n_cp - target_total)
+                if dist < closest_distance:
+                    closest_distance = dist
+                    best_penalty = pen
+                    best_changepoints = changepoints
+            except Exception as e:
+                self.logger.debug(f"PELT pen={pen:.5f} failed: {e}")
+                continue
 
-        # === 4. Вычисление change points через Binseg (быстро и стабильно) ===
-        try:
-            algo = rpt.Binseg(model="l2", min_size=10, jump=5).fit(signal)
-            changepoints = algo.predict(n_bkps=target_changepoints)
-            # Убираем последнюю точку (ruptures добавляет len(signal) как искусственный конец)
-            changepoints = [cp for cp in changepoints if cp < len(df)]
-            logger.info(f"✅ Найдено {len(changepoints)} changepoints")
-        except Exception as e:
-            logger.error(f"❌ Ошибка Binseg: {e}")
+        if best_changepoints is None or len(best_changepoints) == 0:
+            self.logger.warning("❌ PELT: не найдено change points")
             return []
 
-        # === 5. Построение BUY/SELL по трендам между changepoints ===
-        results = []
-        for i in range(1, len(changepoints) - 1):
-            prev_cp = changepoints[i - 1]
-            cur_cp = changepoints[i]
-            next_cp = changepoints[i + 1]
+        changepoints = best_changepoints
+        actual_count = len(changepoints)
+        daily_count = (actual_count * bars_per_day / n_samples) if n_samples > 0 else 0
+        self.logger.info(f"✅ PELT: pen={best_penalty:.5f} → {actual_count} change points (~{daily_count:.1f}/день)")
 
-            if cur_cp >= len(df):
+        # === Определение BUY/SELL по смене направления тренда ===
+        buy_signals: List[int] = []
+        sell_signals: List[int] = []
+
+        for i in range(len(changepoints) - 1):
+            start, end = changepoints[i], changepoints[i + 1]
+            if end - 1 >= len(df) or start <= 0:
                 continue
+            trend_change = float(df['close'].iloc[end - 1] - df['close'].iloc[start])
+            is_up = trend_change > 0
 
-            # Тренд до точки: [prev_cp → cur_cp)
-            trend_prev_up = df['close'].iat[cur_cp - 1] > df['close'].iat[prev_cp]
-            # Тренд после точки: [cur_cp → next_cp)
-            trend_next_up = df['close'].iat[next_cp - 1] > df['close'].iat[cur_cp]
+            if i > 0:
+                prev_start = changepoints[i - 1]
+                if start - 1 < len(df) and prev_start < len(df):
+                    prev_trend = float(df['close'].iloc[start - 1] - df['close'].iloc[prev_start])
+                    prev_up = prev_trend > 0
 
-            rev_type = None
-            if not trend_prev_up and trend_next_up:
-                rev_type = "BUY"
-            elif trend_prev_up and not trend_next_up:
-                rev_type = "SELL"
-            if rev_type is None:
+                    if (not prev_up) and is_up:
+                        buy_signals.append(start)
+                    elif prev_up and (not is_up):
+                        sell_signals.append(start)
+
+        self.logger.info(f"📊 Сгенерировано: BUY={len(buy_signals)}, SELL={len(sell_signals)}")
+
+        # === Формирование результатов в формате сигнала ===
+        results: List[Dict] = []
+        for idx in buy_signals:
+            if idx + 1 >= len(df):
                 continue
-
-            # 🔁 ВХОД НА СЛЕДУЮЩЕЙ СВЕЧЕ ПОСЛЕ ЭКСТРЕМУМА (правильно!)
-            entry_idx = cur_cp + 1
-            if entry_idx >= len(df):
-                continue
-
-            # Расчёт confidence: нормализованный price move
-            move_abs = abs(df['close'].iat[next_cp - 1] - df['close'].iat[cur_cp])
-            move_rel = move_abs / df['close'].iat[cur_cp]
-            confidence = np.clip(move_rel * 10, 0.3, 0.95)  # 0.3–0.95
-
-            # Подтверждение сигнала
-            confirmation = self._smart_confirmation_system(df, entry_idx, rev_type)
-            conf_idx = confirmation['confirmation_index']
-            if conf_idx >= len(df):
-                conf_idx = len(df) - 1
-
-            # Формируем результат
             results.append({
-                'index': entry_idx,
-                'type': rev_type,
-                'confidence': float(confidence),
-                'extreme_index': int(cur_cp),
-                'extreme_timestamp': int(df['ts'].iloc[cur_cp]),
-                'confirmation_index': int(conf_idx),
-                'confirmation_timestamp': int(df['ts'].iloc[conf_idx]),
-                'method': 'PELT_OFFLINE_BINSEG',
-                'reversal_label': 1 if rev_type == 'BUY' else 2,
+                'index': idx + 1,  # вход на следующей свече
+                'type': 'BUY',
+                'confidence': 0.7,
+                'extreme_index': idx,
+                'extreme_timestamp': int(df['ts'].iloc[idx]),
+                'confirmation_index': idx + 1,
+                'confirmation_timestamp': int(df['ts'].iloc[idx + 1]),
+                'method': 'PELT_OFFLINE',
+                'reversal_label': 1,
+            })
+        for idx in sell_signals:
+            if idx + 1 >= len(df):
+                continue
+            results.append({
+                'index': idx + 1,
+                'type': 'SELL',
+                'confidence': 0.7,
+                'extreme_index': idx,
+                'extreme_timestamp': int(df['ts'].iloc[idx]),
+                'confirmation_index': idx + 1,
+                'confirmation_timestamp': int(df['ts'].iloc[idx + 1]),
+                'method': 'PELT_OFFLINE',
+                'reversal_label': 2,
             })
 
-        # === 6. Отчёт ===
-        logger.info(f"📊 Найдено {len(results)} разворотов")
+        # === PnL анализ (логгирование, не print) ===
         if results:
-            buy_cnt = sum(1 for r in results if r['type'] == 'BUY')
-            sell_cnt = sum(1 for r in results if r['type'] == 'SELL')
-            avg_conf = np.mean([r['confidence'] for r in results])
-            print(f"📈 Сигналы: {buy_cnt} BUY, {sell_cnt} SELL, средняя уверенность: {avg_conf:.2f}")
+            trades = []
+            fee = getattr(self.config, 'fee_percent', 0.0008)
+            positions = sorted([(r['extreme_index'], r['reversal_label']) for r in results])
+            i = 0
+            while i < len(positions) - 1:
+                entry_idx, entry_type = positions[i]
+                if entry_type == 1:  # BUY
+                    j = None
+                    for jj in range(i + 1, len(positions)):
+                        exit_idx, exit_type = positions[jj]
+                        if exit_type == 2:  # SELL
+                            j = jj
+                            entry_price = float(df['close'].iloc[entry_idx])
+                            exit_price = float(df['close'].iloc[exit_idx])
+                            if entry_price > 0:
+                                pnl = (exit_price - entry_price) / entry_price - 2 * fee
+                                trades.append(pnl)
+                            break
+                    i = j if j is not None else i + 1
+                else:
+                    i += 1
+
+            if trades:
+                win_rate = sum(1 for pnl in trades if pnl > 0) / len(trades)
+                avg_pnl = float(np.mean(trades))
+                total_pnl = (float(np.prod([1 + pnl for pnl in trades])) - 1) * 100
+                self.logger.info(f"📈 PnL анализ (long-only): сделок={len(trades)}, win_rate={win_rate:.1%}, "
+                                 f"avg_pnl={avg_pnl:.2%}, total_pnl={total_pnl:.1f}%")
+            else:
+                self.logger.info("📉 Нет полных сделок для PnL анализа")
 
         return results
 
