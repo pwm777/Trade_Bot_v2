@@ -157,6 +157,13 @@ class LabelingConfig:
     pelt_pen: float = 1
     pelt_min_size: int = 10
     pelt_confirm_bar: int = 3
+    
+    # PELT параметры для offline разметки
+    pelt_penalty_min: float = 1e-6  # Минимальный penalty
+    pelt_penalty_max: float = 1e-2  # Максимальный penalty
+    pelt_penalty_steps: int = 25    # Шагов при подборе
+    pelt_target_daily: float = 7.0  # Увеличить с 5.0 до 7.0 сделок в день
+    pelt_pnl_threshold: float = 0.001  # Минимальный PnL для принятия сигнала
 
     # CUSUM
     cusum_z_threshold: float = 3 # минимальный |cusum_zscore|,
@@ -1832,12 +1839,27 @@ class AdvancedLabelingTool:
         min_size = int(getattr(self.config, 'pelt_min_size', 4))
         jump = int(getattr(self.config, 'pelt_jump', 5))
 
-        # === ЛОКАЛЬНЫЙ ПОДБОР PENALTY ===
-        target_low = int(target_changepoints * 0.8)
-        target_high = int(target_changepoints * 1.2)
+        # === АДАПТИВНЫЙ РАСЧЁТ ЦЕЛЕВОГО ДИАПАЗОНА ===
+        # Адаптивный расчёт целевого диапазона на основе волатильности окна
+        window_volatility = window_df['close'].pct_change().std()
+        volatility_multiplier = max(0.5, min(2.0, window_volatility / 0.02))  # Нормализация к 2% volatility
 
-        start_pen, end_pen = 1e-4, 1e-1
-        n_steps = 15  # Меньше итераций для скорости
+        target_changepoints = int(target_changepoints * volatility_multiplier)
+        target_low = int(target_changepoints * 0.6)  # Более мягкие границы (было 0.8)
+        target_high = int(target_changepoints * 2.0)  # Более широкий диапазон (было 1.2)
+
+        self.logger.debug(
+            f"  Окно {window_num}: volatility={window_volatility:.4f}, "
+            f"multiplier={volatility_multiplier:.2f}, target={target_changepoints}"
+        )
+
+        # === ЛОКАЛЬНЫЙ ПОДБОР PENALTY ===
+        # Параметры из конфига или defaults
+        start_pen = float(getattr(self.config, 'pelt_penalty_min', 1e-6))
+        end_pen = float(getattr(self.config, 'pelt_penalty_max', 1e-2))
+        n_steps = int(getattr(self.config, 'pelt_penalty_steps', 25))
+        pnl_threshold = float(getattr(self.config, 'pelt_pnl_threshold', 0.001))
+        
         pens = np.logspace(np.log10(start_pen), np.log10(end_pen), num=n_steps)
 
         best_penalty = None
@@ -1865,17 +1887,18 @@ class AdvancedLabelingTool:
 
                 # Критерии выбора:
                 # 1. Количество changepoints близко к цели
-                # 2. PnL > 0.3 (приоритет)
+                # 2. PnL > пороговое значение (приоритет)
                 dist = abs(n_cp - target_changepoints)
 
-                # Если PnL > 0.3 и количество приемлемо - хороший кандидат
-                if quick_pnl > 0.003 and target_low <= n_cp <= target_high:
+                # Более мягкие критерии отбора
+                # Расширяем допустимый диапазон на 50% (target_high * 1.5)
+                if quick_pnl > pnl_threshold and target_low <= n_cp <= target_high * 1.5:
                     if quick_pnl > best_pnl:
                         best_pnl = quick_pnl
                         best_penalty = pen
                         best_changepoints = changepoints
                 # Если нет хороших по PnL, берём ближайший по количеству
-                elif best_pnl < 0.003 and dist < closest_distance:
+                elif best_pnl < pnl_threshold and dist < closest_distance:
                     closest_distance = dist
                     best_penalty = pen
                     best_changepoints = changepoints
