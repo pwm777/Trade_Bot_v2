@@ -146,24 +146,24 @@ class LabelingConfig:
     timeframe: str = "5m"
 
     # === BinSeg: отдельные пороги, чтобы можно было делать разметку "пожирнее" ===
-    binseg_min_trend_strength: float = 0.0015      # было жёстко 0.002 (0.2%), стало 0.15%
-    binseg_trend_ratio: float = 0.25               # было 0.3 (30%), стало 25%
-    binseg_min_segment_len: int = 10               # защита от совсем микросегментов
+    binseg_min_trend_strength: float = 0.001      # было жёстко 0.002 (0.2%), стало 0.15%
+    binseg_trend_ratio: float = 0.20               # было 0.3 (30%), стало 25%
+    binseg_min_segment_len: int = 6               # защита от совсем микросегментов
     binseg_potential_bonus: float = 0.02           # бонус к score за potential_signals
     binseg_potential_bonus_cap: float = 0.30       # максимум бонуса (было 0.1)
 
-    # PELT Online
+    # PELT Offline
     pelt_window: int = 1000
     pelt_pen: float = 1
-    pelt_min_size: int = 10
+    pelt_min_size: int = 2
     pelt_confirm_bar: int = 3
-    
+
     # PELT параметры для offline разметки
-    pelt_penalty_min: float = 1e-6  # Минимальный penalty
-    pelt_penalty_max: float = 1e-2  # Максимальный penalty
-    pelt_penalty_steps: int = 25    # Шагов при подборе
-    pelt_target_daily: float = 7.0  # Увеличить с 5.0 до 7.0 сделок в день
-    pelt_pnl_threshold: float = 0.001  # Минимальный PnL для принятия сигнала
+    pelt_penalty_min: float = 1e-9  # Было 1e-6
+    pelt_penalty_max: float = 1e-3  # Было 1e-2
+    pelt_penalty_steps: int = 30  # Было 25
+    pelt_target_daily: float = 25.0  # Было 7.0
+    pelt_pnl_threshold: float = 0.0003
 
     # CUSUM
     cusum_z_threshold: float = 3 # минимальный |cusum_zscore|,
@@ -513,7 +513,7 @@ class AdvancedLabelingTool:
         self.config = config
 
         logger = logging.getLogger(__name__)
-        _VALID_METHODS = {"CUSUM", "EXTREMUM", "PELT_ONLINE", "CUSUM_EXTREMUM"}
+        _VALID_METHODS = {"CUSUM", "EXTREMUM", "PELT_ONLINE", "PELT_OFFLINE", "CUSUM_EXTREMUM", "BINSEG"}
 
         m = (getattr(self.config, "method", None) or "CUSUM_EXTREMUM").upper()
         if m not in _VALID_METHODS:
@@ -1628,16 +1628,13 @@ class AdvancedLabelingTool:
 
     def _pelt_offline_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        PELT с sliding window для работы с большими историями.
-
-        Архитектура:
+        Архитектура (БЕЗ перекрытия целевых зон):
         - Окно = 2 недели (4032 бара на 5m)
-        - Размечаем только 2-ю неделю (центральная зона)
-        - Буфер слева/справа по 1 неделе для контекста
-        - Шаг сдвига = 1 неделя
-        - Penalty подбирается локально для каждого окна
-        - Целевое количество сделок на окно: ~70 (5/день * 14 дней)
-        - Критерий качества: PnL > 0.3
+        - Размечаем первые 3.5 дня (1008 баров) = target zone
+        - Остальные 10.5 дней (3024 бара) = контекст для PELT
+        - Шаг сдвига = 3.5 дня (1008 баров) = размер target zone
+        - ПЕРЕКРЫТИЯ ЦЕЛЕВЫХ ЗОН НЕТ!
+        - PELT анализирует ВСЁ окно (4032 бара), но разметка идёт только в первые 1008 баров
         """
         if not RUPTURES_AVAILABLE:
             self.logger.warning("⚠️ ruptures недоступен — PELT OFFLINE отключен")
@@ -1647,14 +1644,14 @@ class AdvancedLabelingTool:
             self.logger.warning("⚠️ Недостаточно данных (<50 баров) для PELT")
             return []
 
-        # === ПАРАМЕТРЫ ОКНА (те же что в BinSeg) ===
+        # === ПАРАМЕТРЫ ОКНА ===
         BARS_PER_DAY = 288  # 5m: 24*60/5 = 288
         WEEK_BARS = BARS_PER_DAY * 7  # 2016 баров
 
         window_size = 2 * WEEK_BARS  # 4032 бара = 2 недели
-        target_zone_size = WEEK_BARS  # 2016 баров = размечаем 2-ю неделю
-        step_size = WEEK_BARS  # 2016 баров = сдвиг на 1 неделю
-        buffer_left = WEEK_BARS  # 2016 баров слева
+        target_zone_size = WEEK_BARS + BARS_PER_DAY  # 1008 баров = 3.5 дня (первая половина недели)
+        step_size = WEEK_BARS  # 1008 баров = сдвиг на 3.5 дня (равен target zone)
+        buffer_left = 0  # Размечаем с начала окна
 
         total_bars = len(df)
         all_results = []
@@ -1662,14 +1659,15 @@ class AdvancedLabelingTool:
         # === РАСЧЁТ КОЛИЧЕСТВА ОКОН ===
         estimated_windows = max(1, (total_bars - window_size) // step_size + 1)
 
-        # === ЦЕЛЕВОЕ КОЛИЧЕСТВО СДЕЛОК НА ОКНО ===
-        target_daily = float(getattr(self.config, 'pelt_target_daily', 5.0))
-        window_days = window_size / BARS_PER_DAY  # ~14 дней
-        target_changepoints_per_window = int(target_daily * window_days)  # ~70
+        # === ЦЕЛЕВОЕ КОЛИЧЕСТВО СДЕЛОК НА target zone (не на всё окно!) ===
+        target_daily = float(getattr(self.config, 'pelt_target_daily', 15.0))
+        target_zone_days = target_zone_size / BARS_PER_DAY  # ~3.5 дня
+        target_changepoints_per_window = int(target_daily * target_zone_days)  # ~52
 
         self.logger.info(
-            f"🎯 PELT Windowed: {total_bars} баров, окно={window_size}, шаг={step_size}, "
-            f"ожидается окон: ~{estimated_windows}, цель={target_changepoints_per_window} changepoints/окно"
+            f"🎯 PELT Windowed (БЕЗ перекрытия): {total_bars} баров, "
+            f"окно={window_size}, target_zone={target_zone_size}, шаг={step_size}, "
+            f"ожидается окон: ~{estimated_windows}, цель={target_changepoints_per_window} cp/окно"
         )
 
         # === ИТЕРАЦИЯ ПО ОКНАМ ===
@@ -1682,7 +1680,7 @@ class AdvancedLabelingTool:
             window_end = min(window_start + window_size, total_bars)
 
             # Проверка минимального размера окна
-            if window_end - window_start < target_zone_size + buffer_left:
+            if window_end - window_start < target_zone_size:
                 self.logger.debug(f"⏭️  Окно {window_num}: недостаточно данных ({window_end - window_start} баров)")
                 window_start += step_size
                 continue
@@ -1691,9 +1689,9 @@ class AdvancedLabelingTool:
             window_df = df.iloc[window_start:window_end].copy()
             window_df = window_df.reset_index(drop=True)
 
-            # === ЦЕЛЕВАЯ ЗОНА (2-я неделя) ===
-            target_start_local = buffer_left
-            target_end_local = min(buffer_left + target_zone_size, len(window_df))
+            # === ЦЕЛЕВАЯ ЗОНА (первые 1008 баров окна) ===
+            target_start_local = 0
+            target_end_local = min(target_zone_size, len(window_df))
 
             if target_end_local <= target_start_local:
                 self.logger.debug(f"⏭️  Окно {window_num}: пустая целевая зона")
@@ -1712,21 +1710,12 @@ class AdvancedLabelingTool:
                 eta_min = int(eta_seconds // 60)
                 eta_sec = int(eta_seconds % 60)
 
-                print(
-                    f"\r⏳ Окно {window_num}/{estimated_windows} "
-                    f"({100 * window_num // estimated_windows}%) | "
-                    f"Прошло: {int(elapsed // 60)}m {int(elapsed % 60)}s | "
-                    f"ETA: {eta_min}m {eta_sec}s      ",
-                    end="",
-                    flush=True
-                )
-
             self.logger.info(
-                f"📊 Окно {window_num}: [{window_start}:{window_end}] "
-                f"| Целевая зона: [{target_start_global}:{target_end_global}]"
+                f"📊 Окно {window_num}: [{window_start}:{window_end}] (размер={window_end - window_start}) "
+                f"| Целевая зона: [{target_start_global}:{target_end_global}] (размер={target_end_global - target_start_global})"
             )
 
-            # === ЗАПУСК PELT НА ОКНЕ ===
+            # === ЗАПУСК PELT НА ВСЁМ ОКНЕ, разметка только target zone ===
             window_signals = self._run_changepoint_on_window(
                 window_df=window_df,
                 target_start_local=target_start_local,
@@ -1747,14 +1736,14 @@ class AdvancedLabelingTool:
         # === ПОСТОБРАБОТКА ===
         if all_results:
             all_results.sort(key=lambda x: x['extreme_index'])
+            # Дедупликация должна удалить МИНИМУМ дубликатов
             all_results = self._filter_consecutive_same_type(all_results)
 
         total_time = time.time() - start_time
 
-        # === PNL АНАЛИЗ (общий для всей истории) ===
+        # === PNL АНАЛИЗ ===
         pnl_stats = self._calculate_pnl_for_signals(df, all_results)
 
-        # Логирование + вывод в консоль
         self.logger.info(
             f"✅ PELT Windowed: обработано {window_num} окон за "
             f"{int(total_time // 60)}m {int(total_time % 60)}s, "
@@ -1769,7 +1758,6 @@ class AdvancedLabelingTool:
                 f"total_pnl={pnl_stats['total_pnl']:.1f}%"
             )
 
-            # Вывод в консоль
             print(f"\n📈 PnL анализ (long-only):")
             print(f"   • Сделок: {pnl_stats['total_trades']}")
             print(f"   • Win rate: {pnl_stats['win_rate']:.1%}")
