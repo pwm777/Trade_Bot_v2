@@ -15,7 +15,6 @@ from datetime import datetime, UTC
 import warnings
 import logging
 import traceback
-import time
 
 try:
     import msvcrt
@@ -967,25 +966,118 @@ class AdvancedLabelingTool:
 
     def _binseg_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        Улучшенный BinSeg с защитой от ошибок, некорректных данных и падений.
-        Возвращает список сигналов: [{'index', 'type', 'confidence', 'extreme_index', 'extreme_timestamp', ...}]
+        BinSeg с sliding window для работы с большими историями.
+
+        Архитектура:
+        - Окно = 2 недели (4032 бара на 5m)
+        - Размечаем только 2-ю неделю (центральная зона)
+        - Буфер слева/справа по 1 неделе для контекста
+        - Шаг сдвига = 1 неделя
+        - Память O(4032) вместо O(95000)
         """
         if not RUPTURES_AVAILABLE:
             logger.warning("⚠️ ruptures не установлен — BinSeg отключен")
             return []
 
-        if len(df) < 50:
+        if len(df) < 100:
             logger.warning("⚠️ Слишком мало данных для BinSeg: %s баров", len(df))
             return []
 
-        close_vals = df["close"].astype(float).values
+        # === ПАРАМЕТРЫ ОКНА ===
+        BARS_PER_DAY = 288  # 5m: 24*60/5 = 288
+        WEEK_BARS = BARS_PER_DAY * 7  # 2016 баров
+
+        window_size = 2 * WEEK_BARS  # 4032 бара = 2 недели
+        target_zone_size = WEEK_BARS  # 2016 баров = размечаем 2-ю неделю
+        step_size = WEEK_BARS  # 2016 баров = сдвиг на 1 неделю
+        buffer_left = WEEK_BARS  # 2016 баров слева
+
+        total_bars = len(df)
+        all_results = []
+
+        logger.info(f"🔍 BinSeg Windowed: {total_bars} баров, окно={window_size}, шаг={step_size}")
+
+        # === ИТЕРАЦИЯ ПО ОКНАМ ===
+        window_start = 0
+        window_num = 0
+
+        while window_start < total_bars:
+            window_num += 1
+            window_end = min(window_start + window_size, total_bars)
+
+            # Проверка минимального размера окна
+            if window_end - window_start < target_zone_size + buffer_left:
+                logger.debug(f"⏭️  Окно {window_num}: недостаточно данных ({window_end - window_start} баров)")
+                window_start += step_size
+                continue
+
+            # === ИЗВЛЕЧЕНИЕ ОКНА ===
+            window_df = df.iloc[window_start:window_end].copy()
+            window_df = window_df.reset_index(drop=True)
+
+            # === ЦЕЛЕВАЯ ЗОНА (2-я неделя) ===
+            target_start_local = buffer_left
+            target_end_local = min(buffer_left + target_zone_size, len(window_df))
+
+            if target_end_local <= target_start_local:
+                logger.debug(f"⏭️  Окно {window_num}: пустая целевая зона")
+                window_start += step_size
+                continue
+
+            target_start_global = window_start + target_start_local
+            target_end_global = window_start + target_end_local
+
+            logger.info(
+                f"📊 Окно {window_num}: [{window_start}:{window_end}] "
+                f"| Целевая зона: [{target_start_global}:{target_end_global}]"
+            )
+
+            # === ЗАПУСК BINSEG НА ОКНЕ ===
+            window_signals = self._run_binseg_on_window(
+                window_df=window_df,
+                target_start_local=target_start_local,
+                target_end_local=target_end_local,
+                global_offset=window_start,
+                window_num=window_num
+            )
+
+            all_results.extend(window_signals)
+
+            # === СДВИГ ОКНА ===
+            window_start += step_size
+
+        # === ПОСТОБРАБОТКА ===
+        if all_results:
+            all_results.sort(key=lambda x: x['extreme_index'])
+            all_results = self._filter_consecutive_same_type(all_results)
+
+        logger.info(
+            f"✅ BinSeg Windowed: обработано {window_num} окон, "
+            f"найдено {len(all_results)} уникальных сигналов"
+        )
+
+        return all_results
+
+    def _run_binseg_on_window(
+            self,
+            window_df: pd.DataFrame,
+            target_start_local: int,
+            target_end_local: int,
+            global_offset: int,
+            window_num: int
+    ) -> List[Dict]:
+        """
+        Запускает BinSeg на одном окне и возвращает сигналы только из целевой зоны.
+        """
+        close_vals = window_df["close"].astype(float).values
         close_vals = np.nan_to_num(close_vals, nan=1e-12, posinf=1e12, neginf=1e-12)
         n = len(close_vals)
-        if n == 0:
-            logger.error("❌ Пустые данные после очистки")
+
+        if n < 50:
+            logger.debug(f"⏭️  Окно {window_num}: мало данных ({n} баров)")
             return []
 
-        # Сигналы для анализа
+        # === ПОДГОТОВКА СИГНАЛОВ ===
         signals = {}
         log_prices = np.log(np.clip(close_vals, 1e-12, None))
         returns = np.diff(log_prices)
@@ -1001,21 +1093,16 @@ class AdvancedLabelingTool:
         volatility = np.abs(returns) * 100.0
         signals["volatility"] = volatility
 
-        candidate_n_bkps = [50, 80, 120, 180, 250, 350]
+        # === ПОДБОР ЛУЧШЕЙ КОНФИГУРАЦИИ ===
+        candidate_n_bkps = [30, 50, 80, 120]
         models = ["l2", "rbf"]
 
-        total_iterations = len(signals) * len(models) * len(candidate_n_bkps)
-        current_iteration = 0
-        start_time = time.time()
-
-        print(f"🔍 BinSeg: {n} свечей | {total_iterations} итераций")
         best_result = None
         best_score = -np.inf
 
         max_reasonable_bkps = n // 100
         if max_reasonable_bkps < min(candidate_n_bkps):
-            logger.warning("⚠️ Слишком мало данных: max_reasonable_bkps=%s < min(candidate_n_bkps)=%s",
-                           max_reasonable_bkps, min(candidate_n_bkps))
+            logger.debug(f"⏭️  Окно {window_num}: max_bkps={max_reasonable_bkps} < {min(candidate_n_bkps)}")
             return []
 
         for signal_name, signal_data in signals.items():
@@ -1023,37 +1110,31 @@ class AdvancedLabelingTool:
                 continue
 
             for model in models:
+                algo = None
                 try:
-                    algo = rpt.Binseg(model=model, min_size=5, jump=2)
+                    algo = rpt.Binseg(model=model, min_size=5, jump=2).fit(signal_data)
                 except Exception as err:
-                    logger.debug("BinSeg fit error: %s, %s: %s", signal_name, model, err)
+                    logger.debug(f"BinSeg fit error (окно {window_num}): {signal_name}, {model}: {err}")
                     continue
 
                 for n_bkps in candidate_n_bkps:
-                    current_iteration += 1
-                    if current_iteration % 50 == 0:
-                        elapsed = time.time() - start_time
-                        print(f"\r⏳ Progress: {current_iteration}/{total_iterations} "
-                              f"({100 * current_iteration // total_iterations}%) | "
-                              f"Time: {int(elapsed // 60)}m {int(elapsed % 60)}s", end="", flush=True)
-
                     if n_bkps >= max_reasonable_bkps:
                         continue
 
                     try:
                         changepoints = algo.predict(n_bkps=n_bkps)
-                    except Exception as err:
-                        logger.debug("BinSeg predict error: %s", err)
+                    except Exception:
                         continue
 
                     changepoints = [int(cp) for cp in changepoints if 5 < cp < n - 5]
+
                     if len(changepoints) < 3:
-                        logger.debug("Слишком мало changepoints после фильтрации: %s", len(changepoints))
                         continue
 
-                    score = self._evaluate_segmentation_improved(df, changepoints, signal_name)
-                    potential_signals = self._count_potential_signals(df, changepoints)
-                    score += min(potential_signals * 0.01, 0.1)
+                    score = self._evaluate_segmentation_improved(window_df, changepoints, signal_name)
+                    potential_signals = self._count_potential_signals(window_df, changepoints)
+                    score += min(potential_signals * self.config.binseg_potential_bonus,
+                                 self.config.binseg_potential_bonus_cap)
 
                     if score > best_score:
                         best_score = score
@@ -1063,32 +1144,81 @@ class AdvancedLabelingTool:
                             "n_bkps": n_bkps,
                             "changepoints": changepoints,
                             "score": score,
-                            "potential_signals": potential_signals,
                         }
 
-        print()  # newline after progress
+                if algo is not None:
+                    del algo
 
         if best_result is None:
-            logger.warning("❌ BinSeg: не удалось найти подходящие changepoints")
+            logger.debug(f"⏭️  Окно {window_num}: не найдено changepoints")
             return []
 
         changepoints = best_result["changepoints"]
-        print(
-            f"✅ Лучшая конфигурация: {best_result['signal']}, model={best_result['model']}, n_bkps={best_result['n_bkps']}")
-        print(f"📊 Найдено точек разрыва: {len(changepoints)}")
+        logger.debug(
+            f"  Окно {window_num}: {best_result['signal']}, "
+            f"model={best_result['model']}, n_bkps={best_result['n_bkps']}, "
+            f"changepoints={len(changepoints)}"
+        )
 
-        results = self._convert_changepoints_to_signals_improved(df, changepoints)
+        # === ПРЕОБРАЗОВАНИЕ В СИГНАЛЫ ===
+        all_signals = self._convert_changepoints_to_signals_improved(window_df, changepoints)
 
-        if not results:
-            logger.warning("⚠️ BinSeg: после преобразования в сигналы не осталось результатов")
+        # === ФИЛЬТРАЦИЯ ПО ЦЕЛЕВОЙ ЗОНЕ (используем ts, не индексы) ===
+        target_signals = []
+        target_ts_start = int(window_df.iloc[target_start_local]['ts'])
+        target_ts_end = int(window_df.iloc[target_end_local - 1]['ts'])
+
+        for sig in all_signals:
+            sig_ts = sig.get('extreme_timestamp')
+
+            if sig_ts and target_ts_start <= sig_ts <= target_ts_end:
+                # Конвертируем локальные индексы в глобальные
+                sig['index'] = global_offset + sig['index']
+                sig['extreme_index'] = global_offset + sig['extreme_index']
+                sig['confirmation_index'] = global_offset + sig.get('confirmation_index', sig['index'])
+
+                target_signals.append(sig)
+
+        logger.debug(
+            f"  Окно {window_num}: найдено {len(all_signals)} сигналов, "
+            f"в целевой зоне: {len(target_signals)}"
+        )
+
+        return target_signals
+
+    def _filter_consecutive_same_type(self, signals: List[Dict]) -> List[Dict]:
+        """
+        Удаляет последовательные сигналы одного типа (BUY→BUY, SELL→SELL).
+        Оставляет сигнал с максимальной confidence (при равенстве - последний).
+        """
+        if not signals:
             return []
 
-        buy_count = sum(1 for r in results if r["type"] == "BUY")
-        sell_count = sum(1 for r in results if r["type"] == "SELL")
-        avg_confidence = float(np.mean([r["confidence"] for r in results]))
-        print(f"📈 Итоги: {buy_count} BUY, {sell_count} SELL, средняя уверенность: {avg_confidence:.2f}")
+        filtered = []
+        i = 0
 
-        return results
+        while i < len(signals):
+            current = signals[i]
+            current_type = current['type']
+
+            # Ищем все последовательные сигналы того же типа
+            group = [current]
+            j = i + 1
+            while j < len(signals) and signals[j]['type'] == current_type:
+                group.append(signals[j])
+                j += 1
+
+            # Выбираем лучший: сначала по confidence, потом по extreme_index
+            best_signal = max(group, key=lambda s: (s.get('confidence', 0), s['extreme_index']))
+            filtered.append(best_signal)
+
+            i = j
+
+        removed_count = len(signals) - len(filtered)
+        if removed_count > 0:
+            logger.info(f"🔧 Удалено {removed_count} последовательных дубликатов (BUY→BUY, SELL→SELL)")
+
+        return filtered
 
     def _convert_changepoints_to_signals_improved(
         self,
