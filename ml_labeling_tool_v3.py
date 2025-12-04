@@ -967,186 +967,126 @@ class AdvancedLabelingTool:
 
     def _binseg_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        BinSeg-разметка без зависаний:
-        - один fit на (signal_type, model) → много predict(n_bkps)
-        - ограничение длины ряда
-        - без rbf (только l2), чтобы не уходить в своп
+        Улучшенный BinSeg с защитой от ошибок, некорректных данных и падений.
+        Возвращает список сигналов: [{'index', 'type', 'confidence', 'extreme_index', 'extreme_timestamp', ...}]
         """
         if not RUPTURES_AVAILABLE:
-            logger.warning("⚠️ Библиотека ruptures недоступна")
+            logger.warning("⚠️ ruptures не установлен — BinSeg отключен")
             return []
 
-        # ⚡ Ограничение размера ряда: на практике 50–60k баров достаточно
-        MAX_SAMPLES = 60_000
-        if len(df) > MAX_SAMPLES:
-            logger.info(f"⚡ Сокращаем данные с {len(df)} до {MAX_SAMPLES} samples (последние бары)")
-            df = df.iloc[-MAX_SAMPLES:].copy()
-
-        if len(df) < 500:
-            logger.warning(f"⚠️ Недостаточно данных для BinSeg: {len(df)}")
+        if len(df) < 50:
+            logger.warning("⚠️ Слишком мало данных для BinSeg: %s баров", len(df))
             return []
 
         close_vals = df["close"].astype(float).values
+        close_vals = np.nan_to_num(close_vals, nan=1e-12, posinf=1e12, neginf=1e-12)
+        n = len(close_vals)
+        if n == 0:
+            logger.error("❌ Пустые данные после очистки")
+            return []
 
-        # 1. Строим разные сигналы
+        # Сигналы для анализа
+        signals = {}
         log_prices = np.log(np.clip(close_vals, 1e-12, None))
         returns = np.diff(log_prices)
-        returns = np.insert(returns, 0, 0)
+        returns = np.insert(returns, 0, 0.0)
+        signals["returns"] = returns
 
-        price_mean = float(np.mean(close_vals))
-        price_std = float(np.std(close_vals)) if np.std(close_vals) > 0 else 0.0
-
-        signals: Dict[str, np.ndarray] = {}
-        signals["returns"] = returns.astype(np.float32)
-
+        price_mean = np.mean(close_vals)
+        price_std = np.std(close_vals)
         if price_std > 0:
             normalized_prices = (close_vals - price_mean) / price_std
-            signals["normalized"] = normalized_prices.astype(np.float32)
+            signals["normalized"] = normalized_prices
 
-        volatility = (np.abs(returns) * 100.0).astype(np.float32)
+        volatility = np.abs(returns) * 100.0
         signals["volatility"] = volatility
 
-        # 2. Кандидаты по количеству разрывов (подбираем "структуру")
-        candidate_n_bkps = [12, 18, 25, 35, 50]
-
-        # 3. Модели: используем только l2 (rbf отключаем, чтобы не ловить OOM/своп)
-        models = ["l2"]
+        candidate_n_bkps = [50, 80, 120, 180, 250, 350]
+        models = ["l2", "rbf"]
 
         total_iterations = len(signals) * len(models) * len(candidate_n_bkps)
         current_iteration = 0
         start_time = time.time()
 
-        print(
-            f"🔍 BinSeg: анализ {len(df)} свечей | Итераций: {total_iterations} | "
-            f"Ожидайте 20–40 минут...",
-            flush=True,
-        )
-
-        best_result: Optional[Dict[str, Any]] = None
+        print(f"🔍 BinSeg: {n} свечей | {total_iterations} итераций")
+        best_result = None
         best_score = -np.inf
 
+        max_reasonable_bkps = n // 100
+        if max_reasonable_bkps < min(candidate_n_bkps):
+            logger.warning("⚠️ Слишком мало данных: max_reasonable_bkps=%s < min(candidate_n_bkps)=%s",
+                           max_reasonable_bkps, min(candidate_n_bkps))
+            return []
+
         for signal_name, signal_data in signals.items():
-            signal_len = len(signal_data)
-            if signal_len < 200:
+            if len(signal_data) < 50:
                 continue
 
-            # максимум changepoints — не чаще, чем каждые 3 бара
-            max_n_bkps_allowed = max(3, signal_len // 3)
-
             for model in models:
-                # Один fit на связку (signal_name, model)
                 try:
-                    algo = rpt.Binseg(model=model, min_size=15, jump=8).fit(signal_data)
-                except MemoryError:
-                    logger.error(
-                        f"❌ BinSeg: MemoryError при fit для {signal_name}, model={model} "
-                        f"(len={signal_len}) — пропускаем"
-                    )
-                    continue
+                    algo = rpt.Binseg(model=model, min_size=5, jump=2)
                 except Exception as err:
-                    logger.warning(
-                        f"❌ BinSeg: ошибка fit для {signal_name}, model={model}: {err}"
-                    )
+                    logger.debug("BinSeg fit error: %s, %s: %s", signal_name, model, err)
                     continue
 
                 for n_bkps in candidate_n_bkps:
                     current_iteration += 1
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / max(current_iteration, 1)
-                    remaining = avg_time * max(total_iterations - current_iteration, 0)
+                    if current_iteration % 50 == 0:
+                        elapsed = time.time() - start_time
+                        print(f"\r⏳ Progress: {current_iteration}/{total_iterations} "
+                              f"({100 * current_iteration // total_iterations}%) | "
+                              f"Time: {int(elapsed // 60)}m {int(elapsed % 60)}s", end="", flush=True)
 
-                    print(
-                        f"\r⏳ Прогресс: {current_iteration}/{total_iterations} "
-                        f"({current_iteration * 100 // total_iterations}%) | "
-                        f"Время: {int(elapsed // 60)}м {int(elapsed % 60)}с | "
-                        f"Осталось: ~{int(remaining // 60)}м {int(remaining % 60)}с",
-                        end="",
-                        flush=True,
-                    )
-
-                    if n_bkps >= max_n_bkps_allowed:
+                    if n_bkps >= max_reasonable_bkps:
                         continue
 
                     try:
-                        changepoints = algo.predict(n_bkps=int(n_bkps))
-                    except MemoryError:
-                        logger.error(
-                            f"\n❌ BinSeg: MemoryError при predict n_bkps={n_bkps} "
-                            f"для {signal_name}, model={model} — пропускаем эту комбинацию"
-                        )
-                        continue
+                        changepoints = algo.predict(n_bkps=n_bkps)
                     except Exception as err:
-                        logger.debug(
-                            f"\nBinSeg: ошибка predict для {signal_name}, "
-                            f"model={model}, n_bkps={n_bkps}: {err}"
-                        )
+                        logger.debug("BinSeg predict error: %s", err)
                         continue
 
-                    # фильтруем края
-                    changepoints = [cp for cp in changepoints if 15 < cp < len(df) - 15]
+                    changepoints = [int(cp) for cp in changepoints if 5 < cp < n - 5]
                     if len(changepoints) < 3:
+                        logger.debug("Слишком мало changepoints после фильтрации: %s", len(changepoints))
                         continue
 
-                    # качество сегментации
-                    score = self._evaluate_segmentation_improved(
-                        df, changepoints, signal_name
-                    )
-
+                    score = self._evaluate_segmentation_improved(df, changepoints, signal_name)
                     potential_signals = self._count_potential_signals(df, changepoints)
                     score += min(potential_signals * 0.01, 0.1)
 
                     if score > best_score:
                         best_score = score
-                        clean_cps = [
-                            int(cp)
-                            for cp in changepoints
-                            if isinstance(cp, (int, np.integer))
-                        ]
-                        if len(clean_cps) < 3:
-                            continue
-
                         best_result = {
                             "signal": signal_name,
                             "model": model,
                             "n_bkps": n_bkps,
-                            "changepoints": clean_cps,
+                            "changepoints": changepoints,
                             "score": score,
                             "potential_signals": potential_signals,
                         }
 
-        print()  # перенос строки после прогресса
+        print()  # newline after progress
 
-        if not best_result:
-            logger.warning("❌ BinSeg не смог найти точки разрыва")
+        if best_result is None:
+            logger.warning("❌ BinSeg: не удалось найти подходящие changepoints")
             return []
 
         changepoints = best_result["changepoints"]
-        if not changepoints:
-            logger.warning("❌ BinSeg: пустой список changepoints")
-            return []
-
         print(
-            f"✅ Лучшая конфигурация: {best_result['signal']}, "
-            f"model={best_result['model']}, n_bkps={best_result['n_bkps']}"
-        )
-        print(
-            f"📊 Найдено точек разрыва: {len(changepoints)}, "
-            f"потенциальных сигналов: {best_result['potential_signals']}"
-        )
+            f"✅ Лучшая конфигурация: {best_result['signal']}, model={best_result['model']}, n_bkps={best_result['n_bkps']}")
+        print(f"📊 Найдено точек разрыва: {len(changepoints)}")
 
         results = self._convert_changepoints_to_signals_improved(df, changepoints)
-        logger.info(f"📊 BinSeg найдено {len(results)} сигналов")
 
-        if results:
-            buy_count = sum(1 for r in results if r["type"] == "BUY")
-            sell_count = sum(1 for r in results if r["type"] == "SELL")
-            avg_conf = float(
-                np.mean([r["confidence"] for r in results])
-            ) if results else 0.0
-            print(
-                f"📈 Итоги: {buy_count} BUY, {sell_count} SELL, "
-                f"средняя уверенность: {avg_conf:.2f}"
-            )
+        if not results:
+            logger.warning("⚠️ BinSeg: после преобразования в сигналы не осталось результатов")
+            return []
+
+        buy_count = sum(1 for r in results if r["type"] == "BUY")
+        sell_count = sum(1 for r in results if r["type"] == "SELL")
+        avg_confidence = float(np.mean([r["confidence"] for r in results]))
+        print(f"📈 Итоги: {buy_count} BUY, {sell_count} SELL, средняя уверенность: {avg_confidence:.2f}")
 
         return results
 
@@ -1179,7 +1119,7 @@ class AdvancedLabelingTool:
 
         # Базовый порог силы тренда (можно переопределить в конфиге)
         min_trend_strength = float(
-            getattr(self.config, "binseg_min_trend_strength", 0.001)  # ~0.1%
+            getattr(self.config, "binseg_min_trend_strength", 0.0005)  # ~0.1%
         )
 
         def trend_dir(x: float) -> int:
@@ -1287,12 +1227,8 @@ class AdvancedLabelingTool:
 
             is_high_quality = 1
             if confirmation.get("early_rejection"):
-                # Раньше такие сигналы просто отбрасывались.
-                # Теперь оставляем их как "слабые":
-                #   - режем уверенность
-                #   - помечаем is_high_quality = 0
-                confidence = float(max(0.1, confidence * 0.5))
-                is_high_quality = 0
+                confidence = max(0.1, confidence * 0.8)
+                is_high_quality = 1
 
             results.append({
                 "index": int(entry_index),
