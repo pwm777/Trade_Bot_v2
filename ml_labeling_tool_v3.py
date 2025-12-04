@@ -167,7 +167,7 @@ class LabelingConfig:
     method: str = "CUSUM_EXTREMUM"
     # PnL параметры
     fee_percent: float = 0.0004
-    min_profit_target: float = 0.001
+    min_profit_target: float = 0.0005
     tool: Any = None
 
     # === HOLD разметка: пороги волатильности (нормализованное значение ATR/price) ===
@@ -1132,21 +1132,27 @@ class AdvancedLabelingTool:
             current_trend = (price_current_end - price_current_start) / price_current_start
 
             # 🎯 УЛУЧШЕННЫЕ КРИТЕРИИ:
-            min_trend_strength = 0.002  # 0.3% минимальное изменение
+            min_trend_strength = 0.001  # 0.1% минимальное изменение
 
-            # СИГНАЛ BUY: сильное падение → сильный рост
-            if (prev_trend < -min_trend_strength and
-                    current_trend > min_trend_strength and
-                    abs(current_trend) > abs(prev_trend) * 0.3):  # Меньше требований к силе
+            # Коэффициент относительной силы: раньше 0.3, теперь 0.2 —
+            # допускаем, что новый тренд может быть не сильно сильнее предыдущего, но всё равно значим.
+            relative_strength_factor = 0.2
 
+            # СИГНАЛ BUY: падение → рост
+            if (
+                prev_trend < -min_trend_strength and
+                current_trend > min_trend_strength and
+                abs(current_trend) > abs(prev_trend) * relative_strength_factor
+            ):
                 rev_type = "BUY"
                 confidence = min(abs(current_trend) * 15 + abs(prev_trend) * 10, 0.95)
 
-            # СИГНАЛ SELL: сильный рост → сильное падение
-            elif (prev_trend > min_trend_strength and
-                  current_trend < -min_trend_strength and
-                  abs(current_trend) > abs(prev_trend) * 0.3):
-
+            # СИГНАЛ SELL: рост → падение
+            elif (
+                prev_trend > min_trend_strength and
+                current_trend < -min_trend_strength and
+                abs(current_trend) > abs(prev_trend) * relative_strength_factor
+            ):
                 rev_type = "SELL"
                 confidence = min(abs(current_trend) * 15 + abs(prev_trend) * 10, 0.95)
 
