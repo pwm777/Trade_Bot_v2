@@ -339,16 +339,10 @@ class DataLoader:
             ORDER BY lr.timestamp
         """
         try:
-            positives = pd.read_sql_query(
-                query,
-                self.db_engine,
-                params=(self.symbol,)
-            )
-
+            positives = pd.read_sql_query(query,self.db_engine,params=(self.symbol,))
             if positives.empty:
                 logger.warning(f"❌ Нет размеченных данных для символа {self.symbol}")
                 return pd.DataFrame()
-
             # проверяем существование колонки перед обработкой
             if 'extreme_timestamp' in positives.columns:
                 # Преобразуем в числовой формат, некорректные значения станут NaN
