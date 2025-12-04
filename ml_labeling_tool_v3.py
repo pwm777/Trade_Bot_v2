@@ -15,6 +15,7 @@ from datetime import datetime, UTC
 import warnings
 import logging
 import traceback
+import time
 
 # msvcrt is Windows-only, make import conditional
 try:
@@ -960,19 +961,14 @@ class AdvancedLabelingTool:
 
     def _binseg_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        Улучшенный BinSeg с лучшей настройкой параметров
+        Улучшенный BinSeg с лучшей настройкой параметров.
+        Для больших датасетов (100k+ свечей) используем большие n_bkps.
         """
         if not RUPTURES_AVAILABLE:
             logger.warning("⚠️ Библиотека ruptures недоступна")
             return []
 
-        # ⚡ ОПТИМИЗАЦИЯ: Более разумное ограничение данных
-        optimal_samples = len(df)
-        if len(df) > optimal_samples:
-            logger.info(f"⚡ Сокращаем данные с {len(df)} до {optimal_samples} samples")
-            df = df.iloc[-optimal_samples:].copy()
-
-        # Подготовка данных
+        # Подготовка данных (без ограничения размера)
         close_vals = df['close'].astype(float).values
 
         # 🎯 ИСПОЛЬЗУЕМ РАЗНЫЕ ТИПЫ СИГНАЛОВ ДЛЯ ЛУЧШЕГО ОБНАРУЖЕНИЯ
@@ -995,7 +991,14 @@ class AdvancedLabelingTool:
         volatility = np.abs(returns) * 100  # Процентная волатильность
         signals['volatility'] = volatility
 
-        print("🔍 BinSeg: расширенный подбор параметров...")
+        # Для больших данных используем большие n_bkps
+        candidate_n_bkps = [200, 300, 400, 500, 600, 800]
+        total_iterations = len(signals) * 2 * len(candidate_n_bkps)  # 3*2*6 = 36
+        current_iteration = 0
+        start_time = time.time()
+
+        print(f"🔍 BinSeg: анализ {len(df)} свечей | Итераций: {total_iterations} | Ожидайте 1-3 часа...")
+        print(f"⏳ Прогресс: 0/{total_iterations} (0%) | Время: 0м 0с | Осталось: ~? ", end="", flush=True)
 
         # 🎯 РАСШИРЕННЫЙ ПОДБОР ПАРАМЕТРОВ
         best_result = None
@@ -1003,9 +1006,21 @@ class AdvancedLabelingTool:
 
         # Тестируем разные комбинации
         for signal_name, signal_data in signals.items():
-            for n_bkps in [8, 12, 15, 18, 20, 25]:  # Более широкий диапазон
+            for n_bkps in candidate_n_bkps:
                 for model in ["l2", "rbf"]:  # Только работающие модели
                     try:
+                        # Обновление прогресса
+                        current_iteration += 1
+                        elapsed = time.time() - start_time
+                        avg_time = elapsed / current_iteration
+                        remaining = avg_time * (total_iterations - current_iteration)
+
+                        print(f"\r⏳ Прогресс: {current_iteration}/{total_iterations} "
+                              f"({current_iteration * 100 // total_iterations}%) | "
+                              f"Время: {int(elapsed // 60)}м {int(elapsed % 60)}с | "
+                              f"Осталось: ~{int(remaining // 60)}м {int(remaining % 60)}с",
+                              end="", flush=True)
+
                         if n_bkps >= len(signal_data) // 3:
                             continue
 
@@ -1028,27 +1043,43 @@ class AdvancedLabelingTool:
 
                         if score > best_score:
                             best_score = score
+                            changepoints_clean = [int(cp) for cp in changepoints if isinstance(cp, (int, np.integer))]
+
+                            if len(changepoints_clean) < 3:  # Минимум 3 точки
+                                continue
+
                             best_result = {
                                 'signal': signal_name,
                                 'model': model,
                                 'n_bkps': n_bkps,
-                                'changepoints': changepoints,
+                                'changepoints': changepoints_clean,  # ← Гарантированно List[int]
                                 'score': score,
                                 'potential_signals': potential_signals
                             }
 
-                        print(
-                            f"  {signal_name:12} model={model}, n_bkps={n_bkps:2} → {len(changepoints):2} точек, score={score:.3f}, signals={potential_signals}")
-
                     except Exception as err:
-                        # print(f"  {signal_name:12} model={model}, n_bkps={n_bkps:2} → ошибка: {err}")
                         continue
+
+        # Завершаем прогресс-бар
+        print()
 
         if not best_result:
             logger.warning("❌ BinSeg не смог найти точки разрыва")
             return []
 
         changepoints = best_result['changepoints']
+
+        # Проверка валидности changepoints
+        if not changepoints or not isinstance(changepoints, list):
+            logger.warning("❌ BinSeg: невалидные точки разрыва")
+            return []
+
+        # Дополнительная фильтрация: только int
+        changepoints = [int(cp) for cp in changepoints if isinstance(cp, (int, np.integer))]
+
+        if not changepoints:
+            logger.warning("❌ BinSeg: нет валидных точек разрыва после фильтрации")
+            return []
         print(
             f"✅ Лучшая конфигурация: {best_result['signal']}, model={best_result['model']}, n_bkps={best_result['n_bkps']}")
         print(
