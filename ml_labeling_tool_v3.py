@@ -349,7 +349,7 @@ class DataLoader:
                 logger.warning(f"❌ Нет размеченных данных для символа {self.symbol}")
                 return pd.DataFrame()
 
-            # ⬇️ ИСПРАВЛЕНИЕ: проверяем существование колонки перед обработкой
+            # проверяем существование колонки перед обработкой
             if 'extreme_timestamp' in positives.columns:
                 # Преобразуем в числовой формат, некорректные значения станут NaN
                 positives['extreme_timestamp'] = pd.to_numeric(positives['extreme_timestamp'], errors='coerce')
