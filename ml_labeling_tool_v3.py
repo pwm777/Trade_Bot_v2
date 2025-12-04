@@ -166,8 +166,8 @@ class LabelingConfig:
 
     # Extremum (min/max)
     extremum_confirm_bar: int = 2
-    extremum_window: int = 8
-    min_signal_distance: int = 3
+    extremum_window: int = 12
+    min_signal_distance: int = 6
     # Фильтры
     method: str = "CUSUM_EXTREMUM"
     # PnL параметры
@@ -421,11 +421,11 @@ class DataLoader:
             'total_labels': 0,
             'buy_labels': 0,
             'sell_labels': 0,
+            'hold_labels': 0,  # ✅ ДОБАВЛЕНО!
             'avg_confidence': 0.0
         }
 
         try:
-            # Используем self.db_engine.connect() вместо self.conn
             with self.db_engine.connect() as conn:
                 # Статистика свечей
                 candles_result = conn.execute(
@@ -444,17 +444,19 @@ class DataLoader:
                     text("""
                         SELECT COUNT(*), AVG(reversal_confidence),
                                SUM(CASE WHEN reversal_label = 1 THEN 1 ELSE 0 END),
-                               SUM(CASE WHEN reversal_label = 2 THEN 1 ELSE 0 END)
+                               SUM(CASE WHEN reversal_label = 2 THEN 1 ELSE 0 END),
+                               SUM(CASE WHEN reversal_label = 0 THEN 1 ELSE 0 END)
                         FROM labeling_results WHERE symbol = :symbol
                     """),
                     {'symbol': self.symbol}
                 ).fetchone()
 
                 if labels_result:
-                    total_labels, avg_conf, buy_labels, sell_labels = labels_result
+                    total_labels, avg_conf, buy_labels, sell_labels, hold_labels = labels_result
                     stats['total_labels'] = total_labels or 0
                     stats['buy_labels'] = buy_labels or 0
                     stats['sell_labels'] = sell_labels or 0
+                    stats['hold_labels'] = hold_labels or 0  # ✅ ДОБАВЛЕНО!
                     stats['avg_confidence'] = float(avg_conf) if avg_conf else 0.0
 
         except Exception as err:
@@ -1057,12 +1059,13 @@ class AdvancedLabelingTool:
             )
 
             # === ЗАПУСК BINSEG НА ОКНЕ ===
-            window_signals = self._run_binseg_on_window(
+            window_signals = self._run_changepoint_on_window(
                 window_df=window_df,
                 target_start_local=target_start_local,
                 target_end_local=target_end_local,
                 global_offset=window_start,
-                window_num=window_num
+                window_num=window_num,
+                method='BINSEG'
             )
 
             all_results.extend(window_signals)
@@ -1078,11 +1081,31 @@ class AdvancedLabelingTool:
             all_results = self._filter_consecutive_same_type(all_results)
 
         total_time = time.time() - start_time
+
+        # === PNL АНАЛИЗ (общий для всей истории) ===
+        pnl_stats = self._calculate_pnl_for_signals(df, all_results)
+
+        # Логирование + вывод в консоль
         logger.info(
             f"✅ BinSeg Windowed: обработано {window_num} окон за "
             f"{int(total_time // 60)}m {int(total_time % 60)}s, "
             f"найдено {len(all_results)} уникальных сигналов"
         )
+
+        if pnl_stats:
+            logger.info(
+                f"📈 PnL анализ: сделок={pnl_stats['total_trades']}, "
+                f"win_rate={pnl_stats['win_rate']:.1%}, "
+                f"avg_pnl={pnl_stats['avg_pnl']:.2%}, "
+                f"total_pnl={pnl_stats['total_pnl']:.1f}%"
+            )
+
+            # Вывод в консоль
+            print(f"\n📈 PnL анализ (long-only):")
+            print(f"   • Сделок: {pnl_stats['total_trades']}")
+            print(f"   • Win rate: {pnl_stats['win_rate']:.1%}")
+            print(f"   • Средний PnL: {pnl_stats['avg_pnl']:.2%}")
+            print(f"   • Суммарный PnL: {pnl_stats['total_pnl']:.1f}%")
 
         return all_results
 
@@ -1604,14 +1627,17 @@ class AdvancedLabelingTool:
 
     def _pelt_offline_reversals(self, df: pd.DataFrame) -> List[Dict]:
         """
-        Автоматическая разметка через PELT: ~5 сделок в сутки (цель настраивается через config.pelt_target_daily).
-        Возвращает список сигналов в формате [{index, type, confidence, extreme_index, extreme_timestamp, ...}].
-        Без интерактивного ввода — fully automated.
-        """
-        prev_start:int = 0
-        end:int = 0
-        start:int = 0
+        PELT с sliding window для работы с большими историями.
 
+        Архитектура:
+        - Окно = 2 недели (4032 бара на 5m)
+        - Размечаем только 2-ю неделю (центральная зона)
+        - Буфер слева/справа по 1 неделе для контекста
+        - Шаг сдвига = 1 неделя
+        - Penalty подбирается локально для каждого окна
+        - Целевое количество сделок на окно: ~70 (5/день * 14 дней)
+        - Критерий качества: PnL > 0.3
+        """
         if not RUPTURES_AVAILABLE:
             self.logger.warning("⚠️ ruptures недоступен — PELT OFFLINE отключен")
             return []
@@ -1620,145 +1646,469 @@ class AdvancedLabelingTool:
             self.logger.warning("⚠️ Недостаточно данных (<50 баров) для PELT")
             return []
 
-        # === Параметры из конфига или дефолты ===
+        # === ПАРАМЕТРЫ ОКНА (те же что в BinSeg) ===
+        BARS_PER_DAY = 288  # 5m: 24*60/5 = 288
+        WEEK_BARS = BARS_PER_DAY * 7  # 2016 баров
+
+        window_size = 2 * WEEK_BARS  # 4032 бара = 2 недели
+        target_zone_size = WEEK_BARS  # 2016 баров = размечаем 2-ю неделю
+        step_size = WEEK_BARS  # 2016 баров = сдвиг на 1 неделю
+        buffer_left = WEEK_BARS  # 2016 баров слева
+
+        total_bars = len(df)
+        all_results = []
+
+        # === РАСЧЁТ КОЛИЧЕСТВА ОКОН ===
+        estimated_windows = max(1, (total_bars - window_size) // step_size + 1)
+
+        # === ЦЕЛЕВОЕ КОЛИЧЕСТВО СДЕЛОК НА ОКНО ===
         target_daily = float(getattr(self.config, 'pelt_target_daily', 5.0))
+        window_days = window_size / BARS_PER_DAY  # ~14 дней
+        target_changepoints_per_window = int(target_daily * window_days)  # ~70
+
+        self.logger.info(
+            f"🎯 PELT Windowed: {total_bars} баров, окно={window_size}, шаг={step_size}, "
+            f"ожидается окон: ~{estimated_windows}, цель={target_changepoints_per_window} changepoints/окно"
+        )
+
+        # === ИТЕРАЦИЯ ПО ОКНАМ ===
+        window_start = 0
+        window_num = 0
+        start_time = time.time()
+
+        while window_start < total_bars:
+            window_num += 1
+            window_end = min(window_start + window_size, total_bars)
+
+            # Проверка минимального размера окна
+            if window_end - window_start < target_zone_size + buffer_left:
+                self.logger.debug(f"⏭️  Окно {window_num}: недостаточно данных ({window_end - window_start} баров)")
+                window_start += step_size
+                continue
+
+            # === ИЗВЛЕЧЕНИЕ ОКНА ===
+            window_df = df.iloc[window_start:window_end].copy()
+            window_df = window_df.reset_index(drop=True)
+
+            # === ЦЕЛЕВАЯ ЗОНА (2-я неделя) ===
+            target_start_local = buffer_left
+            target_end_local = min(buffer_left + target_zone_size, len(window_df))
+
+            if target_end_local <= target_start_local:
+                self.logger.debug(f"⏭️  Окно {window_num}: пустая целевая зона")
+                window_start += step_size
+                continue
+
+            target_start_global = window_start + target_start_local
+            target_end_global = window_start + target_end_local
+
+            # === ПРОГРЕСС-БАР ===
+            elapsed = time.time() - start_time
+            if window_num > 1:
+                avg_time_per_window = elapsed / (window_num - 1)
+                remaining_windows = max(0, estimated_windows - window_num)
+                eta_seconds = avg_time_per_window * remaining_windows
+                eta_min = int(eta_seconds // 60)
+                eta_sec = int(eta_seconds % 60)
+
+                print(
+                    f"\r⏳ Окно {window_num}/{estimated_windows} "
+                    f"({100 * window_num // estimated_windows}%) | "
+                    f"Прошло: {int(elapsed // 60)}m {int(elapsed % 60)}s | "
+                    f"ETA: {eta_min}m {eta_sec}s      ",
+                    end="",
+                    flush=True
+                )
+
+            self.logger.info(
+                f"📊 Окно {window_num}: [{window_start}:{window_end}] "
+                f"| Целевая зона: [{target_start_global}:{target_end_global}]"
+            )
+
+            # === ЗАПУСК PELT НА ОКНЕ ===
+            window_signals = self._run_changepoint_on_window(
+                window_df=window_df,
+                target_start_local=target_start_local,
+                target_end_local=target_end_local,
+                global_offset=window_start,
+                window_num=window_num,
+                method='PELT',
+                target_changepoints=target_changepoints_per_window
+            )
+
+            all_results.extend(window_signals)
+
+            # === СДВИГ ОКНА ===
+            window_start += step_size
+
+        print()  # newline after progress bar
+
+        # === ПОСТОБРАБОТКА ===
+        if all_results:
+            all_results.sort(key=lambda x: x['extreme_index'])
+            all_results = self._filter_consecutive_same_type(all_results)
+
+        total_time = time.time() - start_time
+
+        # === PNL АНАЛИЗ (общий для всей истории) ===
+        pnl_stats = self._calculate_pnl_for_signals(df, all_results)
+
+        # Логирование + вывод в консоль
+        self.logger.info(
+            f"✅ PELT Windowed: обработано {window_num} окон за "
+            f"{int(total_time // 60)}m {int(total_time % 60)}s, "
+            f"найдено {len(all_results)} уникальных сигналов"
+        )
+
+        if pnl_stats:
+            self.logger.info(
+                f"📈 PnL анализ: сделок={pnl_stats['total_trades']}, "
+                f"win_rate={pnl_stats['win_rate']:.1%}, "
+                f"avg_pnl={pnl_stats['avg_pnl']:.2%}, "
+                f"total_pnl={pnl_stats['total_pnl']:.1f}%"
+            )
+
+            # Вывод в консоль
+            print(f"\n📈 PnL анализ (long-only):")
+            print(f"   • Сделок: {pnl_stats['total_trades']}")
+            print(f"   • Win rate: {pnl_stats['win_rate']:.1%}")
+            print(f"   • Средний PnL: {pnl_stats['avg_pnl']:.2%}")
+            print(f"   • Суммарный PnL: {pnl_stats['total_pnl']:.1f}%")
+
+        return all_results
+
+    def _run_changepoint_on_window(
+            self,
+            window_df: pd.DataFrame,
+            target_start_local: int,
+            target_end_local: int,
+            global_offset: int,
+            window_num: int,
+            method: str = 'PELT',
+            target_changepoints: int = 70
+    ) -> List[Dict]:
+        """
+        Универсальный метод для запуска changepoint detection на окне.
+        Поддерживает PELT и потенциально другие методы.
+
+        Args:
+            window_df: DataFrame окна
+            target_start_local: начало целевой зоны (локальный индекс)
+            target_end_local: конец целевой зоны (локальный индекс)
+            global_offset: смещение окна относительно полного датасета
+            window_num: номер окна (для логов)
+            method: 'PELT' или другие методы
+            target_changepoints: целевое количество changepoints
+
+        Returns:
+            List[Dict]: сигналы из целевой зоны с глобальными индексами
+        """
+        if method == 'PELT':
+            return self._run_pelt_on_window(
+                window_df, target_start_local, target_end_local,
+                global_offset, window_num, target_changepoints
+            )
+        else:
+            self.logger.warning(f"Неподдерживаемый метод: {method}")
+            return []
+
+    def _run_pelt_on_window(
+            self,
+            window_df: pd.DataFrame,
+            target_start_local: int,
+            target_end_local: int,
+            global_offset: int,
+            window_num: int,
+            target_changepoints: int
+    ) -> List[Dict]:
+        """
+        Запускает PELT на одном окне с локальным подбором penalty.
+        Возвращает сигналы только из целевой зоны.
+        """
+        close_vals = window_df['close'].values.astype(float)
+        signal = np.log(np.clip(close_vals, 1e-12, None))
+
+        n = len(signal)
+
+        if n < 50:
+            self.logger.debug(f"⏭️  Окно {window_num}: мало данных ({n} баров)")
+            return []
+
+        # === ПАРАМЕТРЫ ИЗ КОНФИГА ===
         min_size = int(getattr(self.config, 'pelt_min_size', 4))
         jump = int(getattr(self.config, 'pelt_jump', 5))
 
-        self.logger.info(f"🎯 PELT OFFLINE: цель {target_daily:.1f} сделок/сутки, min_size={min_size}, jump={jump}")
+        # === ЛОКАЛЬНЫЙ ПОДБОР PENALTY ===
+        target_low = int(target_changepoints * 0.8)
+        target_high = int(target_changepoints * 1.2)
 
-        # === Подготовка сигнала ===
-        close_vals = df['close'].values.astype(float)
-        signal = np.log(np.clip(close_vals, 1e-12, None))
-
-        n_samples = len(signal)
-        bars_per_day = self._infer_bars_per_day()
-        target_total = target_daily * (n_samples / bars_per_day)
-
-        # === Подбор penalty (автоматически, без input) ===
         start_pen, end_pen = 1e-4, 1e-1
-        n_steps = 20
+        n_steps = 15  # Меньше итераций для скорости
         pens = np.logspace(np.log10(start_pen), np.log10(end_pen), num=n_steps)
-        target_low = int(target_total * 0.8)
-        target_high = int(target_total * 1.2)
+
         best_penalty = None
         best_changepoints = None
         closest_distance = float('inf')
+        best_pnl = -np.inf
 
-        self.logger.info(f"🔍 Подбираем penalty для ~{target_total:.1f} change points ({target_daily:.1f}/день)")
+        algo = None
+
+        try:
+            algo = rpt.Pelt(model="l2", min_size=min_size, jump=jump).fit(signal)
+        except Exception as e:
+            self.logger.debug(f"PELT fit error (окно {window_num}): {e}")
+            return []
+
+        # Подбор penalty с учётом PnL
         for pen in pens:
             try:
-                algo = rpt.Pelt(model="l2", min_size=min_size, jump=jump).fit(signal)
                 changepoints = algo.predict(pen=pen)
-                changepoints = [cp for cp in changepoints if cp < len(df)]
-                n_cp = max(len(changepoints) - 1, 0)  # исключаем последнюю точку за пределами
-                dist = abs(n_cp - target_total)
-                if dist < closest_distance:
+                changepoints = [int(cp) for cp in changepoints if 0 < cp < n]
+                n_cp = len(changepoints)
+
+                # Быстрая оценка PnL для этого набора changepoints
+                quick_pnl = self._estimate_pnl_for_changepoints(window_df, changepoints)
+
+                # Критерии выбора:
+                # 1. Количество changepoints близко к цели
+                # 2. PnL > 0.3 (приоритет)
+                dist = abs(n_cp - target_changepoints)
+
+                # Если PnL > 0.3 и количество приемлемо - хороший кандидат
+                if quick_pnl > 0.003 and target_low <= n_cp <= target_high:
+                    if quick_pnl > best_pnl:
+                        best_pnl = quick_pnl
+                        best_penalty = pen
+                        best_changepoints = changepoints
+                # Если нет хороших по PnL, берём ближайший по количеству
+                elif best_pnl < 0.003 and dist < closest_distance:
                     closest_distance = dist
                     best_penalty = pen
                     best_changepoints = changepoints
-            except Exception as e:
-                self.logger.debug(f"PELT pen={pen:.5f} failed: {e}")
+                    best_pnl = quick_pnl
+
+            except Exception:
                 continue
+
+        # Очистка памяти
+        if algo is not None:
+            del algo
 
         if best_changepoints is None or len(best_changepoints) == 0:
-            self.logger.warning("❌ PELT: не найдено change points")
+            self.logger.debug(f"⏭️  Окно {window_num}: не найдено changepoints")
             return []
 
-        changepoints = best_changepoints
-        actual_count = len(changepoints)
-        daily_count = (actual_count * bars_per_day / n_samples) if n_samples > 0 else 0
-        self.logger.info(f"✅ PELT: pen={best_penalty:.5f} → {actual_count} change points (~{daily_count:.1f}/день)")
+        self.logger.debug(
+            f"  Окно {window_num}: pen={best_penalty:.5f} → {len(best_changepoints)} changepoints, "
+            f"estimated_pnl={best_pnl:.4f}"
+        )
 
-        # === Определение BUY/SELL по смене направления тренда ===
-        buy_signals: List[int] = []
-        sell_signals: List[int] = []
+        # === ПРЕОБРАЗОВАНИЕ В BUY/SELL СИГНАЛЫ ===
+        buy_signals = []
+        sell_signals = []
 
-        for i in range(len(changepoints) - 1):
-            start, end = changepoints[i], changepoints[i + 1]
-            if end - 1 >= len(df) or start <= 0:
+        changepoints_sorted = sorted(best_changepoints)
+
+        for i in range(len(changepoints_sorted) - 1):
+            start_cp = int(changepoints_sorted[i])
+            end_cp = int(changepoints_sorted[i + 1])
+
+            if end_cp - 1 >= len(window_df) or start_cp <= 0:
                 continue
-            trend_change = float(df['close'].iloc[end - 1] - df['close'].iloc[start])
+
+            # Определяем направление тренда в сегменте
+            trend_change = float(window_df['close'].iloc[end_cp - 1] - window_df['close'].iloc[start_cp])
             is_up = trend_change > 0
 
+            # Определяем разворот по сравнению с предыдущим сегментом
             if i > 0:
-                prev_start = changepoints[i - 1]
-                if start - 1 < len(df) and prev_start < len(df):
-                    prev_trend = float(df['close'].iloc[start - 1] - df['close'].iloc[prev_start])
+                prev_start = int(changepoints_sorted[i - 1])
+                if start_cp - 1 < len(window_df) and prev_start < len(window_df):
+                    prev_trend = float(window_df['close'].iloc[start_cp - 1] - window_df['close'].iloc[prev_start])
                     prev_up = prev_trend > 0
 
                     if (not prev_up) and is_up:
-                        buy_signals.append(start)
+                        buy_signals.append(start_cp)
                     elif prev_up and (not is_up):
-                        sell_signals.append(start)
+                        sell_signals.append(start_cp)
 
-        self.logger.info(f"📊 Сгенерировано: BUY={len(buy_signals)}, SELL={len(sell_signals)}")
+        # === ФИЛЬТРАЦИЯ ПО ЦЕЛЕВОЙ ЗОНЕ (используем ts) ===
+        target_signals = []
+        target_ts_start = int(window_df.iloc[target_start_local]['ts'])
+        target_ts_end = int(window_df.iloc[target_end_local - 1]['ts'])
 
-        # === Формирование результатов в формате сигнала ===
-        results: List[Dict] = []
         for idx in buy_signals:
-            if idx + 1 >= len(df):
+            if idx + 1 >= len(window_df):
                 continue
-            results.append({
-                'index': idx + 1,  # вход на следующей свече
-                'type': 'BUY',
-                'confidence': 0.7,
-                'extreme_index': idx,
-                'extreme_timestamp': int(df['ts'].iloc[idx]),
-                'confirmation_index': idx + 1,
-                'confirmation_timestamp': int(df['ts'].iloc[idx + 1]),
-                'method': 'PELT_OFFLINE',
-                'reversal_label': 1,
-            })
-        for idx in sell_signals:
-            if idx + 1 >= len(df):
-                continue
-            results.append({
-                'index': idx + 1,
-                'type': 'SELL',
-                'confidence': 0.7,
-                'extreme_index': idx,
-                'extreme_timestamp': int(df['ts'].iloc[idx]),
-                'confirmation_index': idx + 1,
-                'confirmation_timestamp': int(df['ts'].iloc[idx + 1]),
-                'method': 'PELT_OFFLINE',
-                'reversal_label': 2,
-            })
 
-        # === PnL анализ (логгирование, не print) ===
-        if results:
-            trades = []
-            fee = getattr(self.config, 'fee_percent', 0.0008)
-            positions = sorted([(r['extreme_index'], r['reversal_label']) for r in results])
-            i = 0
-            while i < len(positions) - 1:
-                entry_idx, entry_type = positions[i]
-                if entry_type == 1:  # BUY
-                    j = None
-                    for jj in range(i + 1, len(positions)):
-                        exit_idx, exit_type = positions[jj]
-                        if exit_type == 2:  # SELL
-                            j = jj
-                            entry_price = float(df['close'].iloc[entry_idx])
-                            exit_price = float(df['close'].iloc[exit_idx])
+            sig_ts = int(window_df['ts'].iloc[idx])
+
+            if target_ts_start <= sig_ts <= target_ts_end:
+                target_signals.append({
+                    'index': global_offset + idx + 1,
+                    'type': 'BUY',
+                    'confidence': 0.7,
+                    'extreme_index': global_offset + idx,
+                    'extreme_timestamp': sig_ts,
+                    'confirmation_index': global_offset + idx + 1,
+                    'confirmation_timestamp': int(window_df['ts'].iloc[idx + 1]),
+                    'method': 'PELT_OFFLINE',
+                    'reversal_label': 1,
+                })
+
+        for idx in sell_signals:
+            if idx + 1 >= len(window_df):
+                continue
+
+            sig_ts = int(window_df['ts'].iloc[idx])
+
+            if target_ts_start <= sig_ts <= target_ts_end:
+                target_signals.append({
+                    'index': global_offset + idx + 1,
+                    'type': 'SELL',
+                    'confidence': 0.7,
+                    'extreme_index': global_offset + idx,
+                    'extreme_timestamp': sig_ts,
+                    'confirmation_index': global_offset + idx + 1,
+                    'confirmation_timestamp': int(window_df['ts'].iloc[idx + 1]),
+                    'method': 'PELT_OFFLINE',
+                    'reversal_label': 2,
+                })
+
+        self.logger.debug(
+            f"  Окно {window_num}: BUY={len([s for s in target_signals if s['type'] == 'BUY'])}, "
+            f"SELL={len([s for s in target_signals if s['type'] == 'SELL'])}"
+        )
+
+        return target_signals
+
+    def _estimate_pnl_for_changepoints(self, window_df: pd.DataFrame, changepoints: List[int]) -> float:
+        """
+        Быстрая оценка PnL для набора changepoints.
+        Используется для выбора оптимального penalty.
+
+        Returns:
+            float: средний PnL на сделку (приблизительно)
+        """
+        if len(changepoints) < 2:
+            return 0.0
+
+        fee = getattr(self.config, 'fee_percent', 0.0008)
+        trades = []
+
+        changepoints_sorted = sorted(changepoints)
+
+        # Генерируем BUY/SELL позиции
+        positions = []
+        for i in range(len(changepoints_sorted) - 1):
+            start_cp = int(changepoints_sorted[i])
+            end_cp = int(changepoints_sorted[i + 1])
+
+            if end_cp - 1 >= len(window_df) or start_cp <= 0:
+                continue
+
+            trend_change = float(window_df['close'].iloc[end_cp - 1] - window_df['close'].iloc[start_cp])
+            is_up = trend_change > 0
+
+            if i > 0:
+                prev_start = int(changepoints_sorted[i - 1])
+                if start_cp - 1 < len(window_df):
+                    prev_trend = float(window_df['close'].iloc[start_cp - 1] - window_df['close'].iloc[prev_start])
+                    prev_up = prev_trend > 0
+
+                    if (not prev_up) and is_up:
+                        positions.append((start_cp, 1))  # BUY
+                    elif prev_up and (not is_up):
+                        positions.append((start_cp, 2))  # SELL
+
+        # Считаем PnL для пар BUY→SELL
+        i = 0
+        while i < len(positions) - 1:
+            entry_idx, entry_type = positions[i]
+
+            if entry_type == 1:  # BUY
+                # Ищем следующий SELL
+                for j in range(i + 1, len(positions)):
+                    exit_idx, exit_type = positions[j]
+                    if exit_type == 2:  # SELL
+                        if entry_idx < len(window_df) and exit_idx < len(window_df):
+                            entry_price = float(window_df['close'].iloc[entry_idx])
+                            exit_price = float(window_df['close'].iloc[exit_idx])
+
                             if entry_price > 0:
                                 pnl = (exit_price - entry_price) / entry_price - 2 * fee
                                 trades.append(pnl)
-                            break
-                    i = j if j is not None else i + 1
+                        i = j
+                        break
                 else:
                     i += 1
-
-            if trades:
-                win_rate = sum(1 for pnl in trades if pnl > 0) / len(trades)
-                avg_pnl = float(np.mean(trades))
-                total_pnl = (float(np.prod([1 + pnl for pnl in trades])) - 1) * 100
-                self.logger.info(f"📈 PnL анализ (long-only): сделок={len(trades)}, win_rate={win_rate:.1%}, "
-                                 f"avg_pnl={avg_pnl:.2%}, total_pnl={total_pnl:.1f}%")
             else:
-                self.logger.info("📉 Нет полных сделок для PnL анализа")
+                i += 1
 
-        return results
+        if not trades:
+            return 0.0
+
+        return float(np.mean(trades))
+
+    def _calculate_pnl_for_signals(self, df: pd.DataFrame, signals: List[Dict]) -> Dict[str, float]:
+        """
+        Расчёт PnL для списка сигналов (long-only стратегия).
+
+        Returns:
+            dict: {
+                'total_trades': int,
+                'win_rate': float,
+                'avg_pnl': float,
+                'total_pnl': float (в процентах)
+            }
+        """
+        if not signals:
+            return {}
+
+        fee = getattr(self.config, 'fee_percent', 0.0008)
+        trades = []
+
+        # Сортируем по индексу
+        positions = sorted([(s['extreme_index'], s['reversal_label']) for s in signals])
+
+        i = 0
+        while i < len(positions) - 1:
+            entry_idx, entry_type = positions[i]
+
+            if entry_type == 1:  # BUY
+                # Ищем следующий SELL
+                j = None
+                for jj in range(i + 1, len(positions)):
+                    exit_idx, exit_type = positions[jj]
+                    if exit_type == 2:  # SELL
+                        j = jj
+
+                        if entry_idx < len(df) and exit_idx < len(df):
+                            entry_price = float(df['close'].iloc[entry_idx])
+                            exit_price = float(df['close'].iloc[exit_idx])
+
+                            if entry_price > 0:
+                                pnl = (exit_price - entry_price) / entry_price - 2 * fee
+                                trades.append(pnl)
+                        break
+
+                i = j if j is not None else i + 1
+            else:
+                i += 1
+
+        if not trades:
+            return {}
+
+        win_rate = sum(1 for pnl in trades if pnl > 0) / len(trades)
+        avg_pnl = float(np.mean(trades))
+        total_pnl = (float(np.prod([1 + pnl for pnl in trades])) - 1) * 100
+
+        return {
+            'total_trades': len(trades),
+            'win_rate': win_rate,
+            'avg_pnl': avg_pnl,
+            'total_pnl': total_pnl
+        }
 
     def _cusum_reversals(self, df):
         """
@@ -2124,13 +2474,12 @@ class AdvancedLabelingTool:
         issues = []
 
         try:
-            # Используем self.engine вместо self.conn
-            # Проверка на дубликаты меток
+            # ✅ ИСПРАВЛЕНО: Проверка реальных дубликатов по PRIMARY KEY
             query_duplicates = """
-                SELECT timestamp, COUNT(*) as cnt 
+                SELECT extreme_timestamp, reversal_label, COUNT(*) as cnt 
                 FROM labeling_results 
                 WHERE symbol = :symbol
-                GROUP BY timestamp 
+                GROUP BY extreme_timestamp, reversal_label
                 HAVING COUNT(*) > 1
             """
             duplicates = pd.read_sql_query(
@@ -2141,9 +2490,21 @@ class AdvancedLabelingTool:
             if not duplicates.empty:
                 issues.append(f"Обнаружены дубликаты меток: {len(duplicates)} случаев")
 
-            # Остальные проверки аналогично исправляем...
-            # ...
-
+            # ✅ ДОПОЛНИТЕЛЬНО: Проверка конфликтов (разные типы сигналов на одном extreme_timestamp)
+            query_conflicts = """
+                SELECT extreme_timestamp, COUNT(DISTINCT reversal_label) as label_count
+                FROM labeling_results 
+                WHERE symbol = :symbol
+                GROUP BY extreme_timestamp
+                HAVING COUNT(DISTINCT reversal_label) > 1
+            """
+            conflicts = pd.read_sql_query(
+                query_conflicts,
+                self.engine,
+                params={'symbol': self.config.symbol}
+            )
+            if not conflicts.empty:
+                issues.append(f"Конфликты типов сигналов: {len(conflicts)} случаев (BUY+SELL на одном экстремуме)")
         except Exception as err:
             issues.append(f"Ошибка при проверке качества: {err}")
 
