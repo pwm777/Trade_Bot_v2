@@ -840,7 +840,7 @@ class AdvancedLabelingTool:
 
         price_at_signal = df['close'].iloc[signal_idx]
         price_after_3bars = df['close'].iloc[signal_idx + 3]
-        expected_move = 0.005
+        expected_move = 0.003
 
         if signal_type == 'BUY':
             move_percent = (price_after_3bars - price_at_signal) / price_at_signal
@@ -967,7 +967,7 @@ class AdvancedLabelingTool:
             return []
 
         # ⚡ ОПТИМИЗАЦИЯ: Более разумное ограничение данных
-        optimal_samples = min(5000, len(df))
+        optimal_samples = len(df)
         if len(df) > optimal_samples:
             logger.info(f"⚡ Сокращаем данные с {len(df)} до {optimal_samples} samples")
             df = df.iloc[-optimal_samples:].copy()
@@ -1101,7 +1101,7 @@ class AdvancedLabelingTool:
             current_trend = (price_current_end - price_current_start) / price_current_start
 
             # 🎯 УЛУЧШЕННЫЕ КРИТЕРИИ:
-            min_trend_strength = 0.003  # 0.3% минимальное изменение
+            min_trend_strength = 0.002  # 0.3% минимальное изменение
 
             # СИГНАЛ BUY: сильное падение → сильный рост
             if (prev_trend < -min_trend_strength and
@@ -2363,7 +2363,9 @@ class AdvancedLabelingTool:
                     print(f"0 ≤ индекс < {len(df)}")
                     continue
 
-                exit_idx = min(idx + self.config.hold_bars, len(df) - 1)
+                exit_idx = idx + self.config.hold_bars
+                if exit_idx >= len(df):
+                    continue
                 pnl, is_profitable = self._calculate_pnl_to_index(df, idx, typ, exit_idx)
                 print(f"PnL: {pnl:.4f} (требуется: ≥{self.config.min_profit_target:.4f})")
 
