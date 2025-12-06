@@ -501,7 +501,21 @@ class MLGlobalDetector(Detector):
                 self.lookback = int(loaded_data.get("lookback", max(1, self.lookback)))
                 # Сгенерировать полные имена оконных признаков (для диагностики)
                 self.feature_names = self._generate_windowed_feature_names()
+                self.decision_policy = self.model_metadata.get("decision_policy")
 
+                # Базовые признаки и окно (обязательно для оконного режима)
+                self.base_feature_names = loaded_data.get("base_feature_names", self.base_feature_names)
+                self.lookback = int(loaded_data.get("lookback", max(1, self.lookback)))
+                # Сгенерировать полные имена оконных признаков (для диагностики)
+                self.feature_names = self._generate_windowed_feature_names()
+
+                # ✅ OVERRIDE TAU
+                if self.model_metadata.get("decision_policy"):
+                    original_tau = self.model_metadata["decision_policy"]["tau"]
+                    self.model_metadata["decision_policy"]["tau"] = 0.80
+                    if self.decision_policy:  # ← ДОБАВЛЕНО
+                        self.decision_policy["tau"] = 0.90  # ← ДОБАВЛЕНО
+                    self.logger.info(f"🔧 Overriding tau: {original_tau:.3f} → 0.90")
                 # Определение использования скейлера
                 scaler_used = self.model_metadata.get("scaler_used", False)
                 if hasattr(self, "use_scaler") and getattr(self, "use_scaler") is None:

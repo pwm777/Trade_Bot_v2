@@ -38,7 +38,7 @@ TABLES: Dict[str, str] = {
 # === ML GLOBAL — базовые признаки ML модели (единый источник)
 BASE_FEATURE_NAMES = [
     'cmo_14', 'volume',
-    'trend_acceleration_ema7',
+    #'trend_acceleration_ema7',
     'regime_volatility',
     'bb_width', 'adx_14', 'plus_di_14', 'minus_di_14', 'atr_14_normalized',
     'volume_ratio_ema3', 'candle_relative_body', 'upper_shadow_ratio',
@@ -47,7 +47,7 @@ BASE_FEATURE_NAMES = [
     'cusum_1m_quality_score', 'cusum_1m_trend_aligned', 'cusum_1m_price_move',
     'is_trend_pattern_1m', 'body_to_range_ratio_1m', 'close_position_in_range_1m',
     "volume_imbalance_5m","volume_supported_trend","exhaustion_score",
-    "cusum_price_conflict",
+    #"cusum_price_conflict",
     "cusum_state_conflict", "trend_vs_noise",
 ]
 

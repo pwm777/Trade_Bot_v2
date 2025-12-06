@@ -172,9 +172,9 @@ class LabelingConfig:
     buffer_bars: int = 5             # Меньше буферных баров
 
     # Extremum (min/max)
-    extremum_confirm_bar: int = 2
-    extremum_window: int = 12
-    min_signal_distance: int = 6
+    extremum_confirm_bar: int = 1
+    extremum_window: int = 7
+    min_signal_distance: int = 5
     # Фильтры
     method: str = "CUSUM_EXTREMUM"
     # PnL параметры
@@ -971,11 +971,12 @@ class AdvancedLabelingTool:
         """
         BinSeg с sliding window для работы с большими историями.
 
-        Архитектура:
+        Архитектура (синхронизировано с PELT):
         - Окно = 2 недели (4032 бара на 5m)
-        - Размечаем только 2-ю неделю (центральная зона)
-        - Буфер слева/справа по 1 неделе для контекста
-        - Шаг сдвига = 1 неделя
+        - Размечаем первые 8 дней (2304 бара) = 1 неделя + 1 день
+        - Остальные 6 дней (1728 баров) = контекст для BinSeg
+        - Шаг сдвига = 1 неделя (2016 баров)
+        - Перекрытие целевых зон: 288 баров (12.  5%)
         - Память O(4032) вместо O(95000)
         """
         if not RUPTURES_AVAILABLE:
@@ -986,14 +987,14 @@ class AdvancedLabelingTool:
             logger.warning("⚠️ Слишком мало данных для BinSeg: %s баров", len(df))
             return []
 
-        # === ПАРАМЕТРЫ ОКНА ===
+        # === ПАРАМЕТРЫ ОКНА (синхронизировано с PELT) ===
         BARS_PER_DAY = 288  # 5m: 24*60/5 = 288
         WEEK_BARS = BARS_PER_DAY * 7  # 2016 баров
 
         window_size = 2 * WEEK_BARS  # 4032 бара = 2 недели
-        target_zone_size = WEEK_BARS  # 2016 баров = размечаем 2-ю неделю
+        target_zone_size = WEEK_BARS + BARS_PER_DAY  # 2304 бара = 1 неделя + 1 день
         step_size = WEEK_BARS  # 2016 баров = сдвиг на 1 неделю
-        buffer_left = WEEK_BARS  # 2016 баров слева
+        buffer_left = 0  # Размечаем с начала окна (БЕЗ буфера слева)
 
         total_bars = len(df)
         all_results = []
@@ -1003,7 +1004,7 @@ class AdvancedLabelingTool:
 
         logger.info(
             f"🔍 BinSeg Windowed: {total_bars} баров, окно={window_size}, "
-            f"шаг={step_size}, ожидается окон: ~{estimated_windows}")
+            f"target_zone={target_zone_size}, шаг={step_size}, ожидается окон: ~{estimated_windows}")
 
         # === ИТЕРАЦИЯ ПО ОКНАМ ===
         window_start = 0
@@ -1024,7 +1025,7 @@ class AdvancedLabelingTool:
             window_df = df.iloc[window_start:window_end].copy()
             window_df = window_df.reset_index(drop=True)
 
-            # === ЦЕЛЕВАЯ ЗОНА (2-я неделя) ===
+            # === ЦЕЛЕВАЯ ЗОНА (первые 2304 бара окна) ===
             target_start_local = buffer_left
             target_end_local = min(buffer_left + target_zone_size, len(window_df))
 
@@ -1036,37 +1037,18 @@ class AdvancedLabelingTool:
             target_start_global = window_start + target_start_local
             target_end_global = window_start + target_end_local
 
-            # === ПРОГРЕСС-БАР ===
-            elapsed = time.time() - start_time
-            if window_num > 1:
-                avg_time_per_window = elapsed / (window_num - 1)
-                remaining_windows = max(0, estimated_windows - window_num)
-                eta_seconds = avg_time_per_window * remaining_windows
-                eta_min = int(eta_seconds // 60)
-                eta_sec = int(eta_seconds % 60)
-
-                print(
-                    f"\r⏳ Окно {window_num}/{estimated_windows} "
-                    f"({100 * window_num // estimated_windows}%) | "
-                    f"Прошло: {int(elapsed // 60)}m {int(elapsed % 60)}s | "
-                    f"ETA: {eta_min}m {eta_sec}s      ",
-                    end="",
-                    flush=True
-                )
-
             logger.info(
                 f"📊 Окно {window_num}: [{window_start}:{window_end}] "
                 f"| Целевая зона: [{target_start_global}:{target_end_global}]"
             )
 
             # === ЗАПУСК BINSEG НА ОКНЕ ===
-            window_signals = self._run_changepoint_on_window(
+            window_signals = self._run_binseg_on_window(
                 window_df=window_df,
                 target_start_local=target_start_local,
                 target_end_local=target_end_local,
                 global_offset=window_start,
-                window_num=window_num,
-                method='BINSEG'
+                window_num=window_num
             )
 
             all_results.extend(window_signals)

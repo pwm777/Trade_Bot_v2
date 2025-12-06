@@ -1948,13 +1948,17 @@ class MarketDataUtils:
         cmo = 100.0 * (ups_s - downs_s) / (ups_s + downs_s).replace(0, np.nan)
         return [None if pd.isna(v) else float(v) for v in cmo.tolist()]
 
-    @staticmethod
-    def _bollinger_bands_features(close: List[float], period: int = 20, stdevs: float = 2.0) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    def _bollinger_bands_features(close: List[float], period: int = 20, stdevs: float = 2.0):
         s = pd.Series(close, dtype="float64")
-        ma = s.rolling(window=period, min_periods=period).mean()
-        std = s.rolling(window=period, min_periods=period).std(ddof=0)
+
+        # ✅ Сдвигаем статистику на 1 бар назад
+        ma = s.rolling(window=period, min_periods=period).mean().shift(1)
+        std = s.rolling(window=period, min_periods=period).std(ddof=0).shift(1)
+
         upper = ma + stdevs * std
         lower = ma - stdevs * std
+
+        # ✅ Теперь текущая цена сравнивается с ПРОШЛЫМИ полосами
         width = (upper - lower) / ma
         pos = (s - lower) / (upper - lower)
         return (
@@ -2091,24 +2095,20 @@ class MarketDataUtils:
 
         return vwap
 
-
     @staticmethod
     def _z_score_series(values: List[float], window: int = 20) -> List[Optional[float]]:
         """
-        Расчет Z-score для серии значений.
-        trend_momentum_z = Z-score от price_change_5
-
-        Args:
-            values: список значений (например, price_change_5)
-            window: окно для расчета скользящего среднего и std
-
-        Returns:
-            список Z-score значений
+        ✅ ИСПРАВЛЕНО: Z-score БЕЗ look-ahead bias
         """
         s = pd.Series(values, dtype="float64")
-        rolling_mean = s.rolling(window=window, min_periods=window).mean()
-        rolling_std = s.rolling(window=window, min_periods=window).std(ddof=1)
+
+        # ✅ Сдвигаем статистику на 1 бар назад
+        rolling_mean = s.rolling(window=window, min_periods=window).mean().shift(1)
+        rolling_std = s.rolling(window=window, min_periods=window).std(ddof=1).shift(1)
+
+        # ✅ Нормализуем текущее значение по ПРОШЛОЙ статистике
         z_scores = (s - rolling_mean) / rolling_std
+
         return [None if pd.isna(v) or np.isinf(v) else float(v) for v in z_scores.tolist()]
 
     @staticmethod
