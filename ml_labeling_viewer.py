@@ -992,163 +992,196 @@ class LabelingViewer:
 
             return info, {'margin': '20px', 'display': 'flex', 'gap': '10px'}, extreme_ts
 
-    def setup_clientside_callbacks(self):
+    def _edit_label_callbacks(self):
+        """Callbacks для редактирования меток"""
 
-    @self.app.callback(
-        Output('main-chart', 'figure', allow_duplicate=True),
-        [
-            Input('change-buy', 'n_clicks'),
-            Input('change-sell', 'n_clicks'),
-            Input('change-hold', 'n_clicks')
-        ],
-        [State('selected-label-ts', 'data')],
-        prevent_initial_call=True
-    )
-    def change_label_type(self, buy_clicks, sell_clicks, hold_clicks, selected_ts):
-        """Изменение типа метки с автосохранением"""
-        if not selected_ts:
-            return dash.no_update
-
-        ctx = callback_context
-        if not ctx.triggered:
-            return dash.no_update
-
-        btn_id = ctx.triggered[0]['prop_id'].split('. ')[0]
-
-        # Определяем новый тип
-        new_type_map = {
-            'change-buy': 1,
-            'change-sell': 2,
-            'change-hold': 0
-        }
-
-        new_type = new_type_map.get(btn_id)
-        if new_type is None:
-            return dash.no_update
-
-        # Обновляем метку в БД
-        self._update_label_type(selected_ts, new_type)
-
-        # Перезагружаем данные
-        self.df_candles, self.df_labels = self.load_data()
-
-        # Перерисовываем график
-        bounds = self.calculate_window_bounds(self.current_index, self.block_size)
-        return self.create_figure(bounds)
-
-    # === UPDATE CONFIDENCE ===
-    @self.app.callback(
-        Output('main-chart', 'figure', allow_duplicate=True),
-        [Input('update-confidence', 'n_clicks')],
-        [
-            State('selected-label-ts', 'data'),
-            State('confidence-input', 'value')
-        ],
-        prevent_initial_call=True
-    )
-    def update_label_confidence(self, n_clicks, selected_ts, new_confidence):
-        """Изменение confidence с автосохранением"""
-        if not selected_ts or not new_confidence:
-            return dash.no_update
-
-        # Валидация
-        if not (0.1 <= new_confidence <= 0.99):
-            return dash.no_update
-
-        # Обновляем confidence в БД
-        self._update_confidence(selected_ts, new_confidence)
-
-        # Перезагружаем данные
-        self.df_candles, self.df_labels = self.load_data()
-
-        # Перерисовываем график
-        bounds = self.calculate_window_bounds(self.current_index, self.block_size)
-        return self.create_figure(bounds)
-
-    # === DELETE LABEL ===
-    @self.app.callback(
-        Output('main-chart', 'figure', allow_duplicate=True),
-        [Input('delete-label', 'n_clicks')],
-        [State('selected-label-ts', 'data')],
-        prevent_initial_call=True
-    )
-    def delete_label(self,n_clicks, selected_ts):
-        """Удаление метки без подтверждения"""
-        if not selected_ts:
-            return dash.no_update
-
-        # Удаляем из БД
-        self._delete_label(selected_ts)
-
-        # Перезагружаем данные
-        self.df_candles, self.df_labels = self.load_data()
-
-        # Перерисовываем график
-        bounds = self.calculate_window_bounds(self.current_index, self.block_size)
-        return self.create_figure(bounds)
-
-    # === SHOW ADD LABEL DROPDOWN ===
-    @self.app.callback(
-        [
-            Output('add-label-dropdown', 'style'),
-            Output('add-label-index', 'children'),
-            Output('add-label-click-index', 'data')
-        ],
-        [Input('main-chart', 'clickData')],
-        [State('keyboard-listener', 'children')],
-        prevent_initial_call=True
-    )
-    def show_add_dropdown(clickData, keyboard_state):
-        """
-        Показывает dropdown для добавления метки при клике на свечу
-
-        Note: Проверяем что клик НЕ на маркер метки (нет customdata)
-        """
-        if not clickData or 'points' not in clickData:
-            return {'display': 'none'}, '', None
-
-        point = clickData['points'][0]
-
-        # Если клик на маркер (есть customdata) - не показываем dropdown
-        if 'customdata' in point:
-            return {'display': 'none'}, '', None
-
-        # Получаем индекс свечи
-        click_index = int(point['x'])
-
-        # Позиционируем dropdown около клика
-        # (в реальности нужны координаты мыши через clientside callback)
-        dropdown_style = {
-            'display': 'block',
-            'position': 'absolute',
-            'top': '400px',
-            'left': '50%',
-            'transform': 'translateX(-50%)',
-            'zIndex': 1000
-        }
-
-        index_display = html.Span([
-            html.Strong('Index: '),
-            f'{click_index}'
-        ])
-
-        return dropdown_style, index_display, click_index
-
-    # === ADD LABEL BUTTONS ===
-    @self.app.callback(
-        [
+        # === EDIT LABEL TYPE ===
+        @self.app.callback(
             Output('main-chart', 'figure', allow_duplicate=True),
-            Output('add-label-dropdown', 'style', allow_duplicate=True)
-        ],
-        [
-            Input('add-buy', 'n_clicks'),
-            Input('add-sell', 'n_clicks'),
-            Input('add-hold', 'n_clicks'),
-            Input('add-cancel', 'n_clicks')
-        ],
-        [State('add-label-click-index', 'data')],
-        prevent_initial_call=True
-    )
+            [
+                Input('change-buy', 'n_clicks'),
+                Input('change-sell', 'n_clicks'),
+                Input('change-hold', 'n_clicks')
+            ],
+            [State('selected-label-ts', 'data')],
+            prevent_initial_call=True
+        )
+        def change_label_type(buy_clicks, sell_clicks, hold_clicks, selected_ts):
+            """Изменение типа метки с автосохранением"""
+            if not selected_ts:
+                return dash.no_update
+
+            ctx = callback_context
+            if not ctx.triggered:
+                return dash.no_update
+
+            btn_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+            new_type_map = {
+                'change-buy': 1,
+                'change-sell': 2,
+                'change-hold': 0
+            }
+
+            new_type = new_type_map.get(btn_id)
+            if new_type is None:
+                return dash.no_update
+
+            self._update_label_type(selected_ts, new_type)
+            self.df_candles, self.df_labels = self.load_data()
+            bounds = self.calculate_window_bounds(self.current_index, self.block_size)
+            return self.create_figure(bounds)
+
+        # === UPDATE CONFIDENCE ===
+        @self.app.callback(
+            Output('main-chart', 'figure', allow_duplicate=True),
+            [Input('update-confidence', 'n_clicks')],
+            [
+                State('selected-label-ts', 'data'),
+                State('confidence-input', 'value')
+            ],
+            prevent_initial_call=True
+        )
+        def update_label_confidence(n_clicks, selected_ts, new_confidence):
+            """Изменение confidence с автосохранением"""
+            if not selected_ts or not new_confidence:
+                return dash.no_update
+
+            # Валидация
+            if not (0.1 <= new_confidence <= 0.99):
+                return dash.no_update
+
+            # Обновляем confidence в БД
+            self._update_confidence(selected_ts, new_confidence)
+
+            # Перезагружаем данные
+            self.df_candles, self.df_labels = self.load_data()
+
+            # Перерисовываем график
+            bounds = self.calculate_window_bounds(self.current_index, self.block_size)
+            return self.create_figure(bounds)
+
+        # === DELETE LABEL ===  ← ИСПРАВЛЕНО: правильный отступ
+        @self.app.callback(
+            Output('main-chart', 'figure', allow_duplicate=True),
+            [Input('delete-label', 'n_clicks')],
+            [State('selected-label-ts', 'data')],
+            prevent_initial_call=True
+        )
+        def delete_label(n_clicks, selected_ts):
+            """Удаление метки без подтверждения"""
+            if not selected_ts:
+                return dash.no_update
+
+            # Удаляем из БД
+            self._delete_label(selected_ts)
+
+            # Перезагружаем данные
+            self.df_candles, self.df_labels = self.load_data()
+
+            # Перерисовываем график
+            bounds = self.calculate_window_bounds(self.current_index, self.block_size)
+            return self.create_figure(bounds)
+
+    def _add_label_callbacks(self):
+        """Callbacks для добавления меток"""
+
+        # === SHOW ADD LABEL DROPDOWN ===
+        @self.app.callback(  # ← ДОБАВИТЬ: декоратор отсутствовал!
+            [
+                Output('add-label-dropdown', 'style'),
+                Output('add-label-index', 'children'),
+                Output('add-label-click-index', 'data')
+            ],
+            [Input('main-chart', 'clickData')],
+            [State('keyboard-listener', 'children')],
+            prevent_initial_call=True
+        )
+        def show_add_dropdown(clickData, keyboard_state):
+            """
+            Показывает dropdown для добавления метки при клике на свечу
+
+            Note: Проверяем что клик НЕ на маркер метки (нет customdata)
+            """
+            if not clickData or 'points' not in clickData:
+                return {'display': 'none'}, '', None
+
+            point = clickData['points'][0]
+
+            # Если клик на маркер (есть customdata) - не показываем dropdown
+            if 'customdata' in point:
+                return {'display': 'none'}, '', None
+
+            # Получаем индекс свечи
+            click_index = int(point['x'])
+
+            # Позиционируем dropdown около клика
+            dropdown_style = {
+                'display': 'block',
+                'position': 'absolute',
+                'top': '400px',
+                'left': '50%',
+                'transform': 'translateX(-50%)',
+                'zIndex': 1000
+            }
+
+            index_display = html.Span([
+                html.Strong('Index: '),
+                f'{click_index}'
+            ])
+
+            return dropdown_style, index_display, click_index
+
+        # === ADD LABEL BUTTONS ===
+        @self.app.callback(
+            [
+                Output('main-chart', 'figure', allow_duplicate=True),
+                Output('add-label-dropdown', 'style', allow_duplicate=True)
+            ],
+            [
+                Input('add-buy', 'n_clicks'),
+                Input('add-sell', 'n_clicks'),
+                Input('add-hold', 'n_clicks'),
+                Input('add-cancel', 'n_clicks')
+            ],
+            [State('add-label-click-index', 'data')],
+            prevent_initial_call=True
+        )
+        def add_label(buy_clicks, sell_clicks, hold_clicks, cancel_clicks, click_index):
+            """Добавление новой метки через dropdown"""
+            ctx = callback_context
+            if not ctx.triggered or click_index is None:
+                return dash.no_update, {'display': 'none'}
+
+            btn_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+            # Cancel - просто скрываем dropdown
+            if btn_id == 'add-cancel':
+                return dash.no_update, {'display': 'none'}
+
+            # Определяем тип и confidence
+            label_config = {
+                'add-buy': (1, 0.8),
+                'add-sell': (2, 0.8),
+                'add-hold': (0, 1.0)
+            }
+
+            if btn_id not in label_config:
+                return dash.no_update, {'display': 'none'}
+
+            label_type, confidence = label_config[btn_id]
+
+            # Добавляем метку в БД
+            self._add_new_label(click_index, label_type, confidence)
+
+            # Перезагружаем данные
+            self.df_candles, self.df_labels = self.load_data()
+
+            # Перерисовываем график
+            bounds = self.calculate_window_bounds(self.current_index, self.block_size)
+
+            return self.create_figure(bounds), {'display': 'none'}
+
     def add_label(self, buy_clicks, sell_clicks, hold_clicks, cancel_clicks, click_index):
         """Добавление новой метки через dropdown"""
         ctx = callback_context
@@ -1184,10 +1217,10 @@ class LabelingViewer:
 
         return self.create_figure(bounds), {'display': 'none'}
 
-    # --- Run ---
-    def run(self, host='127.0.0.1', port=8050, debug=True):
+        # После строки 1185 (конец add_label callback)
 
-        def _update_label_type(self, extreme_timestamp: int, new_type: int):
+        # === DATABASE OPERATIONS === ← ДОБАВИТЬ: методы на уровне класса
+    def _update_label_type(self, extreme_timestamp: int, new_type: int):
             """
             Изменение типа метки с немедленным сохранением в БД
 
@@ -1204,14 +1237,13 @@ class LabelingViewer:
             label_idx = self.df_candles[label_mask].index[0]
 
             # Определяем exit index для расчета PnL
-            # Ищем следующую метку
             next_labels = self.df_labels[self.df_labels['extreme_timestamp'] > extreme_timestamp]
 
             if not next_labels.empty:
                 next_ts = next_labels.iloc[0]['extreme_timestamp']
                 exit_mask = self.df_candles['ts'] == next_ts
                 if exit_mask.any():
-                    exit_idx = self.df_candles[exit_mask].index[0] - 1  # Выход за 1 бар до следующей метки
+                    exit_idx = self.df_candles[exit_mask].index[0] - 1
                 else:
                     exit_idx = label_idx + self.config.hold_bars
             else:
@@ -1225,7 +1257,7 @@ class LabelingViewer:
             signal_type_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
             signal_type = signal_type_map[new_type]
 
-            if new_type == 0:  # HOLD не имеет PnL
+            if new_type == 0:
                 pnl = 0.0
                 is_profitable = True
             else:
@@ -1252,14 +1284,8 @@ class LabelingViewer:
 
             print(f"✅ Updated label {extreme_timestamp}: type={signal_type}, pnl={pnl:.4f}, is_hq={is_profitable}")
 
-        def _update_confidence(self, extreme_timestamp: int, new_confidence: float):
-            """
-            Изменение confidence с автосохранением
-
-            Args:
-                extreme_timestamp: timestamp метки
-                new_confidence: новый confidence (0.1-0.99)
-            """
+    def _update_confidence(self, extreme_timestamp: int, new_confidence: float):
+            """Изменение confidence с автосохранением"""
             with self.engine.begin() as conn:
                 conn.execute(text("""
                     UPDATE labeling_results
@@ -1274,13 +1300,8 @@ class LabelingViewer:
 
             print(f"✅ Updated confidence for {extreme_timestamp}: {new_confidence:.2f}")
 
-        def _delete_label(self, extreme_timestamp: int):
-            """
-            Удаление метки с автосохранением
-
-            Args:
-                extreme_timestamp: timestamp метки
-            """
+    def _delete_label(self, extreme_timestamp: int):
+            """Удаление метки с автосохранением"""
             with self.engine.begin() as conn:
                 result = conn.execute(text("""
                     DELETE FROM labeling_results
@@ -1292,6 +1313,8 @@ class LabelingViewer:
                 })
 
             print(f"✅ Deleted label {extreme_timestamp} (rows affected: {result.rowcount})")
+
+            # Строка 1296 - НАЧАЛО метода _add_new_label (он ПРАВИЛЬНЫЙ)
 
     def _add_new_label(self, index: int, label_type: int, confidence: float):
         """
@@ -1315,7 +1338,7 @@ class LabelingViewer:
         # Проверка: метка уже существует?
         existing = self.df_labels[self.df_labels['extreme_timestamp'] == extreme_timestamp]
         if not existing.empty:
-            print(f"⚠️  Label already exists at ts={extreme_timestamp}")
+            print(f"⚠️ Label already exists at ts={extreme_timestamp}")
             return
 
         # Определяем exit index для расчета PnL
@@ -1339,9 +1362,8 @@ class LabelingViewer:
         signal_type_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
         signal_type = signal_type_map[label_type]
 
-        if label_type == 0:  # HOLD
-            pnl = 0.
-            0
+        if label_type == 0:
+            pnl = 0.0
             is_profitable = True
         else:
             pnl, is_profitable = self.tool._calculate_pnl_to_index(
@@ -1355,42 +1377,30 @@ class LabelingViewer:
         # INSERT в БД
         with self.engine.begin() as conn:
             conn.execute(text("""
-                INSERT INTO labeling_results (
-                    symbol,
-                    timestamp,
-                    timeframe,
-                    reversal_label,
-                    reversal_confidence,
-                    labeling_method,
-                    labeling_params,
-                    extreme_index,
-                    extreme_price,
-                    extreme_timestamp,
-                    confirmation_index,
-                    confirmation_timestamp,
-                    price_change_after,
-                    features_json,
-                    is_high_quality,
-                    created_at
-                ) VALUES (
-                    :symbol,
-                    :timestamp,
-                    :timeframe,
-                    :reversal_label,
-                    :reversal_confidence,
-                    :labeling_method,
-                    :labeling_params,
-                    :extreme_index,
-                    :extreme_price,
-                    :extreme_timestamp,
-                    :confirmation_index,
-                    :confirmation_timestamp,
-                    :price_change_after,
-                    :features_json,
-                    :is_high_quality,
-                    :created_at
-                )
-            """), {
+                    INSERT INTO labeling_results (
+                        symbol,
+                        timestamp,
+                        timeframe,
+                        reversal_label,
+                        reversal_confidence,
+                        labeling_method,
+                        labeling_params,
+                        extreme_index,
+                        extreme_price,
+                        extreme_timestamp,
+                        confirmation_index,
+                        confirmation_timestamp,
+                        price_change_after,
+                        features_json,
+                        is_high_quality,
+                        created_at
+                    ) VALUES (
+                        :symbol, :timestamp, :timeframe, :reversal_label, :reversal_confidence,
+                        :labeling_method, :labeling_params, :extreme_index, :extreme_price,
+                        :extreme_timestamp, :confirmation_index, :confirmation_timestamp,
+                        :price_change_after, :features_json, :is_high_quality, :created_at
+                    )
+                """), {
                 'symbol': self.config.symbol,
                 'timestamp': extreme_timestamp,
                 'timeframe': self.config.timeframe,
@@ -1411,118 +1421,96 @@ class LabelingViewer:
 
         print(f"✅ Added new label: index={index}, type={signal_type}, confidence={confidence:.2f}, pnl={pnl:. 4f}")
 
-        def setup_clientside_callbacks(self):
+    def setup_clientside_callbacks(self):
+        """Настройка JavaScript callbacks для hotkeys"""
+
+        clientside_callback(
             """
-            Настройка JavaScript callbacks для hotkeys
+            function(n_intervals) {
+                document.addEventListener('keydown', function(event) {
+                    const key = event.key.toLowerCase();
 
-            Hotkeys:
-            - A: режим добавления метки (показывает dropdown при клике)
-            - E: режим редактирования (выделяет edit controls)
-            - D: удаление выбранной метки
-            - ← : навигация назад (половина block)
-            - → : навигация вперед (половина block)
-            """
+                    if (key === 'a') {
+                        console.log('Add mode activated');
+                    }
 
-            # JavaScript код для обработки клавиш
-            clientside_callback(
-                """
-                function(n_intervals) {
-                    // Обработчик клавиатурных событий
-                    document.addEventListener('keydown', function(event) {
-                        const key = event.key. toLowerCase();
-
-                        // A - режим добавления (пока не реализован полностью)
-                        if (key === 'a') {
-                            console.log('Add mode activated');
-                            // Здесь можно добавить визуальную индикацию режима
+                    if (key === 'e') {
+                        const editControls = document.getElementById('edit-controls');
+                        if (editControls && editControls.style.display !== 'none') {
+                            editControls.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }
+                    }
 
-                        // E - фокус на edit controls
-                        if (key === 'e') {
-                            const editControls = document.getElementById('edit-controls');
-                            if (editControls && editControls.style.display !== 'none') {
-                                editControls.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            }
+                    if (key === 'd') {
+                        const deleteBtn = document.getElementById('delete-label');
+                        if (deleteBtn && deleteBtn.style.display !== 'none') {
+                            deleteBtn.click();
                         }
+                    }
 
-                        // D - удаление выбранной метки
-                        if (key === 'd') {
-                            const deleteBtn = document.getElementById('delete-label');
-                            if (deleteBtn && deleteBtn.style.display !== 'none') {
-                                deleteBtn.click();
-                            }
+                    if (key === 'arrowleft') {
+                        const backBtn = document.getElementById('nav-back');
+                        if (backBtn) {
+                            backBtn.click();
+                            event.preventDefault();
                         }
+                    }
 
-                        // ← - навигация назад
-                        if (key === 'arrowleft') {
-                            const backBtn = document.getElementById('nav-back');
-                            if (backBtn) {
-                                backBtn.click();
-                                event.preventDefault();
-                            }
+                    if (key === 'arrowright') {
+                        const fwdBtn = document.getElementById('nav-forward');
+                        if (fwdBtn) {
+                            fwdBtn.click();
+                            event.preventDefault();
                         }
+                    }
+                });
 
-                        // → - навигация вперед
-                        if (key === 'arrowright') {
-                            const fwdBtn = document.getElementById('nav-forward');
-                            if (fwdBtn) {
-                                fwdBtn.click();
-                                event.preventDefault();
-                            }
-                        }
-                    });
+                return '';
+            }
+            """,
+            Output('keyboard-listener', 'children'),
+            Input('main-chart', 'id')
+        )
 
-                    return '';
-                }
-                """,
-                Output('keyboard-listener', 'children'),
-                Input('main-chart', 'id')  # Dummy input для инициализации
-            )
+    def run(self, host='127.0.0.1', port=8050, debug=True):
+        """Запуск Dash web-сервера"""
+        print("=" * 60)
+        print("🚀 ML Labeling Viewer")
+        print("=" * 60)
 
-            def run(self, host='127.0.0.1', port=8050, debug=True):
-                """
-                Запуск Dash web-сервера
+        # Загрузка данных
+        try:
+            self.df_candles, self.df_labels = self.load_data()
+        except Exception as e:
+            print(f"❌ Failed to load data: {e}")
+            return
 
-                Args:
-                    host: адрес сервера (default: localhost)
-                    port: порт (default: 8050)
-                    debug: режим отладки
-                """
-                print("=" * 60)
-                print("🚀 ML Labeling Viewer")
-                print("=" * 60)
+        # Создание Dash app
+        self.app = dash.Dash(
+            __name__,
+            external_stylesheets=[dbc.themes.BOOTSTRAP],
+            suppress_callback_exceptions=True
+        )
 
-                # Загрузка данных
-                try:
-                    self.df_candles, self.df_labels = self.load_data()
-                except Exception as e:
-                    print(f"❌ Failed to load data: {e}")
-                    return
+        self.app.title = f"Labeling Viewer - {self.config.symbol}"
+        self.app.layout = self.create_dash_layout()
 
-                # Создание Dash app
-                self.app = dash.Dash(
-                    __name__,
-                    external_stylesheets=[dbc.themes.BOOTSTRAP],
-                    suppress_callback_exceptions=True
-                )
+        # Настройка callbacks
+        self.setup_callbacks()
+        self._edit_label_callbacks()  # ← ДОБАВИТЬ вызов
+        self.setup_clientside_callbacks()
 
-                self.app.title = f"Labeling Viewer - {self.config.symbol}"
-                self.app.layout = self.create_dash_layout()
+        # Информация
+        total_blocks = len(self.df_candles) // self.block_size
+        print(f"📊 Loaded: {len(self.df_candles)} candles, {len(self.df_labels)} labels")
+        print(f"🎯 Block size: {self.block_size}, Total blocks: {total_blocks}")
+        print(f"🌐 Starting server at http://{host}:{port}")
+        print(f"💡 Press Ctrl+C to stop")
+        print("=" * 60)
 
-                # Настройка callbacks
-                self.setup_callbacks()
-                self.setup_clientside_callbacks()
+        # Запуск сервера
+        self.app.run_server(host=host, port=port, debug=debug, use_reloader=False)
 
-                # Информация
-                total_blocks = len(self.df_candles) // self.block_size
-                print(f"📊 Loaded: {len(self.df_candles)} candles, {len(self.df_labels)} labels")
-                print(f"🎯 Block size: {self.block_size}, Total blocks: {total_blocks}")
-                print(f"🌐 Starting server at http://{host}:{port}")
-                print(f"💡 Press Ctrl+C to stop")
-                print("=" * 60)
-
-                # Запуск сервера
-                self.app.run_server(host=host, port=port, debug=debug, use_reloader=False)
 
 # === MAIN ===
 if __name__ == '__main__':
