@@ -1182,139 +1182,100 @@ class LabelingViewer:
 
             return self.create_figure(bounds), {'display': 'none'}
 
-    def add_label(self, buy_clicks, sell_clicks, hold_clicks, cancel_clicks, click_index):
-        """Добавление новой метки через dropdown"""
-        ctx = callback_context
-        if not ctx.triggered or click_index is None:
-            return dash.no_update, {'display': 'none'}
+    # === DATABASE OPERATIONS ===
+    def _update_label_type(self, extreme_timestamp: int, new_type: int):  # ← Убрать лишний отступ
+        """
+        Изменение типа метки с немедленным сохранением в БД
 
-        btn_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        Args:
+            extreme_timestamp: timestamp метки
+            new_type: 0=HOLD, 1=BUY, 2=SELL
+        """
+        # Находим индекс метки в df_candles
+        label_mask = self.df_candles['ts'] == extreme_timestamp
+        if not label_mask.any():
+            print(f"❌ Label not found: ts={extreme_timestamp}")
+            return
 
-        # Cancel - просто скрываем dropdown
-        if btn_id == 'add-cancel':
-            return dash.no_update, {'display': 'none'}
+        label_idx = self.df_candles[label_mask].index[0]
 
-        # Определяем тип и confidence
-        label_config = {
-            'add-buy': (1, 0.8),  # BUY, confidence 0.8
-            'add-sell': (2, 0.8),  # SELL, confidence 0.8
-            'add-hold': (0, 1.0)  # HOLD, confidence 1.0
-        }
+        # Определяем exit index для расчета PnL
+        next_labels = self.df_labels[self.df_labels['extreme_timestamp'] > extreme_timestamp]
 
-        if btn_id not in label_config:
-            return dash.no_update, {'display': 'none'}
-
-        label_type, confidence = label_config[btn_id]
-
-        # Добавляем метку в БД
-        self._add_new_label(click_index, label_type, confidence)
-
-        # Перезагружаем данные
-        self.df_candles, self.df_labels = self.load_data()
-
-        # Перерисовываем график
-        bounds = self.calculate_window_bounds(self.current_index, self.block_size)
-
-        return self.create_figure(bounds), {'display': 'none'}
-
-        # После строки 1185 (конец add_label callback)
-
-        # === DATABASE OPERATIONS === ← ДОБАВИТЬ: методы на уровне класса
-    def _update_label_type(self, extreme_timestamp: int, new_type: int):
-            """
-            Изменение типа метки с немедленным сохранением в БД
-
-            Args:
-                extreme_timestamp: timestamp метки
-                new_type: 0=HOLD, 1=BUY, 2=SELL
-            """
-            # Находим индекс метки в df_candles
-            label_mask = self.df_candles['ts'] == extreme_timestamp
-            if not label_mask.any():
-                print(f"❌ Label not found: ts={extreme_timestamp}")
-                return
-
-            label_idx = self.df_candles[label_mask].index[0]
-
-            # Определяем exit index для расчета PnL
-            next_labels = self.df_labels[self.df_labels['extreme_timestamp'] > extreme_timestamp]
-
-            if not next_labels.empty:
-                next_ts = next_labels.iloc[0]['extreme_timestamp']
-                exit_mask = self.df_candles['ts'] == next_ts
-                if exit_mask.any():
-                    exit_idx = self.df_candles[exit_mask].index[0] - 1
-                else:
-                    exit_idx = label_idx + self.config.hold_bars
+        if not next_labels.empty:
+            next_ts = next_labels.iloc[0]['extreme_timestamp']
+            exit_mask = self.df_candles['ts'] == next_ts
+            if exit_mask.any():
+                exit_idx = self.df_candles[exit_mask].index[0] - 1
             else:
                 exit_idx = label_idx + self.config.hold_bars
+        else:
+            exit_idx = label_idx + self.config.hold_bars
 
-            # Проверка границ
-            if exit_idx >= len(self.df_candles):
-                exit_idx = len(self.df_candles) - 1
+        # Проверка границ
+        if exit_idx >= len(self.df_candles):
+            exit_idx = len(self.df_candles) - 1
 
-            # Расчет PnL
-            signal_type_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
-            signal_type = signal_type_map[new_type]
+        # Расчет PnL
+        signal_type_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
+        signal_type = signal_type_map[new_type]
 
-            if new_type == 0:
-                pnl = 0.0
-                is_profitable = True
-            else:
-                pnl, is_profitable = self.tool._calculate_pnl_to_index(
-                    self.df_candles, label_idx, signal_type, exit_idx
-                )
+        if new_type == 0:
+            pnl = 0.0
+            is_profitable = True
+        else:
+            pnl, is_profitable = self.tool._calculate_pnl_to_index(
+                self.df_candles, label_idx, signal_type, exit_idx
+            )
 
-            # UPDATE в БД
-            with self.engine.begin() as conn:
-                conn.execute(text("""
-                    UPDATE labeling_results
-                    SET reversal_label = :new_type,
-                        price_change_after = :pnl,
-                        is_high_quality = :is_hq
-                    WHERE symbol = :symbol
-                      AND extreme_timestamp = :ts
-                """), {
-                    'new_type': new_type,
-                    'pnl': pnl,
-                    'is_hq': 1 if is_profitable else 0,
-                    'symbol': self.config.symbol,
-                    'ts': extreme_timestamp
-                })
+        # UPDATE в БД
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE labeling_results
+                SET reversal_label = :new_type,
+                    price_change_after = :pnl,
+                    is_high_quality = :is_hq
+                WHERE symbol = :symbol
+                  AND extreme_timestamp = :ts
+            """), {
+                'new_type': new_type,
+                'pnl': pnl,
+                'is_hq': 1 if is_profitable else 0,
+                'symbol': self.config.symbol,
+                'ts': extreme_timestamp
+            })
 
-            print(f"✅ Updated label {extreme_timestamp}: type={signal_type}, pnl={pnl:.4f}, is_hq={is_profitable}")
+        print(f"✅ Updated label {extreme_timestamp}: type={signal_type}, pnl={pnl:.4f}, is_hq={is_profitable}")
 
-    def _update_confidence(self, extreme_timestamp: int, new_confidence: float):
-            """Изменение confidence с автосохранением"""
-            with self.engine.begin() as conn:
-                conn.execute(text("""
-                    UPDATE labeling_results
-                    SET reversal_confidence = :conf
-                    WHERE symbol = :symbol
-                      AND extreme_timestamp = :ts
-                """), {
-                    'conf': new_confidence,
-                    'symbol': self.config.symbol,
-                    'ts': extreme_timestamp
-                })
+    def _update_confidence(self, extreme_timestamp: int, new_confidence: float):  # ← Убрать лишний отступ
+        """Изменение confidence с автосохранением"""
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE labeling_results
+                SET reversal_confidence = :conf
+                WHERE symbol = :symbol
+                  AND extreme_timestamp = :ts
+            """), {
+                'conf': new_confidence,
+                'symbol': self.config.symbol,
+                'ts': extreme_timestamp
+            })
 
-            print(f"✅ Updated confidence for {extreme_timestamp}: {new_confidence:.2f}")
+        print(f"✅ Updated confidence for {extreme_timestamp}: {new_confidence:.2f}")
 
-    def _delete_label(self, extreme_timestamp: int):
-            """Удаление метки с автосохранением"""
-            with self.engine.begin() as conn:
-                result = conn.execute(text("""
-                    DELETE FROM labeling_results
-                    WHERE symbol = :symbol
-                      AND extreme_timestamp = :ts
-                """), {
-                    'symbol': self.config.symbol,
-                    'ts': extreme_timestamp
-                })
+    def _delete_label(self, extreme_timestamp: int):  # ← Убрать лишний отступ
+        """Удаление метки с автосохранением"""
+        with self.engine.begin() as conn:
+            result = conn.execute(text("""
+                DELETE FROM labeling_results
+                WHERE symbol = :symbol
+                  AND extreme_timestamp = :ts
+            """), {
+                'symbol': self.config.symbol,
+                'ts': extreme_timestamp
+            })
 
-            print(f"✅ Deleted label {extreme_timestamp} (rows affected: {result.rowcount})")
-
-            # Строка 1296 - НАЧАЛО метода _add_new_label (он ПРАВИЛЬНЫЙ)
+        print(f"✅ Deleted label {extreme_timestamp} (rows affected: {result.rowcount})")
 
     def _add_new_label(self, index: int, label_type: int, confidence: float):
         """
@@ -1486,32 +1447,32 @@ class LabelingViewer:
             return
 
         # Создание Dash app
-        self.app = dash.Dash(
+        self.app = dash. Dash(
             __name__,
             external_stylesheets=[dbc.themes.BOOTSTRAP],
             suppress_callback_exceptions=True
         )
 
-        self.app.title = f"Labeling Viewer - {self.config.symbol}"
+        self. app.title = f"Labeling Viewer - {self.config.symbol}"
         self.app.layout = self.create_dash_layout()
 
         # Настройка callbacks
-        self.setup_callbacks()
-        self._edit_label_callbacks()  # ← ДОБАВИТЬ вызов
-        self.setup_clientside_callbacks()
+        self.setup_callbacks()           # Навигация + выбор метки
+        self._edit_label_callbacks()     # Редактирование меток
+        self._add_label_callbacks()      # ← ДОБАВИТЬ: callbacks для добавления
+        self.setup_clientside_callbacks()  # Hotkeys
 
         # Информация
         total_blocks = len(self.df_candles) // self.block_size
         print(f"📊 Loaded: {len(self.df_candles)} candles, {len(self.df_labels)} labels")
-        print(f"🎯 Block size: {self.block_size}, Total blocks: {total_blocks}")
+        print(f"🎯 Block size: {self. block_size}, Total blocks: {total_blocks}")
         print(f"🌐 Starting server at http://{host}:{port}")
         print(f"💡 Press Ctrl+C to stop")
         print("=" * 60)
 
         # Запуск сервера
         self.app.run_server(host=host, port=port, debug=debug, use_reloader=False)
-
-
+        
 # === MAIN ===
 if __name__ == '__main__':
     import argparse
